@@ -14,6 +14,19 @@ constexpr uint32_t kBytes = 4096;
 struct Rig {
     std::shared_ptr<FakeSoundBuffer> fake = std::make_shared<FakeSoundBuffer>(kBytes);
     MonitoredSoundBuffer buf{fake, kBytes};
+
+    // Arms underrun counting (R11): two polls that see the play cursor move. Nothing is tracked yet, so nothing counts.
+    void StartPlayback()
+    {
+        DWORD play = 0, write = 0;
+        fake->playCursor = 1;
+        fake->writeCursor = 2;
+        REQUIRE(buf.GetCurrentPosition(&play, &write) == S_OK);
+        fake->playCursor = 3;
+        fake->writeCursor = 4;
+        REQUIRE(buf.GetCurrentPosition(&play, &write) == S_OK);
+        REQUIRE(buf.Underruns() == 0);
+    }
 };
 
 // One committed write as AppleWin does it: Lock(offset, bytes), then Unlock with the parts Lock returned.
@@ -131,6 +144,7 @@ TEST_CASE("sound: the recorded volume starts as the inner volume at construction
 TEST_CASE("sound: commit ending between play and write cursors is an underrun")
 {
     Rig r;
+    r.StartPlayback();
     r.fake->playCursor = 100;
     r.fake->writeCursor = 200;
     Commit(r.buf, 0, 150);   // end 150 lies in (100, 200)
@@ -141,6 +155,7 @@ TEST_CASE("sound: commit ending between play and write cursors is an underrun")
 TEST_CASE("sound: commit ending past the write cursor is not an underrun")
 {
     Rig r;
+    r.StartPlayback();
     r.fake->playCursor = 100;
     r.fake->writeCursor = 200;
     Commit(r.buf, 0, 250);   // end 250 lies outside (100, 200)
@@ -151,6 +166,7 @@ TEST_CASE("sound: commit ending past the write cursor is not an underrun")
 TEST_CASE("sound: wrap-around unsafe zone counts an underrun")
 {
     Rig r;
+    r.StartPlayback();
     r.fake->playCursor = 4000;
     r.fake->writeCursor = 100;
     Commit(r.buf, 4046, 100);   // end (4046 + 100) mod 4096 = 50, inside the zone |xxW----Pxx|
@@ -161,6 +177,7 @@ TEST_CASE("sound: wrap-around unsafe zone counts an underrun")
 TEST_CASE("sound: an underrun is counted once until the next commit")
 {
     Rig r;
+    r.StartPlayback();
     r.fake->playCursor = 100;
     r.fake->writeCursor = 200;
     Commit(r.buf, 0, 150);
@@ -175,6 +192,7 @@ TEST_CASE("sound: an underrun is counted once until the next commit")
 TEST_CASE("sound: a whole-buffer commit stops tracking")
 {
     Rig r;
+    r.StartPlayback();
     r.fake->playCursor = 4000;
     r.fake->writeCursor = 100;
     Commit(r.buf, 0, 150);   // partial commit: tracking on, end 150 is safe
@@ -195,6 +213,7 @@ TEST_CASE("sound: a whole-buffer commit stops tracking")
 TEST_CASE("sound: no underruns counted while muted, or after unmuting until the next commit")
 {
     Rig r;
+    r.StartPlayback();
     r.fake->playCursor = 100;
     r.fake->writeCursor = 200;
     r.buf.SetMuted(true);
@@ -203,6 +222,7 @@ TEST_CASE("sound: no underruns counted while muted, or after unmuting until the 
     CHECK(r.buf.Underruns() == 0);
 
     Rig r2;
+    r2.StartPlayback();
     r2.fake->playCursor = 100;
     r2.fake->writeCursor = 200;
     Commit(r2.buf, 0, 150);   // would be an underrun at the next poll ...
@@ -213,4 +233,58 @@ TEST_CASE("sound: no underruns counted while muted, or after unmuting until the 
     Commit(r2.buf, 0, 150);
     Poll(r2.buf);
     CHECK(r2.buf.Underruns() == 1);
+}
+
+TEST_CASE("sound: no underrun is counted while the play cursor hasn't moved since the first poll")
+{
+    Rig r;
+    r.fake->playCursor = 0;
+    r.fake->writeCursor = 1896;
+    Poll(r.buf);              // first observation: play cursor 0
+    Commit(r.buf, 0, 256);    // end 256 lies in (0, 1896)
+    Poll(r.buf);              // play cursor still 0: not armed
+    CHECK(r.buf.Underruns() == 0);
+    Commit(r.buf, 0, 256);
+    Poll(r.buf);
+    CHECK(r.buf.Underruns() == 0);
+}
+
+TEST_CASE("sound: once the play cursor has moved, the same situation is an underrun")
+{
+    Rig r;
+    r.fake->playCursor = 0;
+    r.fake->writeCursor = 1896;
+    Poll(r.buf);              // first observation: play cursor 0
+    r.fake->playCursor = 132;
+    r.fake->writeCursor = 3000;
+    Poll(r.buf);              // play cursor moved: armed
+    Commit(r.buf, 0, 256);    // end 256 lies in (132, 3000)
+    Poll(r.buf);
+    CHECK(r.buf.Underruns() == 1);
+}
+
+TEST_CASE("sound: the poll that sees the play cursor move can count an underrun")
+{
+    Rig r;
+    r.fake->playCursor = 0;
+    r.fake->writeCursor = 0;
+    Poll(r.buf);              // first observation
+    Commit(r.buf, 0, 256);
+    r.fake->playCursor = 132;
+    r.fake->writeCursor = 3000;
+    Poll(r.buf);              // arms, and end 256 lies in (132, 3000)
+    CHECK(r.buf.Underruns() == 1);
+}
+
+TEST_CASE("sound: muting doesn't disarm")
+{
+    Rig r;
+    r.StartPlayback();
+    r.buf.SetMuted(true);
+    r.buf.SetMuted(false);
+    r.fake->playCursor = 100;
+    r.fake->writeCursor = 200;
+    Commit(r.buf, 0, 150);
+    Poll(r.buf);
+    CHECK(r.buf.Underruns() == 1);
 }

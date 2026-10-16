@@ -16,6 +16,10 @@ namespace harness {
 //   play and write cursors (the predicate of SoundCore_ValidateAndAlignWriteOffset); tracking then stops until the next
 //   commit. Tracking is off at construction, while muted, after unmuting, and after a whole-buffer commit; each waits
 //   for the next partial commit.
+// - Arming (ruling R11): no underrun is counted until playback has visibly begun, i.e. until a successful
+//   GetCurrentPosition returns a play cursor different from the one returned by the first successful call. DirectSound
+//   holds the cursors still after Play() until the device starts the buffer. Once armed, the buffer stays armed for its
+//   life (muting doesn't disarm). Polls before arming leave tracking unchanged.
 class MonitoredSoundBuffer final : public SoundBuffer {
 public:
     // sharedUnderruns (optional) is incremented alongside the per-buffer count, so a total can outlive the buffer.
@@ -48,6 +52,9 @@ private:
     bool muted_ = false;
     LONG recordedVolume_ = 0;
     bool tracking_ = false;
+    bool firstPlaySeen_ = false;
+    DWORD firstPlay_ = 0;
+    bool armed_ = false;
     DWORD lockOffset_ = 0;
     DWORD committedEnd_ = 0;
     uint64_t underruns_ = 0;

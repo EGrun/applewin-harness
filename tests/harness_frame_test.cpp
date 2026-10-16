@@ -152,13 +152,15 @@ TEST_CASE("frame: sound buffers are not kept alive, and their underruns are stil
     });
     auto buf = f.CreateSoundBuffer(4096, 44100, 1, "x");
     REQUIRE(buf);
+    DWORD play = 0, write = 0;
+    buf->GetCurrentPosition(&play, &write);   // play cursor 0, then 100: playback has begun (counting armed, R11)
     fake->playCursor = 100;
     fake->writeCursor = 200;
+    buf->GetCurrentPosition(&play, &write);
     LPVOID p1 = nullptr, p2 = nullptr;
     DWORD n1 = 0, n2 = 0;
     REQUIRE(buf->Lock(0, 150, &p1, &n1, &p2, &n2, 0) == S_OK);
     REQUIRE(buf->Unlock(p1, n1, p2, n2) == S_OK);
-    DWORD play = 0, write = 0;
     buf->GetCurrentPosition(&play, &write);
     CHECK(f.SoundUnderruns() == 1);
 

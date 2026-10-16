@@ -24,7 +24,16 @@ HRESULT MonitoredSoundBuffer::GetCurrentPosition(LPDWORD lpdwCurrentPlayCursor, 
     const HRESULT hr = inner_->GetCurrentPosition(&play, &write);
     if (lpdwCurrentPlayCursor) *lpdwCurrentPlayCursor = play;
     if (lpdwCurrentWriteCursor) *lpdwCurrentWriteCursor = write;
-    if (SUCCEEDED(hr) && tracking_ && !muted_) {
+    if (SUCCEEDED(hr) && !armed_) {
+        // Armed once playback has visibly begun: a play cursor different from the first one observed.
+        if (!firstPlaySeen_) {
+            firstPlaySeen_ = true;
+            firstPlay_ = play;
+        } else if (play != firstPlay_) {
+            armed_ = true;
+        }
+    }
+    if (SUCCEEDED(hr) && armed_ && tracking_ && !muted_) {
         // Mirrors SoundCore_ValidateAndAlignWriteOffset's unsafe zone (strict comparisons).
         const DWORD off = committedEnd_;
         const bool unsafe = (write > play) ? (off > play && off < write) : (off > play || off < write);

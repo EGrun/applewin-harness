@@ -93,7 +93,8 @@ TEST_CASE("vsound: the cursors keep AppleWin's fill check neutral")
         DWORD play = 0, write = 0;
         Cursors(*r.buf, play, write);
         CHECK(play == kBytes * 5 / 8);                       // commit end 0, minus 3/8
-        CHECK(write == (play + frameBytes) % kBytes);
+        CHECK(write == 0);                                   // the commit end (ruling B6)
+        CHECK(write == (play + kBytes / 8 * 3) % kBytes);
 
         // AppleWin's speaker loop (Spkr_SubmitWaveBuffer): the first offset is play + 3/8, then each commit follows the
         // last. Uneven commit sizes, wrapping the ring many times.
@@ -107,7 +108,7 @@ TEST_CASE("vsound: the cursors keep AppleWin's fill check neutral")
             offset = (offset + bytes) % kBytes;
 
             Cursors(*r.buf, play, write);
-            if (play != (offset + kBytes - kBytes / 8 * 3) % kBytes || write != (play + frameBytes) % kBytes)
+            if (play != (offset + kBytes - kBytes / 8 * 3) % kBytes || write != offset)
                 ++cursorWrong;
             uint32_t check = offset;
             if (SoundCore_ValidateAndAlignWriteOffset(check, play, write)) ++alignFired;
@@ -119,6 +120,56 @@ TEST_CASE("vsound: the cursors keep AppleWin's fill check neutral")
         CHECK(alignFired == 0);
         CHECK(outOfBand == 0);
     }
+}
+
+// Ruling B6: the Mockingboard's (and SSI263's) first update starts writing at the write cursor
+// (MockingboardCardManager::GenerateAllSoundData: m_byteOffset = dwCurrentWriteCursor), then measures the bytes queued
+// as offset - play. With write = commit end that is exactly 3/8 of the buffer, so nNumSamplesError stays 0.
+TEST_CASE("vsound: a voice that starts at the write cursor sees exactly 3/8 queued")
+{
+    for (int channels : {1, 2}) {
+        CAPTURE(channels);
+        Rig r(channels, 8192);
+        const DWORD frameBytes = DWORD(2 * channels);
+        Commit(*r.buf, 0, 8192, 0);   // DSZeroVoiceBuffer: a whole-buffer commit first
+        DWORD play = 0, write = 0;
+        uint32_t offset = 0;
+        int wrong = 0;
+        for (int i = 0; i < 50; ++i) {
+            Cursors(*r.buf, play, write);
+            if (i == 0)
+                offset = write;   // first call: start at the write cursor
+            uint32_t queued = (offset + 8192 - play) % 8192;
+            if (queued != 8192 / 8 * 3) ++wrong;
+            uint32_t check = offset;
+            if (SoundCore_ValidateAndAlignWriteOffset(check, play, write)) ++wrong;
+            const DWORD bytes = frameBytes * DWORD(17 + (i * 29) % 400);
+            r.now += 23 * bytes / frameBytes;
+            Commit(*r.buf, offset, bytes, int16_t(i));
+            offset = (offset + bytes) % 8192;
+        }
+        CHECK(wrong == 0);
+    }
+}
+
+TEST_CASE("vsound: Unlock rejects a region the last Lock did not return, and changes nothing")
+{
+    Rig r(1);
+    DWORD play0 = 0, write0 = 0, play = 0, write = 0;
+    Cursors(*r.buf, play0, write0);
+    LPVOID p1 = nullptr, p2 = nullptr;
+    DWORD n1 = 0, n2 = 0;
+    REQUIRE(r.buf->Lock(4000, 200, &p1, &n1, &p2, &n2, 0) == S_OK);
+    CHECK(r.buf->Unlock(static_cast<uint8_t*>(p1) - 2, n1, p2, n2) == DSERR_INVALIDPARAM);   // wrong pointer
+    REQUIRE(r.buf->Lock(4000, 200, &p1, &n1, &p2, &n2, 0) == S_OK);
+    CHECK(r.buf->Unlock(p1, n1 + 2, p2, n2) == DSERR_INVALIDPARAM);                         // longer than locked
+    REQUIRE(r.buf->Lock(4000, 200, &p1, &n1, &p2, &n2, 0) == S_OK);
+    CHECK(r.buf->Unlock(p1, n1, nullptr, n2) == DSERR_INVALIDPARAM);                       // second part missing
+    REQUIRE(r.buf->Lock(100, 200, &p1, &n1, &p2, &n2, 0) == S_OK);
+    REQUIRE(r.buf->Unlock(p1, n1, p2, n2) == S_OK);
+    CHECK(r.buf->Unlock(p1, n1, p2, n2) == DSERR_INVALIDPARAM);                            // no Lock outstanding
+    Cursors(*r.buf, play, write);
+    CHECK(write == 300);   // only the valid commit moved the commit end
 }
 
 // ---- Capture ----

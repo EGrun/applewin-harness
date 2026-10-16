@@ -38,7 +38,10 @@ HRESULT VirtualSoundBuffer::GetCurrentPosition(LPDWORD lpdwCurrentPlayCursor, LP
     if (bytes_ != 0) {
         play = (commitEnd_ + bytes_ - (bytes_ / 8 * 3) % bytes_) % bytes_;
         play -= play % frameBytes;
-        write = (play + frameBytes) % bytes_;
+        // D14 as amended by ruling B6: the write cursor is the end of the last commit. AppleWin's next offset equals it,
+        // which SoundCore_ValidateAndAlignWriteOffset (strict <) never moves, and a voice that starts writing at the
+        // write cursor (Mockingboard, SSI263) sees exactly 3/8 queued from its first call.
+        write = commitEnd_;
     }
     if (lpdwCurrentPlayCursor)
         *lpdwCurrentPlayCursor = play;
@@ -53,10 +56,15 @@ HRESULT VirtualSoundBuffer::Lock(DWORD dwWriteCursor, DWORD dwWriteBytes, LPVOID
     if (!lplpvAudioPtr1 || !lpdwAudioBytes1)
         return DSERR_INVALIDPARAM;
     if ((dwFlags & DSBLOCK_ENTIREBUFFER) || dwWriteBytes == bytes_) {
+        // The whole ring from 0, whatever the offset: AppleWin only does this at offset 0 (DSZeroVoiceBuffer's
+        // DSBLOCK_ENTIREBUFFER, DSZeroVoiceWritableBuffer's Lock(0, size)).
         *lplpvAudioPtr1 = ring_.data();
         *lpdwAudioBytes1 = bytes_;
         if (lplpvAudioPtr2) *lplpvAudioPtr2 = nullptr;
         if (lpdwAudioBytes2) *lpdwAudioBytes2 = 0;
+        lockOffset_ = 0;
+        lockN1_ = bytes_;
+        lockN2_ = 0;
         return S_OK;
     }
     if (dwFlags & DSBLOCK_FROMWRITECURSOR) {
@@ -73,23 +81,31 @@ HRESULT VirtualSoundBuffer::Lock(DWORD dwWriteCursor, DWORD dwWriteBytes, LPVOID
     *lpdwAudioBytes1 = n1;
     if (lplpvAudioPtr2) *lplpvAudioPtr2 = n2 ? ring_.data() : nullptr;
     if (lpdwAudioBytes2) *lpdwAudioBytes2 = n2;
+    lockOffset_ = dwWriteCursor;
+    lockN1_ = n1;
+    lockN2_ = n2;
     return S_OK;
 }
 
 HRESULT VirtualSoundBuffer::Unlock(LPVOID lpvAudioPtr1, DWORD dwAudioBytes1, LPVOID lpvAudioPtr2, DWORD dwAudioBytes2)
 {
+    // Only an Unlock of (a prefix of) the region the last Lock returned is accepted; anything else is rejected without
+    // touching the ring, the cursors or the capture. AppleWin always passes Lock's own values.
+    const DWORD lockN1 = lockN1_, lockN2 = lockN2_;
+    const uint32_t offset = lockOffset_;
+    lockN1_ = lockN2_ = 0;
+    if (dwAudioBytes1 == 0 && dwAudioBytes2 == 0)
+        return S_OK;
+    if (lpvAudioPtr1 != ring_.data() + offset || dwAudioBytes1 > lockN1 || dwAudioBytes2 > lockN2 ||
+        (dwAudioBytes2 != 0 && (lpvAudioPtr2 != ring_.data() || dwAudioBytes1 != lockN1)))
+        return DSERR_INVALIDPARAM;
+
     const uint64_t total = uint64_t(dwAudioBytes1) + dwAudioBytes2;
     if (total == bytes_) {   // whole-buffer commit: AppleWin re-initialising the buffer (D14 "Capture")
         if (capture_)
             capture_->ResetVoice(voiceId_);
         return S_OK;
     }
-    if (total == 0 || !lpvAudioPtr1)
-        return S_OK;
-    const uint8_t* p1 = static_cast<const uint8_t*>(lpvAudioPtr1);
-    if (p1 < ring_.data() || p1 >= ring_.data() + bytes_ || total > bytes_)
-        return DSERR_INVALIDPARAM;
-    const uint32_t offset = uint32_t(p1 - ring_.data());
     commitEnd_ = uint32_t((offset + total) % bytes_);
 
     if (!capture_)
@@ -98,8 +114,8 @@ HRESULT VirtualSoundBuffer::Unlock(LPVOID lpvAudioPtr1, DWORD dwAudioBytes1, LPV
     uint8_t* out = reinterpret_cast<uint8_t*>(scratch_.data());
     const size_t usable = scratch_.size() * sizeof(int16_t);
     const size_t c1 = std::min<size_t>(dwAudioBytes1, usable);
-    std::memcpy(out, p1, c1);
-    if (lpvAudioPtr2 && usable > c1)
+    std::memcpy(out, lpvAudioPtr1, c1);
+    if (usable > c1)
         std::memcpy(out + c1, lpvAudioPtr2, usable - c1);
     scratch_.resize(scratch_.size() - scratch_.size() % size_t(channels_));   // whole frames only
     const uint64_t now = clock_ ? clock_() : uint64_t(g_nCumulativeCycles);

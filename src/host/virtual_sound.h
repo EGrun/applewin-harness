@@ -19,8 +19,12 @@ class AudioCapture;
 // - Commit: an Unlock of the region the last Lock returned. Its end, (offset + n1 + n2) mod bytes, becomes the commit
 //   end. It starts at 0, so the play cursor starts at 5/8 of the ring and AppleWin's first offset (play + 3/8) is 0.
 // - Cursors: GetCurrentPosition reports play = (commit end - bytes x 3/8) mod bytes, rounded down to a whole frame,
-//   and write = play + one frame (mod bytes). AppleWin therefore always sees 3/8 of the buffer queued: its
-//   SoundCore_ValidateAndAlignWriteOffset check never fires and its sample error stays 0 (g_nCpuCyclesFeedback == 0).
+//   and write = the commit end (= play + 3/8; ruling B6). AppleWin therefore always sees 3/8 of the buffer queued: its
+//   SoundCore_ValidateAndAlignWriteOffset check never fires (its offset equals write, and the check is strict) and its
+//   sample errors stay 0 (g_nCpuCyclesFeedback == 0, and the Mockingboard's and SSI263's corrections), even for a voice
+//   whose first write starts at the write cursor.
+// - Unlock accepts only (a prefix of) the region the last Lock returned; anything else returns DSERR_INVALIDPARAM and
+//   changes nothing.
 // - Capture: a commit of n1 + n2 bytes (other than a whole-buffer commit) calls
 //   capture->Commit(voiceId, samples, channels, clock()) with the committed samples in order. A whole-buffer commit is
 //   AppleWin re-initialising the buffer: it is not captured, it doesn't move the commit end, and it calls
@@ -69,6 +73,9 @@ private:
     CycleClock clock_;
     std::vector<uint8_t> ring_;
     uint32_t commitEnd_ = 0;   // byte offset in the ring of the end of the last (partial) commit
+    uint32_t lockOffset_ = 0;  // the region the last Lock returned (lockN1_ + lockN2_ == 0: none outstanding)
+    DWORD lockN1_ = 0;
+    DWORD lockN2_ = 0;
     LONG volume_ = DSBVOLUME_MAX;
     DWORD status_ = 0;
     std::vector<int16_t> scratch_;   // the samples of one commit, in order

@@ -1,33 +1,46 @@
 #include "server/protocol.h"
 #include <stdexcept>
-
-// Task 2 stubs: implemented in Task 4.
+#include <utility>
 
 namespace harness {
 
-nlohmann::json MakeResult(const nlohmann::json&, nlohmann::json)
+nlohmann::json MakeResult(const nlohmann::json& id, nlohmann::json result)
 {
-    throw std::logic_error("MakeResult: not implemented");
+    return nlohmann::json{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
 
-nlohmann::json MakeError(const nlohmann::json&, int, std::string)
+nlohmann::json MakeError(const nlohmann::json& id, int code, std::string message)
 {
-    throw std::logic_error("MakeError: not implemented");
+    return nlohmann::json{{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", std::move(message)}}}};
 }
 
-nlohmann::json MakeNotification(std::string, nlohmann::json)
+nlohmann::json MakeNotification(std::string method, nlohmann::json params)
 {
-    throw std::logic_error("MakeNotification: not implemented");
+    return nlohmann::json{{"jsonrpc", "2.0"}, {"method", std::move(method)}, {"params", std::move(params)}};
 }
 
-std::optional<uint32_t> ParseLengthPrefix(std::span<const uint8_t, 4>)
+std::optional<uint32_t> ParseLengthPrefix(std::span<const uint8_t, 4> prefix)
 {
-    throw std::logic_error("ParseLengthPrefix: not implemented");
+    const uint32_t n = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) | (uint32_t(prefix[2]) << 16) |
+                       (uint32_t(prefix[3]) << 24);
+    if (n == 0 || n > kMaxMessageBytes) return std::nullopt;
+    return n;
 }
 
-std::vector<uint8_t> EncodeMessage(const nlohmann::json&)
+std::vector<uint8_t> EncodeMessage(const nlohmann::json& message)
 {
-    throw std::logic_error("EncodeMessage: not implemented");
+    // Invalid UTF-8 in a string is replaced (U+FFFD) rather than throwing: the wire carries UTF-8 JSON only.
+    const std::string text = message.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    if (text.size() > kMaxMessageBytes) throw std::length_error("EncodeMessage: message exceeds 16 MiB");
+    const auto n = static_cast<uint32_t>(text.size());
+    std::vector<uint8_t> wire;
+    wire.reserve(text.size() + 4);
+    wire.push_back(uint8_t(n & 0xFF));
+    wire.push_back(uint8_t((n >> 8) & 0xFF));
+    wire.push_back(uint8_t((n >> 16) & 0xFF));
+    wire.push_back(uint8_t((n >> 24) & 0xFF));
+    wire.insert(wire.end(), text.begin(), text.end());
+    return wire;
 }
 
 }  // namespace harness

@@ -2,6 +2,9 @@
 #include "core/png_writer.h"
 #include "core/sha256.h"
 #include "core/working_copy.h"
+#include "server/pipe_server.h"
+#include "server/protocol.h"
+#include <nlohmann/json.hpp>
 #include <windows.h>
 #include <chrono>
 #include <cstdint>
@@ -12,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -195,11 +199,40 @@ int Run(const Args& a)
     return rc;
 }
 
-// The JSON-RPC server (Task 2 stub; implemented in Task 5).
-int Serve(const Args&)
+// The JSON-RPC server.
+// TEMPORARY (M3A Task 4): transport only. Every authenticated request gets -32601 and the process serves until it is
+// killed. Task 5 replaces this with the Session (create_session, close_session, the main loop and cleanup).
+int Serve(const Args& a)
 {
-    std::cerr << "error: not implemented\n";
-    return kExitFailure;
+    try {
+        const std::wstring pipe = harness::PipeServer::RandomPipeName();
+        harness::Tokens tokens{harness::PipeServer::RandomToken(), harness::PipeServer::RandomToken()};
+        const std::string agentToken = tokens.agent, operatorToken = tokens.operatorToken;
+        auto isOperatorOnly = [](std::string_view m) {
+            return m == "create_session" || m == "close_session" || m == "pause" || m == "resume" ||
+                   m == "step_frames";
+        };
+        auto onRequest = [](harness::ConnectionPtr c, nlohmann::json request) {
+            c->Send(harness::MakeError(request["id"], harness::kMethodNotFound, "method not found"));
+        };
+        harness::PipeServer server(pipe, std::move(tokens), onRequest, isOperatorOnly,
+                                   a.headless ? harness::DisplayMode::Headless : harness::DisplayMode::Windowed);
+        server.Start();
+        // The announcement (spec: Part A "Launch"): exactly one line, keys in the spec's order (ruling R7).
+        nlohmann::ordered_json line;
+        std::string pipeUtf8;   // the name is ASCII
+        for (wchar_t ch : pipe) pipeUtf8.push_back(static_cast<char>(ch));
+        line["pipe"] = pipeUtf8;
+        line["agent_token"] = agentToken;
+        line["operator_token"] = operatorToken;
+        line["pid"] = GetCurrentProcessId();
+        std::cout << line.dump() << "\n";
+        std::cout.flush();
+        for (;;) Sleep(INFINITE);
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << "\n";
+        return kExitFailure;
+    }
 }
 
 }  // namespace

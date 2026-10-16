@@ -48,7 +48,7 @@ TEST_CASE("protocol: error codes match api_spec.md")
 TEST_CASE("protocol: length prefix is little-endian and rejects 0 and over 16 MiB")
 {
     CHECK(Parse(1) == std::optional<uint32_t>(1));
-    CHECK(Parse(0x01020304) == std::optional<uint32_t>(0x01020304));   // under 16 MiB, byte order matters
+    CHECK(Parse(0x00ABCDEF) == std::optional<uint32_t>(0x00ABCDEF));   // under 16 MiB, byte order matters
     CHECK(Parse(16777216) == std::optional<uint32_t>(16777216));
     CHECK(Parse(0) == std::nullopt);
     CHECK(Parse(16777217) == std::nullopt);

@@ -1,6 +1,7 @@
 #pragma once
 // Sound events for subscribe_audio (spec: docs/specs/m3.md, Part B "subscribe_audio").
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace harness {
@@ -34,7 +35,15 @@ class LevelDetector {
 public:
     LevelDetector(double thresholdDb = -50.0, uint32_t minSilenceMs = 100, uint64_t fromCycle = 0);
 
+    ~LevelDetector();
+    LevelDetector(LevelDetector&&) noexcept;
+    LevelDetector& operator=(LevelDetector&&) noexcept;
+
     std::vector<SoundEvent> Feed(const AudioCapture& capture, uint64_t uptoCycle);
+
+private:
+    struct State;
+    std::unique_ptr<State> state_;
 };
 
 }  // namespace harness

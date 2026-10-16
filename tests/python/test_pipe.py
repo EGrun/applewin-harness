@@ -449,9 +449,8 @@ class AgentMethodsTest(PipeTestCase):
 
 # ---- Part B: agent audio (pass conditions 7 and 8; Review Focus 3 and 4) ----
 
-# The //e bell's pitch as captured from PRINT CHR$(7). Placeholder (the ROM BELL routine is ~1 kHz); M3B Task 4
-# measures it and records the value here and in the ledger.
-BELL_HZ = 1000.0
+# The //e bell's pitch as captured from PRINT CHR$(7) (measured in M3B Task 4: 934.5 Hz, 120 ms, peak -0.15 dBFS).
+BELL_HZ = 935.0
 SOUND_EVENTS = ("sound_started", "sound_stopped")
 
 

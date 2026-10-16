@@ -1,6 +1,7 @@
 #pragma once
 // The session loop and the agent and operator methods (spec: docs/specs/m3.md, Part A "Threading and the session
 // loop", "Agent methods", "Operator methods"). One session per process (P6).
+#include "core/level_detector.h"
 #include "host/emulator.h"
 #include "server/pipe_server.h"
 #include <nlohmann/json.hpp>
@@ -65,10 +66,16 @@ private:
         uint64_t presentsSeen = 0;   // presents since the subscription was (re)set
     };
 
+    struct AudioSubscription {
+        ConnectionPtr connection;
+        LevelDetector detector;
+    };
+
     // Main thread.
     bool DrainCommands();                    // false once the process must exit
     void Dispatch(const Command& command);   // replies with the result, an RpcError, or -32603 with what()
     void SendInputApplied();                 // input_applied for every entry of Emulator::TakeAppliedInputs()
+    void SendSoundEvents();                  // feed each audio subscriber's detector; sound_started / sound_stopped
     void SendFrameReady();                   // frame_ready to the subscribers that are due (the present observer)
     bool PauseRunning();                     // Running: run until the next present, then Paused; false if the window closed
     void Cleanup() noexcept;                 // emulator shut down, working copies, work dir and INI removed
@@ -106,6 +113,7 @@ private:
     std::vector<std::unique_ptr<WorkingCopy>> copies_;
     std::map<uint64_t, ConnectionPtr> inputOwners_;   // input_id -> the connection that receives input_applied
     std::map<uint64_t, FrameSubscription> frameSubscriptions_;   // by connection id
+    std::map<uint64_t, AudioSubscription> audioSubscriptions_;   // by connection id
 };
 
 }  // namespace harness

@@ -2,6 +2,7 @@
 #include "server/protocol.h"
 #include "core/audio_capture.h"
 #include "core/base64.h"
+#include "core/level_detector.h"
 #include "core/wav.h"
 #include "core/png_writer.h"
 #include "core/working_copy.h"
@@ -192,7 +193,7 @@ bool Session::IsOperatorOnly(std::string_view method)
 int Session::RunMainLoop()
 {
     int rc = 0;
-    emulator_.SetPresentObserver([this] { SendFrameReady(); });
+    emulator_.SetPresentObserver([this] { SendFrameReady(); SendSoundEvents(); });
     try {
         for (;;) {
             if (fatalError_) {
@@ -208,6 +209,7 @@ int Session::RunMainLoop()
                 // One realtime step, the window pumped after it, then the commands that arrived meanwhile.
                 const bool open = emulator_.RunRealtimeStep();
                 SendInputApplied();
+                SendSoundEvents();
                 if (!open) break;   // window closed: exit 0
                 if (!emulator_.PumpWindow()) break;
                 if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) break;   // launcher exited: exit 0
@@ -330,6 +332,7 @@ bool Session::PauseRunning()
     emulator_.StopRealtime();
     state_ = State::Paused;
     SendInputApplied();
+    SendSoundEvents();
     return open;
 }
 
@@ -345,6 +348,7 @@ void Session::Cleanup() noexcept
     if (!workDir_.empty()) fs::remove_all(workDir_, ec);
     if (!ini_.empty()) fs::remove(ini_, ec);
     frameSubscriptions_.clear();
+    audioSubscriptions_.clear();
     inputOwners_.clear();
 }
 
@@ -463,6 +467,7 @@ json Session::StepFrames(const json& params)
     bool open = PauseRunning();
     if (open) open = emulator_.RunFrames(uint32_t(frames), Pacing::Stepped);
     SendInputApplied();
+    SendSoundEvents();
     if (!open) {
         exitRequested_ = true;
         throw RpcError{kInvalidState, "the window was closed"};
@@ -561,7 +566,7 @@ json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
     return InputReply(id, emulator_.ScheduledCycle(id));
 }
 
-// ---- Agent audio (M3 Part B). subscribe_audio is a stub until Task 4. ----
+// ---- Agent audio (M3 Part B). ----
 
 json Session::GetAudio(const json& params)
 {
@@ -610,9 +615,58 @@ json Session::GetAudio(const json& params)
                 {"data", Base64Encode(bytes)}};
 }
 
-json Session::SubscribeAudio(const ConnectionPtr&, const json&)
+json Session::SubscribeAudio(const ConnectionPtr& connection, const json& params)
 {
-    throw std::logic_error("subscribe_audio: not implemented");
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    double thresholdDb = -50.0;
+    if (const json* v = Field(params, "threshold_db")) {
+        if (!v->is_number()) InvalidParams("threshold_db must be a number");
+        thresholdDb = v->get<double>();
+        if (!(thresholdDb >= -120.0 && thresholdDb <= 0.0)) InvalidParams("threshold_db must be between -120 and 0");
+    }
+    const uint64_t minSilenceMs = GetUint(params, "min_silence_ms", 10, 10000, 100);
+    // Only sound from now on is reported; re-subscribing replaces the old subscription.
+    audioSubscriptions_.erase(connection->id());
+    audioSubscriptions_.emplace(connection->id(),
+                                AudioSubscription{connection, LevelDetector(thresholdDb, uint32_t(minSilenceMs),
+                                                                            emulator_.EmulatedCycles())});
+    return json::object();
+}
+
+void Session::SendSoundEvents()
+{
+    // Also called from the present observer inside a run: must not throw.
+    try {
+        if (audioSubscriptions_.empty()) return;
+        const AudioCapture& audio = emulator_.Audio();
+        const uint64_t upto = emulator_.EmulatedCycles();
+        for (auto it = audioSubscriptions_.begin(); it != audioSubscriptions_.end();) {
+            AudioSubscription& sub = it->second;
+            bool alive = true;
+            for (const SoundEvent& e : sub.detector.Feed(audio, upto)) {
+                try {
+                    if (e.kind == SoundEvent::Started) {
+                        sub.connection->Send(MakeNotification(
+                            "sound_started", json{{"start_cycle", e.startCycle},
+                                                  {"emulated_ms", double(e.startCycle) * 1000.0 / kAudioBaseClockHz}}));
+                    } else {
+                        sub.connection->Send(MakeNotification(
+                            "sound_stopped",
+                            json{{"start_cycle", e.startCycle},
+                                 {"end_cycle", e.endCycle},
+                                 {"duration_ms", double(e.endCycle - e.startCycle) * 1000.0 / kAudioBaseClockHz},
+                                 {"peak_db", e.peakDb},
+                                 {"dominant_hz", e.dominantHz}}));
+                    }
+                } catch (...) {
+                    alive = false;   // a closed connection: drop the subscription
+                    break;
+                }
+            }
+            it = alive ? std::next(it) : audioSubscriptions_.erase(it);
+        }
+    } catch (...) {
+    }
 }
 
 }  // namespace harness

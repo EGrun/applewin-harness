@@ -27,14 +27,20 @@
 #include "Windows/DXSoundBuffer.h"
 #pragma warning(pop)
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <string>
+#include <variant>
+#include <vector>
 
 namespace harness {
 
@@ -90,6 +96,232 @@ void Boot()
 
 constexpr uint32_t kTypeTimeoutFrames = 600;   // spec: TypeText gives up after 600 frames of emulated time
 
+// ---- Input queue (spec: docs/specs/m3.md "Input queue"; D10). Cycles here are EmulatedCycles() values.
+
+struct JoyState {
+    uint8_t x = 127, y = 127;
+    bool b0 = false, b1 = false;
+};
+
+struct QueuedOp {
+    enum class Kind { Text, Key, Joy } kind = Kind::Key;
+    uint64_t id = 0;
+    // Text
+    std::string text;
+    size_t next = 0;
+    uint64_t delayCycles = 0;
+    uint64_t earliest = 0;      // the next text key is not due before this cycle
+    // Key
+    KeySpec key{uint8_t(0)};
+    uint64_t holdCycles = 0;
+    // Joy
+    JoystickChange change;
+    uint64_t durationCycles = 0;
+    // Text and Key: set once the first key has been applied.
+    bool started = false;
+    uint64_t first = 0;
+};
+
+struct TimedOp {
+    enum class Kind { KeyUp, JoyRestore } kind = Kind::KeyUp;
+    uint64_t id = 0, due = 0, first = 0;
+    WPARAM vk = 0;
+    JoyState restore;
+};
+
+struct InputState {
+    std::deque<QueuedOp> fifo;
+    std::vector<TimedOp> timed;
+    std::vector<InputApplied> applied;           // completed, not yet taken
+    std::map<uint64_t, uint64_t> firstCycles;    // id -> cycle of the first effect (bounded)
+    JoyState joy;
+    uint64_t nextId = 1;
+    uint64_t keysApplied = 0;                    // text and key events applied (TypeText's progress counter)
+};
+InputState g_input;
+
+uint64_t EmulatedNow()
+{
+    return g_nCumulativeCycles - g_cyclesAtPowerOn;
+}
+
+uint64_t MsToBaseCycles(uint32_t ms)
+{
+    return uint64_t(double(ms) * CLK_6502_NTSC / 1000.0);   // base clock, not the speed-adjusted one
+}
+
+bool StrobeClear()
+{
+    return (KeybReadData() & 0x80) == 0;
+}
+
+// The key's own VK where AppleWin's AKD table accepts one, VK_SPACE otherwise.
+WPARAM VkForAscii(uint8_t c)
+{
+    if (c >= 'a' && c <= 'z') return WPARAM(c - 'a' + 'A');
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return WPARAM(c);
+    switch (c) {
+    case 0x0D: return VK_RETURN;
+    case 0x1B: return VK_ESCAPE;
+    case 0x09: return VK_TAB;
+    case 0x08: return VK_BACK;
+    case 0x7F: return VK_DELETE;
+    default: return VK_SPACE;
+    }
+}
+
+WPARAM VkForArrow(ArrowKey a)
+{
+    switch (a) {
+    case ArrowKey::Left: return VK_LEFT;
+    case ArrowKey::Right: return VK_RIGHT;
+    case ArrowKey::Up: return VK_UP;
+    default: return VK_DOWN;
+    }
+}
+
+void NoteFirst(uint64_t id, uint64_t cycle)
+{
+    g_input.firstCycles.emplace(id, cycle);
+    while (g_input.firstCycles.size() > 4096)
+        g_input.firstCycles.erase(g_input.firstCycles.begin());
+}
+
+void Complete(uint64_t id, uint64_t first, uint64_t last)
+{
+    g_input.applied.push_back(InputApplied{id, first, last});
+}
+
+void ApplyJoy(const JoyState& s)
+{
+    g_input.joy = s;
+    JoySetPosition(s.x, 255, s.y, 255);
+    JoySetButton(BUTTON0, s.b0 ? BUTTON_DOWN : BUTTON_UP);
+    JoySetButton(BUTTON1, s.b1 ? BUTTON_DOWN : BUTTON_UP);
+}
+
+// Joystick 0 as the mouse-as-joystick seam: no host device is ever read. Centre, buttons up.
+void ResetJoystick()
+{
+    JoySetJoyType(JN_JOYSTICK0, J0C_MOUSE);
+    ApplyJoy(JoyState{});
+}
+
+// Drops every queued input and releases held keys (PowerCycle, Start, Shutdown).
+void ClearInput()
+{
+    for (const TimedOp& t : g_input.timed)
+        if (t.kind == TimedOp::Kind::KeyUp)
+            KeybAnyKeyDown(WM_KEYUP, t.vk, false);
+    g_input.timed.clear();
+    g_input.fifo.clear();
+}
+
+// Applies every event that is due at the current step boundary.
+void ProcessDueInput()
+{
+    const uint64_t now = EmulatedNow();
+
+    for (;;) {   // timed releases and restores, earliest first
+        auto best = g_input.timed.end();
+        for (auto it = g_input.timed.begin(); it != g_input.timed.end(); ++it)
+            if (it->due <= now && (best == g_input.timed.end() || it->due < best->due))
+                best = it;
+        if (best == g_input.timed.end())
+            break;
+        const TimedOp t = *best;
+        g_input.timed.erase(best);
+        if (t.kind == TimedOp::Kind::KeyUp)
+            KeybAnyKeyDown(WM_KEYUP, t.vk, false);
+        else
+            ApplyJoy(t.restore);
+        Complete(t.id, t.first, now);
+    }
+
+    while (!g_input.fifo.empty()) {   // first in, first out: the first event that is not due blocks the rest
+        QueuedOp& op = g_input.fifo.front();
+        if (op.kind == QueuedOp::Kind::Text) {
+            if (op.next >= op.text.size()) {   // empty text
+                NoteFirst(op.id, now);
+                Complete(op.id, now, now);
+                g_input.fifo.pop_front();
+                continue;
+            }
+            if (now < op.earliest || !StrobeClear())
+                break;
+            KeybQueueKeypress(WPARAM(static_cast<unsigned char>(op.text[op.next])), ASCII);
+            ++g_input.keysApplied;
+            if (!op.started) {
+                op.started = true;
+                op.first = now;
+                NoteFirst(op.id, now);
+            }
+            ++op.next;
+            op.earliest = now + op.delayCycles;
+            if (op.next >= op.text.size()) {
+                Complete(op.id, op.first, now);
+                g_input.fifo.pop_front();
+            }
+        } else if (op.kind == QueuedOp::Kind::Key) {
+            if (std::holds_alternative<ResetKey>(op.key)) {
+                CtrlReset();   // does not wait for the strobe
+                NoteFirst(op.id, now);
+                Complete(op.id, now, now);
+                g_input.fifo.pop_front();
+                continue;
+            }
+            if (!StrobeClear())
+                break;
+            WPARAM vk;
+            if (const ArrowKey* a = std::get_if<ArrowKey>(&op.key)) {
+                vk = VkForArrow(*a);
+                KeybQueueKeypress(vk, NOT_ASCII);
+            } else {
+                const uint8_t c = std::get<uint8_t>(op.key);
+                vk = VkForAscii(c);
+                KeybQueueKeypress(WPARAM(c), ASCII);
+            }
+            ++g_input.keysApplied;
+            NoteFirst(op.id, now);
+            if (op.holdCycles > 0) {
+                KeybAnyKeyDown(WM_KEYDOWN, vk, false);
+                TimedOp t;
+                t.kind = TimedOp::Kind::KeyUp;
+                t.id = op.id;
+                t.due = now + op.holdCycles;
+                t.first = now;
+                t.vk = vk;
+                g_input.timed.push_back(t);
+            } else {
+                Complete(op.id, now, now);
+            }
+            g_input.fifo.pop_front();
+        } else {   // Joy
+            const JoyState previous = g_input.joy;
+            JoyState s = previous;
+            if (op.change.x) s.x = *op.change.x;
+            if (op.change.y) s.y = *op.change.y;
+            if (op.change.button0) s.b0 = *op.change.button0;
+            if (op.change.button1) s.b1 = *op.change.button1;
+            ApplyJoy(s);
+            NoteFirst(op.id, now);
+            if (op.durationCycles > 0) {
+                TimedOp t;
+                t.kind = TimedOp::Kind::JoyRestore;
+                t.id = op.id;
+                t.due = now + op.durationCycles;
+                t.first = now;
+                t.restore = previous;
+                g_input.timed.push_back(t);
+            } else {
+                Complete(op.id, now, now);
+            }
+            g_input.fifo.pop_front();
+        }
+    }
+}
+
+
 // The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
 // holds the sound rule and the window-closed rule for all three.
 // Stepped: period-sized steps, no pacing. Realtime (D9): a BurstBudget burst corrected by the speaker's cycle
@@ -109,6 +341,7 @@ public:
     // Runs one step of at most `remaining` cycles. Returns true if the run must stop (window closed).
     bool Step(uint64_t remaining)
     {
+        ProcessDueInput();   // input takes effect at the start of the step (D10)
         uint64_t cycles;
         if (realtime_) {
             const int64_t withFeedback = int64_t(budget_->Next()) + g_nCpuCyclesFeedback;
@@ -265,10 +498,15 @@ void Emulator::Start(const EmulatorConfig& config)
     ResetToLogoMode();
     LoadConfiguration(true);
     SetApple2Type(A2TYPE_APPLE2EENHANCED);
-    // Host joysticks are never read (determinism): both ports disabled before JoyInitialize().
-    JoySetJoyType(JN_JOYSTICK0, J0C_DISABLED);
+    // Host joysticks are never read (determinism): port 1 disabled, port 0 is the mouse-as-joystick seam (ResetJoystick).
+    JoySetJoyType(JN_JOYSTICK0, J0C_MOUSE);   // mouse-as-joystick seam: driven by the input queue, no host device
     JoySetJoyType(JN_JOYSTICK1, J1C_DISABLED);
     JoyInitialize();
+    ClearInput();
+    g_input.nextId = 1;
+    g_input.applied.clear();
+    g_input.firstCycles.clear();
+    ResetJoystick();
     VideoSwitchVideocardPalette(RGB_GetVideocard(), GetVideo().GetVideoType());
     GetFrame().Initialize(true);
     // AppleWin calls SpkrInitialize() from WM_CREATE, after DSInit() (here: after the sound decision above). Without it
@@ -306,6 +544,7 @@ void Emulator::Shutdown()
 {
     if (!g_started)
         return;
+    ClearInput();
     // Ruling R10: Shutdown owns releasing the disk images; otherwise AppleWin keeps the image files open.
     if (GetCardMgr().QuerySlot(SLOT6) == CT_Disk2) {
         Disk2InterfaceCard& card = Disk2Card();
@@ -322,10 +561,12 @@ void Emulator::PowerCycle()
 {
     RequireStarted();
     // ResetMachineState() already boots the Disk II card (Utilities.cpp); a second Boot() would load a disk image twice.
+    ClearInput();   // discards queued input and releases held keys
     ResetMachineState();
     PinPowerOnRandomness();
     g_nAppMode = MODE_RUNNING;
     g_cyclesAtPowerOn = g_nCumulativeCycles;
+    ResetJoystick();
 }
 
 bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
@@ -371,51 +612,102 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
         if (u != 0x0D && (u < 0x20 || u > 0x7E))
             throw std::invalid_argument("TypeText: only 0x0D and 0x20-0x7E can be typed");
     }
+    if (text.empty())
+        return true;
+    // M2's behaviour on the input queue: queue the text with no delay and run until its last key has been applied. A key
+    // that is not applied within 600 frames of emulated time of the previous one (the strobe never clears) is a timeout.
+    const uint64_t id = QueueText(text, 0);
     Stepper stepper(pacing);   // Realtime: sound unmuted for this scope
     const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
-    for (const char c : text) {
-        const uint64_t giveUp = g_nCumulativeCycles + timeout;
-        while (KeybReadData() & 0x80) {
-            if (g_nCumulativeCycles >= giveUp)
-                throw std::runtime_error("TypeText: keyboard not read");
-            if (stepper.Step(UINT64_MAX))
-                return false;
+    uint64_t seen = g_input.keysApplied;
+    uint64_t progressAt = g_nCumulativeCycles;
+    for (;;) {
+        ProcessDueInput();
+        if (g_input.keysApplied != seen) {
+            seen = g_input.keysApplied;
+            progressAt = g_nCumulativeCycles;
         }
-        KeybQueueKeypress(WPARAM(static_cast<unsigned char>(c)), ASCII);
+        auto done = std::find_if(g_input.applied.begin(), g_input.applied.end(),
+                                 [id](const InputApplied& a) { return a.inputId == id; });
+        if (done != g_input.applied.end()) {
+            g_input.applied.erase(done);   // TypeText consumes its own completion
+            return true;
+        }
+        if (g_nCumulativeCycles - progressAt >= timeout) {
+            std::erase_if(g_input.fifo, [id](const QueuedOp& o) { return o.id == id; });
+            throw std::runtime_error("TypeText: keyboard not read");
+        }
+        if (stepper.Step(UINT64_MAX))
+            return false;
     }
-    return true;
 }
 
-// ---- Input queue: Task 2 stubs, implemented in Task 3.
-
-uint64_t Emulator::QueueText(std::string_view, uint32_t)
+uint64_t Emulator::QueueText(std::string_view text, uint32_t interKeyDelayMs)
 {
     RequireStarted();
-    throw std::logic_error("Emulator::QueueText: not implemented");
+    for (const char c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u != 0x0D && (u < 0x20 || u > 0x7E))
+            throw std::invalid_argument("QueueText: only 0x0D and 0x20-0x7E can be typed");
+    }
+    QueuedOp op;
+    op.kind = QueuedOp::Kind::Text;
+    op.id = g_input.nextId++;
+    op.text = std::string(text);
+    op.delayCycles = MsToBaseCycles(interKeyDelayMs);
+    g_input.fifo.push_back(std::move(op));
+    return g_input.fifo.back().id;
 }
 
-uint64_t Emulator::QueueKey(KeySpec, uint32_t)
+uint64_t Emulator::QueueKey(KeySpec key, uint32_t holdMs)
 {
     RequireStarted();
-    throw std::logic_error("Emulator::QueueKey: not implemented");
+    if (const uint8_t* c = std::get_if<uint8_t>(&key); c && *c > 127)
+        throw std::invalid_argument("QueueKey: ASCII code above 127");
+    QueuedOp op;
+    op.kind = QueuedOp::Kind::Key;
+    op.id = g_input.nextId++;
+    op.key = key;
+    op.holdCycles = MsToBaseCycles(holdMs);
+    g_input.fifo.push_back(std::move(op));
+    return g_input.fifo.back().id;
 }
 
-uint64_t Emulator::QueueJoystick(JoystickChange, uint32_t)
+uint64_t Emulator::QueueJoystick(JoystickChange change, uint32_t durationMs)
 {
     RequireStarted();
-    throw std::logic_error("Emulator::QueueJoystick: not implemented");
+    QueuedOp op;
+    op.kind = QueuedOp::Kind::Joy;
+    op.id = g_input.nextId++;
+    op.change = change;
+    op.durationCycles = MsToBaseCycles(durationMs);
+    g_input.fifo.push_back(std::move(op));
+    return g_input.fifo.back().id;
 }
 
-std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t) const
+std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t inputId) const
 {
     RequireStarted();
-    throw std::logic_error("Emulator::ScheduledCycle: not implemented");
+    if (const auto it = g_input.firstCycles.find(inputId); it != g_input.firstCycles.end())
+        return it->second;
+    // Not applied yet: known only when nothing is queued ahead and, for a key, the strobe is clear.
+    if (g_input.fifo.empty() || g_input.fifo.front().id != inputId)
+        return std::nullopt;
+    const QueuedOp& op = g_input.fifo.front();
+    bool waitsForStrobe = false;
+    if (op.kind == QueuedOp::Kind::Text)
+        waitsForStrobe = op.next < op.text.size();
+    else if (op.kind == QueuedOp::Kind::Key)
+        waitsForStrobe = !std::holds_alternative<ResetKey>(op.key);
+    if (waitsForStrobe && !StrobeClear())
+        return std::nullopt;
+    return EmulatedNow();
 }
 
 std::vector<InputApplied> Emulator::TakeAppliedInputs()
 {
     RequireStarted();
-    throw std::logic_error("Emulator::TakeAppliedInputs: not implemented");
+    return std::exchange(g_input.applied, {});
 }
 
 void Emulator::InsertDisk(int drive, const std::filesystem::path& image)

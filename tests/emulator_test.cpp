@@ -64,6 +64,9 @@ TEST_CASE("emu: frame geometry")
     auto b = e.Frame(true);
     CHECK(b.width == 600);
     CHECK(b.height == 420);
+    CHECK(b.strideBytes == -2400);
+    // borderless topRow = bordered topRow moved down borderH (18) rows and right borderW (20) pixels
+    CHECK(v.topRow == b.topRow + 18 * (-2400) + 20 * 4);
 }
 
 TEST_CASE("emu: frame-exact cycles")

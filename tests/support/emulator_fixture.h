@@ -3,20 +3,40 @@
 #include <windows.h>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <string>
+#include <vector>
 #include <stdexcept>
 
 namespace harness::testsupport {
 
-// Existence and last-write time of HKCU\Software\AppleWin.
+// Snapshot of the whole AppleWin registry subtree (HKCU, Software, AppleWin): whether the root exists, plus every subkey's
+// relative path and last-write time. A value written anywhere below the root changes its key's time.
 struct RegistryStamp {
     bool exists = false;
-    FILETIME lastWrite{};
-    bool operator==(const RegistryStamp& o) const
-    {
-        return exists == o.exists && lastWrite.dwLowDateTime == o.lastWrite.dwLowDateTime &&
-               lastWrite.dwHighDateTime == o.lastWrite.dwHighDateTime;
-    }
+    std::map<std::wstring, unsigned long long> keys;   // relative path ("" = root) -> last-write as 64-bit
+    bool operator==(const RegistryStamp& o) const { return exists == o.exists && keys == o.keys; }
 };
+
+inline void StampKey(HKEY key, const std::wstring& rel, RegistryStamp& s)
+{
+    FILETIME ft{};
+    DWORD subKeys = 0, maxName = 0;
+    if (RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subKeys, &maxName, nullptr, nullptr, nullptr, nullptr, nullptr, &ft) != ERROR_SUCCESS)
+        return;
+    s.keys[rel] = (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    std::vector<wchar_t> name(maxName + 2);
+    for (DWORD i = 0; i < subKeys; ++i) {
+        DWORD len = DWORD(name.size());
+        if (RegEnumKeyExW(key, i, name.data(), &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) continue;
+        std::wstring child(name.data(), len);
+        HKEY sub = nullptr;
+        if (RegOpenKeyExW(key, child.c_str(), 0, KEY_READ, &sub) == ERROR_SUCCESS) {
+            StampKey(sub, rel.empty() ? child : rel + L"\\" + child, s);
+            RegCloseKey(sub);
+        }
+    }
+}
 
 inline RegistryStamp ReadAppleWinRegistryStamp()
 {
@@ -24,7 +44,7 @@ inline RegistryStamp ReadAppleWinRegistryStamp()
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AppleWin", 0, KEY_READ, &key) == ERROR_SUCCESS) {
         s.exists = true;
-        RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &s.lastWrite);
+        StampKey(key, L"", s);
         RegCloseKey(key);
     }
     return s;

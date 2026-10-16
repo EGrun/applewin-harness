@@ -30,12 +30,27 @@ TEST_CASE("fft: pure sines come back within 0.5%")
     }
 }
 
-TEST_CASE("fft: only the first 16,384 samples count")
+TEST_CASE("fft: off-bin tones need the parabolic refinement and the Hann window")
 {
-    std::vector<float> s = Sine(16384, 44100.0, 440.0);
+    // Bin width 44100 / 16384 = 2.6917 Hz. 1234.5 Hz is 0.64 bins past bin 458 and 1233.449 Hz is bin 458.25. The
+    // unrefined peak bin is off by 0.078% and 0.055%. Refined on a rectangular window the error is still 0.035-0.051%;
+    // Hann-windowed and refined (on linear or log magnitude) it is at most 0.011%.
+    for (double hz : {1234.5, 458.25 * 44100.0 / 16384.0}) {
+        CAPTURE(hz);
+        CHECK(DominantHz(Sine(16384, 44100.0, hz), 44100.0) == doctest::Approx(hz).epsilon(0.0002));
+    }
+}
+
+TEST_CASE("fft: exactly the first 16,384 samples count")
+{
+    // [0, 4096): 440 Hz; [4096, 16384): 2000 Hz; then a louder 3000 Hz. A 16,384-point FFT sees mostly 2000 Hz; a
+    // 4,096-point one would see only 440 Hz, and one over more than 16,384 samples would pick up the 3000 Hz.
+    std::vector<float> s = Sine(4096, 44100.0, 440.0);
+    std::vector<float> mid = Sine(16384, 44100.0, 2000.0);
+    s.insert(s.end(), mid.begin() + 4096, mid.end());
     const std::vector<float> later = Sine(20000, 44100.0, 3000.0, 30000.0);
     s.insert(s.end(), later.begin(), later.end());
-    CHECK(DominantHz(s, 44100.0) == doctest::Approx(440.0).epsilon(0.005));
+    CHECK(DominantHz(s, 44100.0) == doctest::Approx(2000.0).epsilon(0.01));
 }
 
 TEST_CASE("fft: a short input is zero-padded")

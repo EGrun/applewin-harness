@@ -155,15 +155,18 @@ TEST_CASE("capture: uneven commits are placed by the interval between them")
     CheckFrames(all, 3443, 3589, 300, 300);
     CheckFrames(all, 3593, 3689, 500, 500);
 
-    // The ramp is spread linearly: frame 1441 + j holds about 10 x (j x 100 / 2000), and never decreases.
-    uint64_t bad = 0, decreasing = 0;
+    // The ramp is interpolated linearly: frame 1441 + j holds 10 x (j x 100 / 2000) = j / 2 (within 3), never
+    // decreases, and moves by at most 2 per frame (zero-order hold or nearest-neighbour would jump by 10).
+    uint64_t bad = 0, decreasing = 0, jumps = 0;
     for (uint64_t k = 1443; k < 3439; ++k) {
         const double expected = 10.0 * double(k - 1441) * 100.0 / 2000.0;
-        if (std::abs(all[2 * k] - expected) > 12.0 || all[2 * k] != all[2 * k + 1]) ++bad;
+        if (std::abs(all[2 * k] - expected) > 3.0 || all[2 * k] != all[2 * k + 1]) ++bad;
         if (all[2 * k] < all[2 * (k - 1)]) ++decreasing;
+        if (all[2 * k] - all[2 * (k - 1)] > 2) ++jumps;
     }
     CHECK(bad == 0);
     CHECK(decreasing == 0);
+    CHECK(jumps == 0);
 }
 
 TEST_CASE("capture: a stereo commit keeps its channels; a mono commit goes to both")
@@ -228,6 +231,62 @@ TEST_CASE("capture: the ring keeps the newest 30 s and Read past it throws")
 
     CHECK_THROWS_AS(c.Read(c.OldestCycle() - 1, c.OldestCycle() + 1000), std::out_of_range);
     CHECK_THROWS_AS(c.Read(0, 10), std::out_of_range);
+}
+
+namespace {
+
+// A sample value that changes every frame and doesn't repeat with the ring's period.
+int16_t SeamValue(uint64_t frame) { return int16_t(int64_t((frame * 7) % 30011) - 15005); }
+
+// Checks that the frames [from, to) read from the capture hold SeamValue(frame) (within 1).
+void CheckSeamValues(const AudioCapture& c, uint64_t from, uint64_t to)
+{
+    const auto got = c.Read(F2C(from), F2C(to));
+    REQUIRE(got.size() == 2 * (to - from));
+    uint64_t bad = 0, firstBad = 0;
+    for (uint64_t k = from; k < to; ++k) {
+        const int want = SeamValue(k);
+        const size_t i = size_t(k - from);
+        if (std::abs(got[2 * i] - want) > 1 || std::abs(got[2 * i + 1] - want) > 1)
+            if (bad++ == 0) firstBad = k;
+    }
+    INFO("frames [" << from << ", " << to << "): first mismatch at frame " << firstBad);
+    CHECK(bad == 0);
+}
+
+}  // namespace
+
+TEST_CASE("capture: commits that straddle the ring's seam keep every sample")
+{
+    // 4,409-frame commits (1,323,000 is not a multiple of 4,409), each placed one-to-one on the timeline, so commit 301
+    // (frames [1,322,709, 1,327,118)) crosses the ring's physical end. 305 commits = 1,344,745 frames.
+    AudioCapture c;
+    const uint64_t chunk = 4409, total = 305 * chunk;
+    std::vector<int16_t> s(chunk);
+    for (uint64_t done = 0; done < total; done += chunk) {
+        for (uint64_t i = 0; i < chunk; ++i) s[size_t(i)] = SeamValue(done + i);
+        c.Commit(0, s, 1, F2C(done + chunk));
+    }
+    CHECK(c.NewestCycle() == F2C(total));
+    CHECK(c.OldestCycle() == F2C(total - harness::kAudioRingFrames));
+    CheckSeamValues(c, harness::kAudioRingFrames - 3000, harness::kAudioRingFrames + 3000);   // across the seam
+    CheckSeamValues(c, total - harness::kAudioRingFrames, total - harness::kAudioRingFrames + 3000);   // oldest
+    CheckSeamValues(c, total - 3000, total);   // newest
+}
+
+TEST_CASE("capture: a single commit longer than the ring keeps its newest 30 s")
+{
+    AudioCapture c;
+    const uint64_t total = 1400000;
+    std::vector<int16_t> s(total);
+    for (uint64_t k = 0; k < total; ++k) s[size_t(k)] = SeamValue(k);
+    // A first commit covers N x CLK/44100 cycles before its end: frames [0, 1,400,000).
+    c.Commit(0, s, 1, F2C(total));
+    CHECK(c.NewestCycle() == F2C(total));
+    CHECK(c.OldestCycle() == F2C(total - harness::kAudioRingFrames));
+    CheckSeamValues(c, total - harness::kAudioRingFrames + 2, total - harness::kAudioRingFrames + 3000);
+    CheckSeamValues(c, total - 3000, total);
+    CHECK_THROWS_AS(c.Read(F2C(total - harness::kAudioRingFrames) - 1, F2C(total)), std::out_of_range);
 }
 
 TEST_CASE("capture: Clear empties the timeline and forgets every voice")

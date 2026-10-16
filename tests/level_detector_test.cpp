@@ -111,6 +111,7 @@ TEST_CASE("level: a DC offset alone is not sound (Review Focus 3)")
     REQUIRE(ev.size() == 2);
     CHECK(ev[0].kind == SoundEvent::Started);
     CHECK(ev[0].startCycle + kBlockCycles >= F2C(Frames(1000)));
+    CHECK(ev[0].startCycle <= F2C(Frames(1000)) + kBlockCycles);
     CHECK(ev[1].kind == SoundEvent::Stopped);
     CHECK(ev[1].peakDb == doctest::Approx(-20.0).epsilon(0.05));
 }
@@ -150,6 +151,31 @@ TEST_CASE("level: min_silence_ms bridges shorter gaps")
         CHECK(ev[1].endCycle <= F2C(Frames(400)) + kBlockCycles);
         CHECK(ev[2].startCycle + kBlockCycles >= F2C(Frames(450)));
     }
+}
+
+TEST_CASE("level: the defaults are -50 dB and 100 ms")
+{
+    // A -45 dB tone with a 90 ms gap (bridged by 100 ms, not by 80 ms), then a -55 dB tone (below -50, above -60).
+    std::vector<int16_t> s = Constant(Frames(200), 0);
+    Append(s, SquareWave(Frames(200), kRate, 1000.0, AmplitudeForDb(-45.0)));
+    Append(s, Constant(Frames(90), 0));
+    Append(s, SquareWave(Frames(200), kRate, 1000.0, AmplitudeForDb(-45.0)));
+    Append(s, Constant(Frames(500), 0));
+    Append(s, SquareWave(Frames(300), kRate, 1000.0, AmplitudeForDb(-55.0)));
+    Append(s, Constant(Frames(500), 0));
+    AudioCapture c;
+    CommitOnTimeline(c, 0, s, 0);
+    LevelDetector d;
+    const auto ev = d.Feed(c, c.NewestCycle());
+    INFO(Describe(ev));
+    REQUIRE(ev.size() == 2);
+    CHECK(ev[0].kind == SoundEvent::Started);
+    CHECK(ev[0].startCycle + kBlockCycles >= F2C(Frames(200)));
+    CHECK(ev[0].startCycle <= F2C(Frames(200)) + kBlockCycles);
+    CHECK(ev[1].kind == SoundEvent::Stopped);
+    CHECK(ev[1].endCycle + kBlockCycles >= F2C(Frames(690)));
+    CHECK(ev[1].endCycle <= F2C(Frames(690)) + kBlockCycles);
+    CHECK(ev[1].peakDb == doctest::Approx(-45.0).epsilon(0.025));
 }
 
 TEST_CASE("level: a tone below the threshold is not sound")

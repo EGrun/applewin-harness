@@ -21,7 +21,8 @@ inline constexpr uint64_t kCyclesPerFrameDen = 8778;
 //
 // Placement: a voice's commit of N sample frames covers the cycles from the end of that voice's previous commit to
 // endCycle. The first commit of a voice (and the first after ResetVoice or Clear) covers the N x (CLK_6502_NTSC / 44100)
-// cycles before endCycle (clamped at 0). The N frames are resampled linearly onto the timeline frames
+// cycles before endCycle (clamped at 0). The N frames are resampled linearly (input frame i sits at timeline position
+// start + i x M / N, M = the number of timeline frames) onto the timeline frames
 // [CycleToFrame(start), CycleToFrame(endCycle)) and added to what is there with saturation to int16. A mono commit
 // (channels == 1) goes to both channels. A commit whose interval is empty (endCycle not after the voice's previous end)
 // adds nothing but still counts as that voice's latest commit. Frames older than the ring are dropped.

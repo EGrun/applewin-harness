@@ -24,7 +24,7 @@ AppleWinHarness.exe --serve [--headless]
   - The keys are in that order. `<id>` is 32 random hex characters.
   - Each token is 32 random bytes from `BCryptGenRandom`, written as hex. They are never written anywhere else.
 - **One session per process.** The process serves at most one session (`create_session` once). Start another process for another session.
-- **Exit.** The process exits with 0 after `close_session` has been answered, or when the window is closed. It exits with 1 on a fatal error, after printing `error: …` to stderr. Working copies and the INI file are removed on every exit path.
+- **Exit.** The process exits with 0 after `close_session` has been answered, or when the window is closed. It exits with 1 on a fatal error, after printing `error: …` to stderr. The process also exits with 0 when the process that launched it exits (an orphaned server never lingers); if the launcher cannot be watched at startup, it prints one line to stderr and carries on. Working copies and the INI file are removed on every exit path.
 - The display mode is fixed for the life of the process, and it never changes emulation results.
 - In windowed mode, closing the window shuts the harness down. This works like `close_session` followed by exit.
 
@@ -49,6 +49,7 @@ The first message on every connection must be `hello`:
 - The response is `{ protocol_version: "0.3", role, display_mode: "windowed" | "headless" }`.
 - A `protocol_version` other than `"0.3"` returns `-32600` and the server closes the connection.
 - A wrong token or role, or any method other than `hello` as the first message, returns `-32001` and the server closes the connection. So does malformed JSON or an invalid request as the first message (the error reply is sent first).
+- A connection that has not completed `hello` within 10 seconds is closed, which frees its slot.
 - The role is fixed for the life of the connection.
 - The server returns `-32001` if an agent connection calls an operator method. The connection stays open.
 - Requests after `hello` don't carry a token.
@@ -142,7 +143,7 @@ After this call the server sends `sound_started` and `sound_stopped` notificatio
 ## Operator API
 
 ### Sessions
-**`create_session`** `{ model?: "apple2ee" = "apple2ee", disks?: [ { slot: 6, drive: 1|2 = 1, path } ], run_mode?: "realtime" | "stepped" = "realtime", speed?: {...}, allow_text_screen?: bool = false, shared_memory_frames?: bool = false }`
+**`create_session`** `{ model?: "apple2ee" = "apple2ee", disks?: [ { slot: 6, drive: 1|2, path } ], run_mode?: "realtime" | "stepped" = "realtime", speed?: {...}, allow_text_screen?: bool = false, shared_memory_frames?: bool = false }`
 
 Returns `{ session_id }`.
 - `path` must be absolute (`-32602`). A missing file returns `-32005`.

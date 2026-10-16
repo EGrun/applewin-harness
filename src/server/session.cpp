@@ -154,6 +154,11 @@ void Session::SetFatalErrorSource(std::function<std::string()> fatalError)
     fatalError_ = std::move(fatalError);
 }
 
+void Session::SetParentProcess(void* processHandle)
+{
+    parent_ = processHandle;
+}
+
 void Session::Post(ConnectionPtr connection, json request)
 {
     // Connection thread. Never throws into the transport: a request that cannot be queued is answered here.
@@ -196,14 +201,19 @@ int Session::RunMainLoop()
                     break;
                 }
             }
+            const HANDLE parent = static_cast<HANDLE>(parent_);
             if (state_ == State::Running) {
-                // One realtime step (it pumps the window), then the commands that arrived meanwhile.
+                // One realtime step, the window pumped after it, then the commands that arrived meanwhile.
                 const bool open = emulator_.RunRealtimeStep();
                 SendInputApplied();
                 if (!open) break;   // window closed: exit 0
+                if (!emulator_.PumpWindow()) break;
+                if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) break;   // launcher exited: exit 0
             } else {
-                HANDLE h = static_cast<HANDLE>(queueEvent_);
-                MsgWaitForMultipleObjects(1, &h, FALSE, kIdleWaitMs, QS_ALLINPUT);
+                HANDLE waits[2] = {static_cast<HANDLE>(queueEvent_), parent};
+                const DWORD count = parent ? 2 : 1;
+                const DWORD w = MsgWaitForMultipleObjects(count, waits, FALSE, kIdleWaitMs, QS_ALLINPUT);
+                if (parent && w == WAIT_OBJECT_0 + 1) break;   // launcher exited: exit 0
                 if (state_ != State::NoSession && !emulator_.PumpWindow()) break;   // window closed: exit 0
             }
             if (!DrainCommands()) break;

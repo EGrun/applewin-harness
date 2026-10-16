@@ -7,6 +7,7 @@
 #include "server/session.h"
 #include <nlohmann/json.hpp>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -200,17 +201,52 @@ int Run(const Args& a)
     return rc;
 }
 
+// A SYNCHRONIZE handle to the process that launched this one, or null when it is already gone or cannot be opened.
+HANDLE OpenParentProcess()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return nullptr;
+    const DWORD self = GetCurrentProcessId();
+    DWORD parentPid = 0;
+    FILETIME selfCreated{}, parentCreated{}, unused{};
+    PROCESSENTRY32W e{};
+    e.dwSize = sizeof(e);
+    for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e))
+        if (e.th32ProcessID == self) {
+            parentPid = e.th32ParentProcessID;
+            break;
+        }
+    CloseHandle(snap);
+    if (parentPid == 0) return nullptr;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+    if (!h) return nullptr;
+    // A recycled pid names an unrelated process: the real parent must have been created before this process.
+    HANDLE me = GetCurrentProcess();
+    if (!GetProcessTimes(me, &selfCreated, &unused, &unused, &unused) ||
+        !GetProcessTimes(h, &parentCreated, &unused, &unused, &unused) ||
+        CompareFileTime(&parentCreated, &selfCreated) > 0 || WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+        CloseHandle(h);
+        return nullptr;
+    }
+    return h;
+}
+
 // The JSON-RPC server (spec: docs/specs/m3.md, Part A "Launch"): announce, serve until close_session, the window
 // closing (exit 0) or a fatal error (exit 1). The session removes the working copies and the INI on every path.
 int Serve(const Args& a)
 {
     try {
+        // Exit (0, normal cleanup) when the launching process exits. Opened before the announcement, so a launcher
+        // that exits right after reading it is still seen; without a handle there is no watch.
+        HANDLE parent = OpenParentProcess();
+        if (!parent) std::cerr << "note: parent process not watched\n";
         const auto display = a.headless ? harness::DisplayMode::Headless : harness::DisplayMode::Windowed;
         const std::wstring pipe = harness::PipeServer::RandomPipeName();
         harness::Tokens tokens{harness::PipeServer::RandomToken(), harness::PipeServer::RandomToken()};
         const std::string agentToken = tokens.agent, operatorToken = tokens.operatorToken;
         // The session outlives the server: connection threads post to it until Stop has joined them.
         harness::Session session(display, harness::Emulator::Instance());
+        session.SetParentProcess(parent);
         harness::PipeServer server(
             pipe, std::move(tokens),
             [&session](harness::ConnectionPtr c, nlohmann::json request) { session.Post(std::move(c), std::move(request)); },
@@ -228,6 +264,7 @@ int Serve(const Args& a)
         std::cout.flush();
         session.SetFatalErrorSource([&server] { return server.FatalError(); });
         const int rc = session.RunMainLoop();
+        if (parent) CloseHandle(parent);
         server.Stop();   // after the last replies (close_session's {}) have been written
         return rc;
     } catch (const std::exception& e) {

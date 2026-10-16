@@ -444,5 +444,50 @@ class AgentMethodsTest(PipeTestCase):
         self.assertIn("input_id", agent.call("type_text", text="x" * 4095 + "\n"))
 
 
+LAUNCHER = r'''
+import os, subprocess, sys
+exe = os.environ["HARNESS_EXE"]
+p = subprocess.Popen([exe, "--serve", "--headless"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.DEVNULL, cwd=os.path.dirname(exe))
+sys.stdout.write(p.stdout.readline().decode("utf-8"))
+sys.stdout.flush()
+'''
+
+
+class OrphanTest(unittest.TestCase):
+    def test_server_exits_when_its_launcher_exits(self):
+        import subprocess
+        import sys
+        import tempfile
+        from harness_client import exe_path
+        env = dict(os.environ, HARNESS_EXE=exe_path())
+        out = subprocess.run([sys.executable, "-c", LAUNCHER], env=env, stdout=subprocess.PIPE, timeout=30).stdout
+        announcement = json.loads(out.decode("utf-8"))
+        pid = announcement["pid"]
+        self.addCleanup(subprocess.call, ["taskkill", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+        work = os.path.join(tempfile.gettempdir(), "applewin-harness", str(pid))
+        ini = work + ".ini"
+        deadline = time.time() + 10
+        while time.time() < deadline and _pid_alive(pid):
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(pid), "the server outlived its launcher by 10 s")
+        self.assertFalse(os.path.exists(work))
+        self.assertFalse(os.path.exists(ini))
+
+
+def _pid_alive(pid):
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)   # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x102   # WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 if __name__ == "__main__":
     unittest.main()

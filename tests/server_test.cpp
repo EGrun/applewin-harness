@@ -282,6 +282,23 @@ TEST_CASE("server: a length prefix over 16 MiB closes the connection")
     CheckServerStillServes(s);
 }
 
+TEST_CASE("server: a connection that has not said hello within 10 s is closed, freeing its slot")
+{
+    Server s = StartServer();
+    std::vector<std::unique_ptr<PipeClient>> idle;   // all 8 instances held by clients that never speak
+    for (int i = 0; i < 8; ++i) {
+        auto c = std::make_unique<PipeClient>();
+        REQUIRE(c->Open(s.announcement.pipe));
+        idle.push_back(std::move(c));
+    }
+    const auto start = std::chrono::steady_clock::now();
+    for (auto& c : idle) CHECK_MESSAGE(c->WaitClosed(14s), "an idle connection was not closed within 14 s");
+    CHECK(std::chrono::steady_clock::now() - start < 14s);
+    CHECK(s.process->Running());
+    auto op = Connect(s, "operator");   // the slots are free again
+    CHECK(op->StaysOpen(200ms));
+}
+
 TEST_CASE("server: a truncated message closes only that connection")
 {
     Server s = StartServer();

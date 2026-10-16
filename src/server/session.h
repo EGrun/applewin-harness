@@ -40,6 +40,11 @@ public:
     // RunMainLoop.
     void SetFatalErrorSource(std::function<std::string()> fatalError);
 
+    // A handle (SYNCHRONIZE) to the process that launched the server, owned by the caller and valid until RunMainLoop
+    // returns. When it becomes signalled the loop ends as for close_session (exit 0, normal cleanup). Set before
+    // RunMainLoop; null means no watch.
+    void SetParentProcess(void* processHandle);
+
     // The operator-only methods (create_session, close_session, pause, resume, step_frames); PipeServer's
     // isOperatorOnly.
     static bool IsOperatorOnly(std::string_view method);
@@ -87,6 +92,7 @@ private:
 
     std::mutex queueMutex_;
     std::deque<Command> queue_;
+    void* parent_ = nullptr;       // watched parent process handle, or null
     void* queueEvent_ = nullptr;   // auto-reset event set by Post (a Win32 HANDLE)
 
     State state_ = State::NoSession;

@@ -85,10 +85,10 @@ HANDLE NewEvent()
 
 // Waits for an issued overlapped operation, or cancels it if `cancel` is signalled first. Returns the bytes
 // transferred, or nullopt on failure or cancellation. Never returns while the operation is still in flight.
-std::optional<DWORD> FinishOverlapped(HANDLE file, OVERLAPPED& ov, HANDLE cancel)
+std::optional<DWORD> FinishOverlapped(HANDLE file, OVERLAPPED& ov, HANDLE cancel, DWORD timeoutMs = INFINITE)
 {
     const HANDLE waits[2] = {ov.hEvent, cancel};
-    const DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+    const DWORD w = WaitForMultipleObjects(2, waits, FALSE, timeoutMs);   // a timeout cancels like `cancel`
     if (w != WAIT_OBJECT_0) CancelIoEx(file, &ov);
     DWORD n = 0;
     const BOOL ok = GetOverlappedResult(file, &ov, &n, TRUE);   // completes (or aborts) the operation either way
@@ -162,19 +162,26 @@ public:
         }
     }
 
-    // Reads exactly n bytes; false on disconnect, error or cancellation. Reader thread only.
-    bool ReadExact(uint8_t* p, size_t n, HANDLE readEvent)
+    // Reads exactly n bytes; false on disconnect, error, cancellation or (when deadline != 0, a GetTickCount64 value)
+    // the deadline passing. Reader thread only.
+    bool ReadExact(uint8_t* p, size_t n, HANDLE readEvent, ULONGLONG deadline = 0)
     {
         size_t got = 0;
         while (got < n) {
             if (closed_.load()) return false;
+            DWORD timeoutMs = INFINITE;
+            if (deadline) {
+                const ULONGLONG now = GetTickCount64();
+                if (now >= deadline) return false;
+                timeoutMs = static_cast<DWORD>(deadline - now);
+            }
             OVERLAPPED ov{};
             ov.hEvent = readEvent;
             ResetEvent(readEvent);
             const DWORD want = static_cast<DWORD>(n - got);   // <= 16 MiB
             DWORD r = 0;
             if (ReadFile(pipe_.h, p + got, want, nullptr, &ov) || GetLastError() == ERROR_IO_PENDING) {
-                const auto res = FinishOverlapped(pipe_.h, ov, cancel_.h);
+                const auto res = FinishOverlapped(pipe_.h, ov, cancel_.h, timeoutMs);
                 if (!res) return false;
                 r = *res;
             } else {
@@ -531,19 +538,23 @@ struct PipeServer::Impl {
     void Serve(std::shared_ptr<PipeConnection> conn, std::atomic<bool>& done)
     {
         constexpr DWORD kDrainMs = 2000;
+        constexpr DWORD kHelloTimeoutMs = 10000;
         std::thread writer;
         try {
             writer = std::thread([conn] { conn->WriterLoop(); });
             Handle readEvent(NewEvent());
             bool authed = false;
             std::string body;
+            // A connection must complete hello within kHelloTimeoutMs of being accepted, or it is closed.
+            const ULONGLONG helloDeadline = GetTickCount64() + kHelloTimeoutMs;
             for (;;) {
+                const ULONGLONG deadline = authed ? 0 : helloDeadline;
                 std::array<uint8_t, 4> prefix{};
-                if (!conn->ReadExact(prefix.data(), prefix.size(), readEvent.h)) break;
+                if (!conn->ReadExact(prefix.data(), prefix.size(), readEvent.h, deadline)) break;
                 const auto len = ParseLengthPrefix(std::span<const uint8_t, 4>(prefix));
                 if (!len) break;
                 body.resize(*len);
-                if (!conn->ReadExact(reinterpret_cast<uint8_t*>(body.data()), body.size(), readEvent.h)) break;
+                if (!conn->ReadExact(reinterpret_cast<uint8_t*>(body.data()), body.size(), readEvent.h, deadline)) break;
                 if (!HandleMessage(conn, body, authed)) break;
             }
         } catch (...) {

@@ -206,3 +206,32 @@ TEST_CASE("level: a sound still going gives only Started")
     REQUIRE(ev.size() == 1);
     CHECK(ev[0].kind == SoundEvent::Started);
 }
+
+TEST_CASE("level: a slow DC ramp is not sound, but a tone riding on it is (B8 detrend)")
+{
+    // AppleWin's speaker idles at -32768 and ramps to 0 at one unit per sample (about -48 dBFS mean-only AC RMS).
+    std::vector<int16_t> ramp;
+    for (int i = 0; i < 32768; ++i) ramp.push_back(int16_t(-32768 + i));
+    Append(ramp, Constant(Frames(300), 0));
+    {
+        AudioCapture c;
+        CommitOnTimeline(c, 0, ramp, 0);
+        LevelDetector d;
+        const auto ev = d.Feed(c, c.NewestCycle());
+        INFO(Describe(ev));
+        CHECK(ev.empty());
+    }
+    {
+        // Positive control: a 1 kHz -45 dB tone on the same ramp.
+        const std::vector<int16_t> tone = SquareWave(Frames(300), kRate, 1000.0, AmplitudeForDb(-45.0));
+        std::vector<int16_t> r2 = Constant(Frames(100), -16000);
+        for (size_t i = 0; i < Frames(300); ++i) r2.push_back(int16_t(-16000 + int(i) + tone[i]));
+        Append(r2, Constant(Frames(500), -16000));
+        AudioCapture c;
+        CommitOnTimeline(c, 0, r2, 0);
+        LevelDetector d;
+        const auto ev = d.Feed(c, c.NewestCycle());
+        INFO(Describe(ev));
+        CHECK(ev.size() == 2);
+    }
+}

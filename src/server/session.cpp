@@ -639,33 +639,34 @@ void Session::SendSoundEvents()
     try {
         if (audioSubscriptions_.empty()) return;
         const AudioCapture& audio = emulator_.Audio();
-        const uint64_t upto = emulator_.EmulatedCycles();
-        for (auto it = audioSubscriptions_.begin(); it != audioSubscriptions_.end();) {
-            AudioSubscription& sub = it->second;
-            bool alive = true;
+        // Hold back 110 ms behind the newest committed audio (B9): a voice can commit up to ~64 ms (a Mockingboard
+        // Timer1 period) after another, and a measured block is never revisited. Matches the capture's gap threshold.
+        constexpr uint64_t kHoldBackCycles = uint64_t(0.110 * kAudioBaseClockHz);
+        const uint64_t newest = audio.NewestCycle();
+        const uint64_t upto = (std::min)(emulator_.EmulatedCycles(), newest > kHoldBackCycles ? newest - kHoldBackCycles : 0);
+        for (auto& [id, sub] : audioSubscriptions_) {
             for (const SoundEvent& e : sub.detector.Feed(audio, upto)) {
-                try {
-                    if (e.kind == SoundEvent::Started) {
-                        sub.connection->Send(MakeNotification(
-                            "sound_started", json{{"start_cycle", e.startCycle},
-                                                  {"emulated_ms", double(e.startCycle) * 1000.0 / kAudioBaseClockHz}}));
-                    } else {
-                        sub.connection->Send(MakeNotification(
-                            "sound_stopped",
-                            json{{"start_cycle", e.startCycle},
-                                 {"end_cycle", e.endCycle},
-                                 {"duration_ms", double(e.endCycle - e.startCycle) * 1000.0 / kAudioBaseClockHz},
-                                 {"peak_db", e.peakDb},
-                                 {"dominant_hz", e.dominantHz}}));
-                    }
-                } catch (...) {
-                    alive = false;   // a closed connection: drop the subscription
-                    break;
+                if (e.kind == SoundEvent::Started) {
+                    sub.connection->Send(MakeNotification(
+                        "sound_started", json{{"start_cycle", e.startCycle},
+                                              {"emulated_ms", double(e.startCycle) * 1000.0 / kAudioBaseClockHz}}));
+                } else {
+                    sub.connection->Send(MakeNotification(
+                        "sound_stopped",
+                        json{{"start_cycle", e.startCycle},
+                             {"end_cycle", e.endCycle},
+                             {"duration_ms", double(e.endCycle - e.startCycle) * 1000.0 / kAudioBaseClockHz},
+                             {"peak_db", e.peakDb},
+                             {"dominant_hz", e.dominantHz}}));
                 }
             }
-            it = alive ? std::next(it) : audioSubscriptions_.erase(it);
         }
+    } catch (const std::exception& e) {
+        static bool logged = false;
+        if (!logged) { logged = true; std::cerr << "warning: sound events: " << e.what() << std::endl; }
     } catch (...) {
+        static bool logged = false;
+        if (!logged) { logged = true; std::cerr << "warning: sound events: unknown exception" << std::endl; }
     }
 }
 

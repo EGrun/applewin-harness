@@ -274,7 +274,8 @@ int AudioOutput::FeedbackCycles() const
     const State& s = *state_;
     if (!s.playing)
         return 0;
-    return int(double(s.error) * g_fCurrentCLK6502 / double(kAudioSampleRate));
+    // Same factor as Speaker.cpp's g_fClksPerSpkrSample: whole cycles per sample, truncated.
+    return s.error * int(UINT(g_fCurrentCLK6502 / double(kAudioSampleRate)));
 }
 
 void AudioOutput::SetPlaying(bool playing)

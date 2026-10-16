@@ -102,7 +102,7 @@ The harness runs in one of two display modes, chosen when it starts:
 
 **Rules:**
 - The window is **view-only**. Keyboard and mouse input to the window doesn't reach the emulator, so the agent API stays the only source of input and runs stay deterministic.
-- The display mode never affects emulated state. In stepped mode, a headless run and a windowed run produce identical frames and state checksums. In realtime mode the two can differ in where input lands, because of the audio feedback (D9).
+- The display mode does not affect emulated state, with one exception: SSI263 speech chips on Mockingboard cards. Headless, `SSI263::Update` returns early without DirectSound, so the phoneme-complete IRQ never fires. Windowed, that IRQ is driven partly by the DirectSound play position, which depends on host timing. So for programs that use speech, headless and windowed runs differ, and stepped windowed runs are not reproducible. Otherwise, in stepped mode, a headless run and a windowed run produce identical frames and state checksums. In realtime mode the two can differ in where input lands, because of the audio feedback (D9).
 - Sound plays through the speakers only in realtime mode. In stepped mode emulation doesn't run in real time, so playback is muted.
 - The agent's audio (D12) is captured separately, in every mode, and doesn't depend on whether sound is playing.
 - If windowed mode can't open an audio device, the harness logs a warning and carries on without sound.

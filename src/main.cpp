@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -161,6 +162,16 @@ int Run(const Args& a)
                     std::cout.flush();
                 }
             }
+        } catch (const std::exception& e) {
+            ReleaseEmulator(emu);
+            // Name the user's image, not the working copy.
+            std::string what = e.what();
+            if (copy && a.disk1) {
+                const std::string from = copy->Path().string(), to = a.disk1->string();
+                for (size_t pos = 0; (pos = what.find(from, pos)) != std::string::npos; pos += to.size())
+                    what.replace(pos, from.size(), to);
+            }
+            throw std::runtime_error(what);
         } catch (...) {
             ReleaseEmulator(emu);
             throw;

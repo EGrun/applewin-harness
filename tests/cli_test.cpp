@@ -329,6 +329,52 @@ TEST_CASE("cli: a missing disk1 file exits 1")
     CHECK(r.exitCode == 1);
 }
 
+// A 1000-byte file named bad.dsk (an unsupported image size) in a fresh temp directory removed by the guard.
+struct BadImage {
+    fs::path dir, path;
+    BadImage()
+    {
+        dir = fs::temp_directory_path() / ("applewin-harness-bad-" + std::to_string(GetCurrentProcessId()) + "-" +
+                                            std::to_string(GetTickCount64()));
+        fs::create_directories(dir);
+        path = dir / "bad.dsk";
+        std::ofstream f(path, std::ios::binary);
+        const std::string data(1000, 'x');
+        f.write(data.data(), std::streamsize(data.size()));
+    }
+    ~BadImage()
+    {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    BadImage(const BadImage&) = delete;
+    BadImage& operator=(const BadImage&) = delete;
+};
+
+// Start fails while inserting disk1 (Start shuts down, the Start guard releases again, main shuts down a third time):
+// exit 1, a readable error naming the user's image, no leftovers, no assert dialog (the child exits in time).
+void CheckInvalidDisk1Cleanup(const std::wstring& mode)
+{
+    BadImage bad;
+    auto p = LaunchCli(mode + L"--disk1 " + Quoted(bad.path) + L" --frames 1");
+    REQUIRE(p->Launched());
+    const DWORD pid = p->Pid();
+    auto r = p->Wait(60000);
+    REQUIRE(!r.timedOut);
+    INFO("output: " << r.out);
+    CHECK(r.exitCode == 1);
+    CHECK(r.out.find("cannot insert") != std::string::npos);
+    CHECK(r.out.find(bad.path.string()) != std::string::npos);   // the original path, not the working copy
+    CHECK(!fs::exists(HarnessTempDir() / std::to_string(pid)));
+    CHECK(!fs::exists(HarnessTempDir() / (std::to_string(pid) + ".ini")));
+    CHECK(FindHarnessWindow(pid) == nullptr);
+}
+
+TEST_CASE("cli: an invalid disk1 image exits 1 and cleans up")
+{
+    CheckInvalidDisk1Cleanup(L"--headless ");
+}
+
 TEST_CASE("cli: the working copy and INI are gone after a run")
 {
     auto p = LaunchCli(L"--headless --disk1 " + Quoted(DosMasterImage()) + L" --frames 1");
@@ -345,6 +391,11 @@ TEST_CASE("cli: the working copy and INI are gone after a run")
 
 TEST_SUITE("windowed")
 {
+    TEST_CASE("cli: windowed, an invalid disk1 image exits 1 and cleans up")
+    {
+        CheckInvalidDisk1Cleanup(L"");
+    }
+
     TEST_CASE("cli: windowed DOS golden prints the same hash")
     {
         auto p = LaunchCli(L"--disk1 " + Quoted(DosMasterImage()) + kDosPrintSteps, /*mergeStderr*/ false);

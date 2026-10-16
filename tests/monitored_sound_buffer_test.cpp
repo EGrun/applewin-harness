@@ -174,6 +174,21 @@ TEST_CASE("sound: wrap-around unsafe zone counts an underrun")
     CHECK(r.buf.Underruns() == 1);
 }
 
+TEST_CASE("sound: a safe poll doesn't stop tracking; a later unsafe poll counts")
+{
+    Rig r;
+    r.StartPlayback();
+    r.fake->playCursor = 100;
+    r.fake->writeCursor = 200;
+    Commit(r.buf, 0, 250);   // end 250 is outside (100, 200)
+    Poll(r.buf);
+    CHECK(r.buf.Underruns() == 0);
+    r.fake->playCursor = 240;
+    r.fake->writeCursor = 260;
+    Poll(r.buf);             // the same end 250 is now inside (240, 260)
+    CHECK(r.buf.Underruns() == 1);
+}
+
 TEST_CASE("sound: an underrun is counted once until the next commit")
 {
     Rig r;

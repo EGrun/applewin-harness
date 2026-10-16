@@ -114,6 +114,7 @@ Add `create_session`, `checkpoint`, `restore_checkpoint` and `get_state_checksum
 - The checksums are also identical when the script runs at `machine_speed` 10 and at 40.
 - `get_audio` over the same cycle range returns byte-identical audio across those runs, and in both windowed and headless mode.
 - The original disk image's hash is unchanged.
+- SSI263 speech (Mockingboard) is covered by a determinism test, or pinned off for deterministic runs (D8 exception).
 
 ### M5 — Agent adapter
 Build an MCP server that wraps the agent API, and an example agent task (for example, write and run a short BASIC program).
@@ -131,6 +132,7 @@ Session record/replay, batch experiment orchestration, sector-level disk access.
 - **Maintaining a patch set against AppleWin upstream.** Mitigation: keep patches minimal and apply them on top of the pinned submodule commit (D7).
 - **GPL-2.0 obligations** (D6).
 - **Hidden sources of non-determinism**, such as the real-time clock, the no-slot clock, random memory initialisation, and AppleWin's speaker feedback (which changes how many cycles each burst runs, depending on the host audio buffer). Mitigation: speaker feedback only runs in windowed realtime mode, stepped mode has no feedback and pins or disables the rest (D9), and M4 tests for it.
+- **SSI263 speech is display-mode dependent.** Headless, the phoneme-complete IRQ never fires (no DirectSound). Windowed, it is partly driven by the DirectSound play position, so it depends on host timing (D8). Mitigation: M4 includes a determinism test for SSI263 speech, or pins speech off for deterministic runs.
 - **Agent audio needs AppleWin patches** in `Speaker.cpp` and `MockingboardCardManager.cpp`: tap points, a Mockingboard mix that works with no sound buffer, and capture at the base clock rate. Mitigation: model the patch on the existing WAV output, keep it small, and confirm it in M3 (D12).
 - **Realtime input timing depends on when clients send input.** Mitigation: every input reports `applied_at_cycle` (D10). Use stepped mode when a run must be reproducible.
 - **Frame timing:** whole-frame capture at vsync may miss mid-frame effects. Accepted for now; per-scanline capture isn't planned.

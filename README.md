@@ -48,7 +48,7 @@ step: --frames <n> | --type <text>
 - `--headless`, `--realtime`, `--disk1` and `--png` may each appear once. Closing the window during a run prints `error: window closed` and exits with 1.
 - Exit codes: 0 success, 2 bad arguments (usage on stderr), 1 any other failure.
 
-The default display mode is windowed: a view-only window shows the live Apple screen and plays its sound (keys and mouse clicks in the window do nothing). `--headless` opens no window and no audio device, for CI and batch runs (decision D8).
+The default display mode is windowed: a view-only window shows the live Apple screen and plays its sound (keys and mouse clicks in the window do nothing). Sound plays only during realtime runs (`--realtime`, or windowed with no steps); stepped runs without `--realtime` are muted. `--headless` opens no window and no audio device, for CI and batch runs (decision D8).
 
 Examples:
 ```
@@ -64,8 +64,10 @@ AppleWinHarness.exe --realtime --disk1 "external\AppleWin\bin\DOS 3.3 System Mas
 
 ## Tests
 ```
-bin\x64\Debug\HarnessTests.exe                      :: everything
-bin\x64\Debug\HarnessTests.exe -tse=windowed,audio  :: what CI runs
+REM everything
+bin\x64\Debug\HarnessTests.exe
+REM what CI runs
+bin\x64\Debug\HarnessTests.exe -tse=windowed,audio
 ```
 Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64 and runs `HarnessTests.exe -tse=windowed,audio`.
 

@@ -395,6 +395,9 @@ void Emulator::InsertDisk(int drive, const std::filesystem::path& image)
     const size_t before = HostFrame().messages().size();
     const ImageError_e err = card.InsertDisk(drive, image.string(), false, false);
     if (err != eIMAGE_ERROR_NONE) {
+        // InsertDisk() itself reports nothing; the Win32 UI calls this separately. It routes AppleWin's human-readable
+        // text through FrameMessageBox, which HarnessFrame records.
+        card.NotifyInvalidImage(drive, image.string(), err);
         std::string what = "Emulator: cannot insert " + image.string() + " (image error " + std::to_string(int(err)) + ")";
         const auto& msgs = HostFrame().messages();
         for (size_t i = before; i < msgs.size(); ++i)

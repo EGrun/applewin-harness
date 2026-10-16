@@ -41,8 +41,8 @@ HRESULT MonitoredSoundBuffer::GetCurrentPosition(LPDWORD lpdwCurrentPlayCursor, 
             ++underruns_;
             if (sharedUnderruns_)
                 ++*sharedUnderruns_;
+            tracking_ = false;   // only an underrun stops tracking; a safe poll keeps it going
         }
-        tracking_ = false;
     }
     return hr;
 }

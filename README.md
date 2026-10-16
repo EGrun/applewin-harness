@@ -40,10 +40,9 @@ AppleWinHarness.exe [--headless] [--realtime] [--disk1 <image>] [--png <path>] [
 step: --frames <n> | --type <text>
 ```
 - Steps run in command-line order. `--frames n` runs `n` frames. `--type text` types the text on the emulated keyboard. Both run at authentic speed, paced to real time, with `--realtime`, and as fast as possible otherwise.
-- `--type` escapes: `` and `
-` both mean Return, and `\` means a backslash. Any other backslash sequence, an empty text, or a character outside `0x20`-`0x7E` is a usage error.
+- `--type` escapes: `\r` and `\n` both mean Return, and `\\` means a backslash. Any other backslash sequence, an empty text, or a character outside `0x20`-`0x7E` is a usage error.
 - `--frames` takes 1-9 decimal digits.
-- `--disk1` boots from a working copy of the image in `%TEMP%pplewin-harness\<pid>\`. The original is never written to, and the copy is deleted on exit.
+- `--disk1` boots from a working copy of the image in `%TEMP%\applewin-harness\<pid>\`. The original is never written to, and the copy is deleted on exit.
 - After the last step the harness writes the PNG if `--png` was given, prints `sha256 <hash>` of the frame, and, if sound is active, prints `audio underruns <n>`.
 - With no steps, windowed mode runs until you close the window and exits with 0. Headless mode with no steps is a usage error.
 - `--headless`, `--realtime`, `--disk1` and `--png` may each appear once. Closing the window during a run prints `error: window closed` and exits with 1.
@@ -57,16 +56,16 @@ Examples:
 AppleWinHarness.exe
 
 :: headless golden run: boot DOS 3.3 (720 frames), type PRINT 2+2, save the screen
-AppleWinHarness.exe --headless --disk1 "external\AppleWinin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT 2+2" --frames 60 --png out.png
+AppleWinHarness.exe --headless --disk1 "external\AppleWin\bin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT 2+2\r" --frames 60 --png out.png
 
 :: windowed, real time: the bell
-AppleWinHarness.exe --realtime --disk1 "external\AppleWinin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT CHR$(7)" --frames 120
+AppleWinHarness.exe --realtime --disk1 "external\AppleWin\bin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT CHR$(7)\r" --frames 120
 ```
 
 ## Tests
 ```
-bind\Debug\HarnessTests.exe                      :: everything
-bind\Debug\HarnessTests.exe -tse=windowed,audio  :: what CI runs
+bin\x64\Debug\HarnessTests.exe                      :: everything
+bin\x64\Debug\HarnessTests.exe -tse=windowed,audio  :: what CI runs
 ```
 Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64 and runs `HarnessTests.exe -tse=windowed,audio`.
 

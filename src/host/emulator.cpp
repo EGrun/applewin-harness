@@ -88,7 +88,7 @@ void Emulator::Start(const EmulatorConfig& config)
     g_sProgramDir = exeDir;
     g_sConfigFile = config.configIni.string();
     g_nMemoryClearType = MIP_ZERO;
-    // Deviation: no sound (as AppleWin's -no-dsound switch). Speaker and Mockingboard skip DirectSound and never show
+    // No sound (as AppleWin's -no-dsound switch). Speaker and Mockingboard skip DirectSound and never show
     // the "unable to initialize a waveform output device" message box.
     g_bDisableDirectSound = true;
 
@@ -106,10 +106,10 @@ void Emulator::Start(const EmulatorConfig& config)
     JoyInitialize();
     VideoSwitchVideocardPalette(RGB_GetVideocard(), GetVideo().GetVideoType());
     GetFrame().Initialize(true);
-    // Deviation: AppleWin calls SpkrInitialize() from WM_CREATE (window creation, skipped here). Without it the speaker
+    // AppleWin calls SpkrInitialize() from WM_CREATE (window creation, skipped here). Without it the speaker
     // sample buffer is null and the first SpkrUpdate() crashes.
     SpkrInitialize();
-    // DebugInitialize() is deliberately NOT called (deviation from the spec's startup list): its first statement,
+    // DebugInitialize() is deliberately NOT called (the spec lists it as skipped): its first statement,
     // GetConsoleFontDC(), calls Win32Frame::GetWin32Frame(), which throws std::bad_cast for a HeadlessFrame. Its
     // remaining work (debugger console, windows, colours, fonts, breakpoint tables already zero-initialised) is
     // debugger-UI state that the M1 run path does not use.
@@ -136,7 +136,7 @@ void Emulator::Shutdown()
     if (!g_started)
         return;
     GetFrame().Destroy();
-    SpkrDestroy();   // deviation: pairs with SpkrInitialize() in Start (AppleWin calls it from WM_DESTROY)
+    SpkrDestroy();   // pairs with SpkrInitialize() in Start (AppleWin calls it from WM_DESTROY)
     LogDone();
     g_started = false;
 }
@@ -144,8 +144,9 @@ void Emulator::Shutdown()
 void Emulator::PowerCycle()
 {
     RequireStarted();
+    // ResetMachineState() already boots the Disk II card (Utilities.cpp); a second Boot() would load a disk image twice.
     ResetMachineState();
-    Boot();
+    g_nAppMode = MODE_RUNNING;
 }
 
 void Emulator::RunFrames(uint32_t frames)

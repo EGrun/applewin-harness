@@ -15,7 +15,7 @@ private:
     double carried_ = 0.0;
 };
 
-// Periodic 1 ms high-resolution waitable timer (CreateWaitableTimerExW with
+// One-shot high-resolution waitable timer re-armed to an absolute deadline each wait (CreateWaitableTimerExW with
 // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS). Throws std::runtime_error if the timer
 // cannot be created.
 class RealtimePacer {

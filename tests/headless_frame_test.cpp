@@ -1,4 +1,4 @@
-// NOT yet in HarnessTests.vcxproj: HeadlessFrame needs host code that arrives in Task 5, which adds this file.
+// HeadlessFrame unit tests.
 #include "doctest/doctest.h"
 #include "host/headless_frame.h"
 #include "resource.h"

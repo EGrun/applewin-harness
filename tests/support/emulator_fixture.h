@@ -68,6 +68,8 @@ inline Emulator& StartedEmulator()
         std::filesystem::create_directories(dir);
         EmulatorConfig cfg;
         cfg.configIni = dir / "tests.ini";
+        std::error_code ec;
+        std::filesystem::remove(cfg.configIni, ec);   // AppleWin persists slot config here; start every run clean
         RegistryStampBeforeStartRef() = ReadAppleWinRegistryStamp();
         Emulator::Instance().Start(cfg);
         started = true;

@@ -2,6 +2,7 @@
 #include "host/emulator.h"
 #include "core/sha256.h"
 #include "support/emulator_fixture.h"
+#include "support/golden.h"
 #include <chrono>
 #include <fstream>
 #include <stdexcept>
@@ -10,28 +11,6 @@
 using namespace harness;
 using namespace harness::testsupport;
 using namespace std::chrono_literals;
-
-namespace {
-
-std::filesystem::path ExeDir()
-{
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetModuleFileNameW(nullptr, buf, DWORD(std::size(buf)));
-    return std::filesystem::path(std::wstring(buf, n)).parent_path();
-}
-
-// <exe dir>\..\..\..\tests\golden\<name>, first line trimmed; empty if missing.
-std::string ReadTrimmed(const char* name)
-{
-    std::ifstream f(ExeDir() / ".." / ".." / ".." / "tests" / "golden" / name);
-    std::string s;
-    std::getline(f, s);
-    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
-    size_t b = s.find_first_not_of(" \t");
-    return b == std::string::npos ? std::string() : s.substr(b);
-}
-
-}  // namespace
 
 // doctest's default order is by file name, then line. No earlier file starts the emulator, so this case runs first.
 TEST_CASE("emu: precondition")
@@ -102,7 +81,7 @@ TEST_CASE("emu: golden boot")
     auto& e = StartedEmulator();
     e.PowerCycle();
     e.RunFrames(120);
-    auto golden = ReadTrimmed("m1_boot_120.sha256");
+    auto golden = ReadGoldenTrimmed("m1_boot_120.sha256");
     REQUIRE_MESSAGE(!golden.empty(), "run Task 7 to record the golden hash");
     CHECK(FrameHash(e.Frame()) == golden);
 }

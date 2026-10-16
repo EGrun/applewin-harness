@@ -28,6 +28,7 @@ public:
     void WaitForTick();
 private:
     void* timer_ = nullptr;   // HANDLE
+    long long nextTick_ = 0;  // QPC count of the next 1 ms deadline
 };
 
 }  // namespace harness

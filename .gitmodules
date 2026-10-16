@@ -1,0 +1,3 @@
+[submodule "external/AppleWin"]
+	path = external/AppleWin
+	url = https://github.com/AppleWin/AppleWin.git

@@ -1,0 +1,14 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Build output
+bin/
+obj/
+x64/
+AppleWinHarness/x64/
+
+# Local scratch notes (may contain secrets — never commit)
+notes.txt
+.env

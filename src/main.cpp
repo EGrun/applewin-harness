@@ -80,6 +80,9 @@ int Run(const Args& a)
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         rc = kExitFailure;
+    } catch (...) {
+        std::cerr << "error: unknown exception" << std::endl;
+        rc = kExitFailure;
     }
     try { emu.Shutdown(); } catch (...) {}
     std::error_code ec;

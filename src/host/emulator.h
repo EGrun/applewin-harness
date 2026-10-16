@@ -1,7 +1,4 @@
 #pragma once
-#include "StdAfx.h"
-#include <windows.h>
-#include "Common.h"          // eApple2Type
 #include "core/frame_view.h"
 #include <chrono>
 #include <cstdint>
@@ -13,7 +10,6 @@ namespace harness {
 
 struct EmulatorConfig {
     std::filesystem::path configIni;               // AppleWin settings file (assigned to g_sConfigFile)
-    eApple2Type model = A2TYPE_APPLE2EENHANCED;
 };
 
 // AppleWin's state is global, so there is exactly one emulator per process.

@@ -1,9 +1,12 @@
 #include "host/emulator.h"
 #include "host/applewin_host.h"
-#include "host/headless_frame.h"
+#include "host/harness_frame.h"
 #include "core/pacing.h"
 
 #pragma warning(push, 3)
+#include "StdAfx.h"
+#include <windows.h>
+#include "Common.h"
 #include "Interface.h"
 #include "Core.h"
 #include "CmdLine.h"
@@ -31,9 +34,9 @@ namespace {
 
 bool g_started = false;
 
-HeadlessFrame& Headless()
+HarnessFrame& Headless()
 {
-    return static_cast<HeadlessFrame&>(GetFrame());
+    return static_cast<HarnessFrame&>(GetFrame());
 }
 
 void RequireStarted()
@@ -102,7 +105,7 @@ void Emulator::Start(const EmulatorConfig& config)
     GetVideo().SetVidHD(false);
     ResetToLogoMode();
     LoadConfiguration(true);
-    SetApple2Type(config.model);
+    SetApple2Type(A2TYPE_APPLE2EENHANCED);
     JoyInitialize();
     VideoSwitchVideocardPalette(RGB_GetVideocard(), GetVideo().GetVideoType());
     GetFrame().Initialize(true);
@@ -110,7 +113,7 @@ void Emulator::Start(const EmulatorConfig& config)
     // sample buffer is null and the first SpkrUpdate() crashes.
     SpkrInitialize();
     // DebugInitialize() is deliberately NOT called (the spec lists it as skipped): its first statement,
-    // GetConsoleFontDC(), calls Win32Frame::GetWin32Frame(), which throws std::bad_cast for a HeadlessFrame. Its
+    // GetConsoleFontDC(), calls Win32Frame::GetWin32Frame(), which throws std::bad_cast for a HarnessFrame. Its
     // remaining work (debugger console, windows, colours, fonts, breakpoint tables already zero-initialised) is
     // debugger-UI state that the M1 run path does not use.
     MemInitialize();

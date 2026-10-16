@@ -10,10 +10,10 @@
 namespace harness {
 
 // Windowless FrameBase: no UI, no sound. Never shows a message box.
-class HeadlessFrame final : public FrameBase {
+class HarnessFrame final : public FrameBase {
 public:
-    HeadlessFrame() = default;
-    ~HeadlessFrame() override = default;
+    HarnessFrame() = default;
+    ~HarnessFrame() override = default;
 
     // Observers
     uint64_t presentedFrames() const { return presentedFrames_; }

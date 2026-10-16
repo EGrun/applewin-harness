@@ -2,7 +2,7 @@
 // compile that file (it is AppleWin's WinMain, message loop and window startup).
 //
 // Factories (same shape as AppleWin.cpp: function-local statics):
-//   GetFrame()          -> static harness::HeadlessFrame (instead of Win32Frame)
+//   GetFrame()          -> static harness::HarnessFrame (instead of Win32Frame)
 //   GetVideo()          -> static Video
 //   GetPropertySheet()  -> static CPropertySheet
 //
@@ -23,7 +23,7 @@
 // No AppleWin file is modified.
 
 #include "host/applewin_host.h"
-#include "host/headless_frame.h"
+#include "host/harness_frame.h"
 
 #pragma warning(push, 3)
 #include "Interface.h"
@@ -49,8 +49,8 @@ IPropertySheet& GetPropertySheet()
 
 FrameBase& GetFrame()
 {
-    static harness::HeadlessFrame sg_HeadlessFrame;
-    return sg_HeadlessFrame;
+    static harness::HarnessFrame sg_HarnessFrame;
+    return sg_HarnessFrame;
 }
 
 Video& GetVideo()

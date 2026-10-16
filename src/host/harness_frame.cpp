@@ -1,4 +1,4 @@
-#include "host/headless_frame.h"
+#include "host/harness_frame.h"
 
 #pragma warning(push, 3)
 #include "Interface.h"
@@ -9,7 +9,7 @@
 
 namespace harness {
 
-void HeadlessFrame::Initialize(bool resetVideoState)
+void HarnessFrame::Initialize(bool resetVideoState)
 {
     Video& video = GetVideo();
     const size_t bytes = size_t(video.GetFrameBufferWidth()) * video.GetFrameBufferHeight() * 4;
@@ -17,19 +17,19 @@ void HeadlessFrame::Initialize(bool resetVideoState)
     video.Initialize(buffer_.data(), resetVideoState);
 }
 
-void HeadlessFrame::Destroy()
+void HarnessFrame::Destroy()
 {
     GetVideo().Destroy();
     buffer_.clear();
     buffer_.shrink_to_fit();
 }
 
-void HeadlessFrame::VideoPresentScreen()
+void HarnessFrame::VideoPresentScreen()
 {
     ++presentedFrames_;
 }
 
-int HeadlessFrame::FrameMessageBox(LPCSTR lpText, LPCSTR lpCaption, UINT)
+int HarnessFrame::FrameMessageBox(LPCSTR lpText, LPCSTR lpCaption, UINT)
 {
     std::string msg = std::string(lpCaption ? lpCaption : "") + ": " + (lpText ? lpText : "");
     std::fprintf(stderr, "%s\n", msg.c_str());
@@ -37,18 +37,18 @@ int HeadlessFrame::FrameMessageBox(LPCSTR lpText, LPCSTR lpCaption, UINT)
     return IDOK;
 }
 
-void HeadlessFrame::GetBitmap(WORD, LONG cb, LPVOID lpvBits)
+void HarnessFrame::GetBitmap(WORD, LONG cb, LPVOID lpvBits)
 {
     if (lpvBits && cb > 0)
         std::memset(lpvBits, 0, size_t(cb));
 }
 
-std::shared_ptr<NetworkBackend> HeadlessFrame::CreateNetworkBackend(const std::string&) { return nullptr; }
+std::shared_ptr<NetworkBackend> HarnessFrame::CreateNetworkBackend(const std::string&) { return nullptr; }
 
-std::shared_ptr<SoundBuffer> HeadlessFrame::CreateSoundBuffer(uint32_t, uint32_t, int, const char*) { return nullptr; }
+std::shared_ptr<SoundBuffer> HarnessFrame::CreateSoundBuffer(uint32_t, uint32_t, int, const char*) { return nullptr; }
 
 // Same logic as Win32Frame::GetResource (external/AppleWin/source/Windows/Win32Frame.cpp).
-BYTE* HeadlessFrame::GetResource(WORD id, LPCSTR lpType, uint32_t expectedSize)
+BYTE* HarnessFrame::GetResource(WORD id, LPCSTR lpType, uint32_t expectedSize)
 {
     HRSRC hResInfo = FindResourceA(nullptr, MAKEINTRESOURCEA(id), lpType);
     if (hResInfo == nullptr)
@@ -65,7 +65,7 @@ BYTE* HeadlessFrame::GetResource(WORD id, LPCSTR lpType, uint32_t expectedSize)
     return static_cast<BYTE*>(LockResource(hResData));   // no unlock needed
 }
 
-void HeadlessFrame::Restart()
+void HarnessFrame::Restart()
 {
     restartRequested_ = true;
 }

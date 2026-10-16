@@ -21,6 +21,7 @@ public:
     const std::filesystem::path& Path() const;   // the copy
 
 private:
+    void Release() noexcept;   // deletes the copy (and workDir if empty), leaving this empty
     std::filesystem::path path_;
     std::filesystem::path workDir_;
 };

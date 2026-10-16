@@ -30,7 +30,7 @@ WorkingCopy::WorkingCopy(const fs::path& original, const fs::path& workDir)
     }
 }
 
-WorkingCopy::~WorkingCopy()
+void WorkingCopy::Release() noexcept
 {
     if (path_.empty())
         return;
@@ -38,7 +38,11 @@ WorkingCopy::~WorkingCopy()
     fs::remove(path_, ec);
     if (!workDir_.empty() && fs::is_empty(workDir_, ec) && !ec)
         fs::remove(workDir_, ec);
+    path_.clear();
+    workDir_.clear();
 }
+
+WorkingCopy::~WorkingCopy() { Release(); }
 
 WorkingCopy::WorkingCopy(WorkingCopy&& other) noexcept
     : path_(std::exchange(other.path_, {})), workDir_(std::exchange(other.workDir_, {}))
@@ -48,7 +52,7 @@ WorkingCopy::WorkingCopy(WorkingCopy&& other) noexcept
 WorkingCopy& WorkingCopy::operator=(WorkingCopy&& other) noexcept
 {
     if (this != &other) {
-        this->~WorkingCopy();
+        Release();
         path_ = std::exchange(other.path_, {});
         workDir_ = std::exchange(other.workDir_, {});
     }

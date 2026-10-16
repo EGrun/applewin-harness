@@ -10,6 +10,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -111,6 +112,31 @@ TEST_CASE("copy: the destructor removes the copy and the empty work dir")
     CHECK(!fs::exists(copied));
     CHECK(!fs::exists(work));
     CHECK(fs::exists(original));
+}
+
+TEST_CASE("copy: move-assignment deletes the old copy, keeps the new one, and the moved-from deletes nothing")
+{
+    TempDir tmp;
+    const fs::path a = tmp.path / "a.dsk";
+    const fs::path b = tmp.path / "b.dsk";
+    WriteBytes(a, kBytes);
+    WriteBytes(b, kBytes);
+    const fs::path workA = tmp.path / "workA";
+    const fs::path workB = tmp.path / "workB";
+    {
+        WorkingCopy first(a, workA);
+        WorkingCopy second(b, workB);
+        const fs::path firstPath = first.Path();
+        const fs::path secondPath = second.Path();
+        first = std::move(second);
+        CHECK(!fs::exists(firstPath));
+        CHECK(!fs::exists(workA));
+        CHECK(first.Path() == secondPath);
+        CHECK(fs::exists(secondPath));
+    }
+    CHECK(!fs::exists(workB));
+    CHECK(fs::exists(a));
+    CHECK(fs::exists(b));
 }
 
 TEST_CASE("copy: a missing original throws runtime_error naming the file")

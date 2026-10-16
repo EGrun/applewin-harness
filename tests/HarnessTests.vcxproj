@@ -29,6 +29,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="png_writer_test.cpp" />
     <ClCompile Include="sha256_test.cpp" />
+    <ClCompile Include="base64_test.cpp" />
     <ClCompile Include="pacing_test.cpp" />
     <ClCompile Include="emulator_test.cpp" />
     <ClCompile Include="harness_frame_test.cpp" />

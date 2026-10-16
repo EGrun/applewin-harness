@@ -2,6 +2,7 @@
 // The agent-audio timeline (spec: docs/specs/m3.md, D14 "Capture"; plan: M3 Part B, Global Constraints "Timeline" and
 // "Placing commits"). Independent of AppleWin: it only knows emulated cycles.
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -22,7 +23,7 @@ inline constexpr uint64_t kCyclesPerFrameDen = 8778;
 // Placement: a voice's commit of N sample frames covers the cycles from the end of that voice's previous commit to
 // endCycle. The first commit of a voice (and the first after ResetVoice or Clear) covers the N x (CLK_6502_NTSC / 44100)
 // cycles before endCycle (clamped at 0). The N frames are resampled linearly (input frame i sits at timeline position
-// start + i x M / N, M = the number of timeline frames) onto the timeline frames
+// start + i x M / N, M = the number of timeline frames; past the last input frame the final step's slope continues) onto the timeline frames
 // [CycleToFrame(start), CycleToFrame(endCycle)) and added to what is there with saturation to int16. A mono commit
 // (channels == 1) goes to both channels. A commit whose interval is empty (endCycle not after the voice's previous end)
 // adds nothing but still counts as that voice's latest commit. Frames older than the ring are dropped.
@@ -31,6 +32,7 @@ inline constexpr uint64_t kCyclesPerFrameDen = 8778;
 class AudioCapture {
 public:
     AudioCapture();
+    ~AudioCapture();
 
     // interleaved.size() must be a multiple of channels; channels is 1 or 2 (std::invalid_argument otherwise).
     void Commit(int voiceId, std::span<const int16_t> interleaved, int channels, uint64_t endCycle);
@@ -53,6 +55,10 @@ public:
     static uint64_t FrameToCycle(uint64_t frame);
     // The frame whose time is at or before cycle c: floor(c x 8778 / 203125). CycleToFrame(FrameToCycle(k)) == k.
     static uint64_t CycleToFrame(uint64_t cycle);
+
+private:
+    struct State;
+    std::unique_ptr<State> state_;
 };
 
 }  // namespace harness

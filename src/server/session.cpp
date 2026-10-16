@@ -1,6 +1,8 @@
 #include "server/session.h"
 #include "server/protocol.h"
+#include "core/audio_capture.h"
 #include "core/base64.h"
+#include "core/wav.h"
 #include "core/png_writer.h"
 #include "core/working_copy.h"
 #include <windows.h>
@@ -559,11 +561,53 @@ json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
     return InputReply(id, emulator_.ScheduledCycle(id));
 }
 
-// ---- Agent audio (M3 Part B). Stubs until Tasks 3 and 4: -32603 "not implemented". ----
+// ---- Agent audio (M3 Part B). subscribe_audio is a stub until Task 4. ----
 
-json Session::GetAudio(const json&)
+json Session::GetAudio(const json& params)
 {
-    throw std::logic_error("get_audio: not implemented");
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const json* fc = Field(params, "from_cycle");
+    const uint64_t fromCycle = fc ? GetUint(params, "from_cycle", 0, UINT64_MAX, 0) : 0;
+    const uint64_t durationMs = GetUint(params, "duration_ms", 1, 30000, 1000);
+    bool wav = true;
+    if (const json* f = Field(params, "format")) {
+        if (!f->is_string() || (f->get<std::string>() != "WAV" && f->get<std::string>() != "PCM16"))
+            InvalidParams("format must be \"WAV\" or \"PCM16\"");
+        wav = f->get<std::string>() == "WAV";
+    }
+
+    const AudioCapture& audio = emulator_.Audio();
+    const uint64_t span = uint64_t(double(durationMs) * kAudioBaseClockHz / 1000.0);
+    const uint64_t newest = audio.NewestCycle(), oldest = audio.OldestCycle();
+    uint64_t start, end;
+    if (fc) {
+        start = fromCycle;
+        end = start + span;
+    } else {
+        end = newest;
+        start = end > span ? end - span : 0;
+        start = (std::max)(start, oldest);   // rounding at the ring's start must not fail a full-ring request
+    }
+    if (start < oldest) throw RpcError{kAudioNotBuffered, "audio before cycle " + std::to_string(oldest) + " is no longer buffered"};
+    end = (std::max)(start, (std::min)(end, newest));
+
+    const std::vector<int16_t> pcm = audio.Read(start, end);
+    std::vector<uint8_t> bytes;
+    if (wav) {
+        bytes = EncodeWav(pcm, kAudioSampleRate, kAudioChannels);
+    } else {
+        bytes.resize(pcm.size() * 2);
+        for (size_t i = 0; i < pcm.size(); ++i) {
+            bytes[2 * i] = uint8_t(uint16_t(pcm[i]));
+            bytes[2 * i + 1] = uint8_t(uint16_t(pcm[i]) >> 8);
+        }
+    }
+    return json{{"start_cycle", start},
+                {"end_cycle", end},
+                {"sample_rate", kAudioSampleRate},
+                {"channels", kAudioChannels},
+                {"format", wav ? "WAV" : "PCM16"},
+                {"data", Base64Encode(bytes)}};
 }
 
 json Session::SubscribeAudio(const ConnectionPtr&, const json&)

@@ -36,6 +36,7 @@ namespace harness {
 namespace {
 
 bool g_started = false;
+bool g_soundActive = false;   // set by the windowed start (Task 9) once DSInit() succeeded
 uint64_t g_cyclesAtPowerOn = 0;   // g_nCumulativeCycles at the last power-on (D10)
 
 HarnessFrame& HostFrame()
@@ -349,12 +350,13 @@ const std::vector<std::string>& Emulator::Messages() const
 
 uint64_t Emulator::SoundUnderruns() const
 {
-    throw std::logic_error("not implemented");
+    RequireStarted();
+    return HostFrame().SoundUnderruns();
 }
 
 bool Emulator::SoundActive() const
 {
-    throw std::logic_error("not implemented");
+    return g_started && g_soundActive;
 }
 
 }  // namespace harness

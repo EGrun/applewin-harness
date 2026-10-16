@@ -8,6 +8,9 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "Windows/DXSoundBuffer.h"
+#include "host/monitored_sound_buffer.h"
+
 namespace harness {
 
 // Video's full framebuffer (GetFrameBufferWidth/Height are constants: 560+2*20 by 384+2*18, BGRA32). Allocated up front so
@@ -83,7 +86,19 @@ void HarnessFrame::GetBitmap(WORD, LONG cb, LPVOID lpvBits)
 
 std::shared_ptr<NetworkBackend> HarnessFrame::CreateNetworkBackend(const std::string&) { return nullptr; }
 
-std::shared_ptr<SoundBuffer> HarnessFrame::CreateSoundBuffer(uint32_t, uint32_t, int, const char*) { return nullptr; }
+std::shared_ptr<SoundBuffer> HarnessFrame::CreateSoundBuffer(uint32_t dwBufferSize, uint32_t nSampleRate, int nChannels, const char*)
+{
+    if (!soundEnabled_)
+        return nullptr;
+    std::shared_ptr<SoundBuffer> inner = DXSoundBuffer::create(dwBufferSize, nSampleRate, nChannels);
+    if (!inner)
+        return nullptr;
+    auto monitored = std::make_shared<MonitoredSoundBuffer>(std::move(inner), dwBufferSize);
+    if (soundMuted_)
+        monitored->SetMuted(true);
+    soundBuffers_.push_back(monitored);
+    return monitored;
+}
 
 // Same logic as Win32Frame::GetResource (external/AppleWin/source/Windows/Win32Frame.cpp).
 BYTE* HarnessFrame::GetResource(WORD id, LPCSTR lpType, uint32_t expectedSize)
@@ -108,13 +123,23 @@ void HarnessFrame::Restart()
     restartRequested_ = true;
 }
 
-// Task 2 stubs: the interface is final, the behaviour arrives in a later task.
-void HarnessFrame::EnableSound(bool) { throw std::logic_error("not implemented"); }
+void HarnessFrame::EnableSound(bool enabled) { soundEnabled_ = enabled; }
 
-void HarnessFrame::SetSoundMuted(bool) { throw std::logic_error("not implemented"); }
+void HarnessFrame::SetSoundMuted(bool muted)
+{
+    soundMuted_ = muted;
+    for (auto& b : soundBuffers_)
+        b->SetMuted(muted);
+}
 
-uint64_t HarnessFrame::SoundUnderruns() const { throw std::logic_error("not implemented"); }
+uint64_t HarnessFrame::SoundUnderruns() const
+{
+    uint64_t sum = 0;
+    for (const auto& b : soundBuffers_)
+        sum += b->Underruns();
+    return sum;
+}
 
-size_t HarnessFrame::SoundBuffersCreated() const { throw std::logic_error("not implemented"); }
+size_t HarnessFrame::SoundBuffersCreated() const { return soundBuffers_.size(); }
 
 }  // namespace harness

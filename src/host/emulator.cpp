@@ -34,7 +34,7 @@ namespace {
 
 bool g_started = false;
 
-HarnessFrame& Headless()
+HarnessFrame& HostFrame()
 {
     return static_cast<HarnessFrame&>(GetFrame());
 }
@@ -84,6 +84,8 @@ void Emulator::Start(const EmulatorConfig& config)
         throw std::logic_error("Emulator: already started");
     if (config.configIni.empty() || !config.configIni.is_absolute())
         throw std::invalid_argument("Emulator: configIni must be an absolute path");
+    if (config.display != DisplayMode::Headless || !config.disk1.empty())
+        throw std::logic_error("not implemented");   // Task 2 stub: only the M1 headless start exists so far
 
     // 1. Directories, config file (INI-only mode in Registry.cpp) and deterministic power-on memory.
     const std::string exeDir = ExeDirWithSeparator();
@@ -98,7 +100,7 @@ void Emulator::Start(const EmulatorConfig& config)
     // 2. Version (AppleWin reads it from its exe's version resource; the harness uses version.h directly).
     SetAppleWinVersion(APPLEWIN_VERSION);
 
-    const size_t messagesBefore = Headless().messages().size();
+    const size_t messagesBefore = HostFrame().messages().size();
 
     // 3. RepeatInitialization, headless subset.
     KeybReset();
@@ -121,7 +123,7 @@ void Emulator::Start(const EmulatorConfig& config)
 
     g_started = true;
 
-    const auto& msgs = Headless().messages();
+    const auto& msgs = HostFrame().messages();
     if (msgs.size() != messagesBefore) {
         std::string what = "Emulator: FrameMessageBox during startup:";
         for (size_t i = messagesBefore; i < msgs.size(); ++i)
@@ -152,11 +154,13 @@ void Emulator::PowerCycle()
     g_nAppMode = MODE_RUNNING;
 }
 
-void Emulator::RunFrames(uint32_t frames)
+bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
 {
     RequireStarted();
+    if (pacing != Pacing::Stepped)
+        throw std::logic_error("not implemented");   // Task 2 stub
     if (frames == 0)
-        return;
+        return true;
     const uint64_t target = g_nCumulativeCycles + uint64_t(frames) * NTSC_GetCyclesPerFrame();
     // Steps are capped at ContinueExecution's 1 ms execution period (~1020 cycles). One huge CpuExecute call would
     // present at most one frame and breaks per-period card updates (Mockingboard asserts on >= 0x10000 cycles).
@@ -165,9 +169,10 @@ void Emulator::RunFrames(uint32_t frames)
         const uint64_t remaining = target - g_nCumulativeCycles;
         ExecuteStep(remaining < period ? uint32_t(remaining) : period);
     }
+    return true;
 }
 
-void Emulator::RunRealtime(std::chrono::milliseconds wallTime)
+bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
 {
     RequireStarted();
     using clock = std::chrono::steady_clock;
@@ -181,6 +186,7 @@ void Emulator::RunRealtime(std::chrono::milliseconds wallTime)
         ExecuteStep(budget.Next());
         pacer.WaitForTick();
     }
+    return true;
 }
 
 uint64_t Emulator::EmulatedCycles() const
@@ -189,10 +195,26 @@ uint64_t Emulator::EmulatedCycles() const
     return g_nCumulativeCycles;
 }
 
+// Task 2 stubs: the interface is final, the behaviour arrives in a later task.
+bool Emulator::TypeText(std::string_view, Pacing)
+{
+    throw std::logic_error("not implemented");
+}
+
+void Emulator::InsertDisk(int, const std::filesystem::path&)
+{
+    throw std::logic_error("not implemented");
+}
+
+void Emulator::EjectDisk(int)
+{
+    throw std::logic_error("not implemented");
+}
+
 uint64_t Emulator::PresentedFrames() const
 {
     RequireStarted();
-    return Headless().presentedFrames();
+    return HostFrame().presentedFrames();
 }
 
 FrameView Emulator::Frame(bool borders) const
@@ -228,7 +250,17 @@ std::string Emulator::ReadTextRow(int row) const
 const std::vector<std::string>& Emulator::Messages() const
 {
     RequireStarted();
-    return Headless().messages();
+    return HostFrame().messages();
+}
+
+uint64_t Emulator::SoundUnderruns() const
+{
+    throw std::logic_error("not implemented");
+}
+
+bool Emulator::SoundActive() const
+{
+    throw std::logic_error("not implemented");
 }
 
 }  // namespace harness

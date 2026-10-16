@@ -59,7 +59,7 @@ inline const RegistryStamp& RegistryStampBeforeStart() { return RegistryStampBef
 
 inline void ShutdownAtExit() { Emulator::Instance().Shutdown(); }
 
-// Lazily starts the shared emulator with %TEMP%\applewin-harness\tests.ini; Shutdown is registered with atexit.
+// Lazily starts the shared headless emulator with %TEMP%\applewin-harness\tests.ini; Shutdown is registered with atexit.
 inline Emulator& StartedEmulator()
 {
     static bool started = false;
@@ -68,6 +68,7 @@ inline Emulator& StartedEmulator()
         std::filesystem::create_directories(dir);
         EmulatorConfig cfg;
         cfg.configIni = dir / "tests.ini";
+        cfg.display = DisplayMode::Headless;   // the shared fixture stays headless (the spec default is Windowed)
         std::error_code ec;
         std::filesystem::remove(cfg.configIni, ec);   // AppleWin persists slot config here; start every run clean
         RegistryStampBeforeStartRef() = ReadAppleWinRegistryStamp();

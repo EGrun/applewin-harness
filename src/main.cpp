@@ -68,6 +68,7 @@ int Run(const Args& a)
         ini = fs::absolute(dir / (std::to_string(GetCurrentProcessId()) + ".ini"));
         harness::EmulatorConfig cfg;
         cfg.configIni = ini;
+        cfg.display = harness::DisplayMode::Headless;   // M1 command line until the M2 CLI lands
         emu.Start(cfg);
         emu.RunFrames(a.bootFrames);
         harness::FrameView frame = emu.Frame();

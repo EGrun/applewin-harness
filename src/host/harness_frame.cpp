@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 namespace harness {
 
@@ -69,5 +70,18 @@ void HarnessFrame::Restart()
 {
     restartRequested_ = true;
 }
+
+// Task 2 stubs: the interface is final, the behaviour arrives in a later task.
+FrameView HarnessFrame::PresentedFrame(bool) const { throw std::logic_error("not implemented"); }
+
+void HarnessFrame::SetPresentHook(std::function<void()>) { throw std::logic_error("not implemented"); }
+
+void HarnessFrame::EnableSound(bool) { throw std::logic_error("not implemented"); }
+
+void HarnessFrame::SetSoundMuted(bool) { throw std::logic_error("not implemented"); }
+
+uint64_t HarnessFrame::SoundUnderruns() const { throw std::logic_error("not implemented"); }
+
+size_t HarnessFrame::SoundBuffersCreated() const { throw std::logic_error("not implemented"); }
 
 }  // namespace harness

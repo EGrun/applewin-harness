@@ -66,6 +66,8 @@ TEST_CASE("png: file write")
     CHECK(WritePngFile(file, View3x2()));
     CHECK(ReadFileBytes(file) == EncodePng(View3x2()));
     CHECK_FALSE(WritePngFile(tmp / "no_such_dir" / "a.png", View3x2()));
+    std::error_code ec;
+    std::filesystem::remove(file, ec);   // leave nothing in %TEMP%\applewin-harness but tests.ini
 }
 
 TEST_CASE("frame: ToRgbTopDown")

@@ -33,6 +33,9 @@
     <ClCompile Include="..\src\host\emulator.cpp" />
     <ClCompile Include="..\src\host\harness_frame.cpp" />
     <ClCompile Include="..\src\host\applewin_host.cpp" />
+    <ClCompile Include="..\src\core\working_copy.cpp" />
+    <ClCompile Include="..\src\host\monitored_sound_buffer.cpp" />
+    <ClCompile Include="..\src\host\window.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\core\frame_view.h" />
@@ -41,6 +44,9 @@
     <ClInclude Include="..\src\core\pacing.h" />
     <ClInclude Include="..\src\host\emulator.h" />
     <ClInclude Include="..\src\host\harness_frame.h" />
+    <ClInclude Include="..\src\core\working_copy.h" />
+    <ClInclude Include="..\src\host\monitored_sound_buffer.h" />
+    <ClInclude Include="..\src\host\window.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

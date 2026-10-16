@@ -2,14 +2,18 @@
 #include "StdAfx.h"
 #include <windows.h>
 #include "FrameBase.h"
+#include "core/frame_view.h"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace harness {
 
-// Windowless FrameBase: no UI, no sound. Never shows a message box.
+class MonitoredSoundBuffer;
+
+// AppleWin's FrameBase for both display modes (D8). Owns no window and never shows a message box.
 class HarnessFrame final : public FrameBase {
 public:
     HarnessFrame() = default;
@@ -19,6 +23,19 @@ public:
     uint64_t presentedFrames() const { return presentedFrames_; }
     const std::vector<std::string>& messages() const { return messages_; }
     bool restartRequested() const { return restartRequested_; }
+
+    // Presented frame: VideoPresentScreen() copies the whole video buffer (with borders) into a snapshot, then calls the
+    // present hook. The view is laid out like the live buffer (bottom-up BGRA32, negative stride). All zero before the
+    // first present.
+    FrameView PresentedFrame(bool borders) const;
+    void SetPresentHook(std::function<void()> hook);   // called after each snapshot; an empty hook does nothing
+
+    // Sound. Off (the default): CreateSoundBuffer returns nullptr. On: it returns a MonitoredSoundBuffer wrapping
+    // DXSoundBuffer::create(...), or nullptr if that returns nullptr.
+    void EnableSound(bool enabled);
+    void SetSoundMuted(bool muted);        // every buffer created so far, and buffers created later
+    uint64_t SoundUnderruns() const;       // sum over all buffers
+    size_t SoundBuffersCreated() const;    // non-null buffers returned
 
     void Initialize(bool resetVideoState) override;
     void Destroy() override;
@@ -54,6 +71,11 @@ private:
     uint64_t presentedFrames_ = 0;
     std::vector<std::string> messages_;
     bool restartRequested_ = false;
+    std::vector<uint8_t> snapshot_;
+    std::function<void()> presentHook_;
+    bool soundEnabled_ = false;
+    bool soundMuted_ = false;
+    std::vector<std::shared_ptr<MonitoredSoundBuffer>> soundBuffers_;
 };
 
 }  // namespace harness

@@ -41,7 +41,7 @@ See `docs/decisions.md` for the reasoning behind each choice.
            AppleWin core (linked in-process; submodule external/AppleWin)
 ```
 
-- Integration: the harness hosts the AppleWin core in-process (D2, to be confirmed in M1).
+- Integration: the harness hosts the AppleWin core in-process (D2, confirmed in M1).
 - API: split into an agent API and an operator API (D4). The spec is in `docs/api_spec.md`.
 - State: checkpoints cover machine state and disks together (D5).
 - Display and sound: windowed with sound by default, headless (no window or sound) as an option. The window and sound are output only; they never change emulated state (D8).
@@ -69,7 +69,7 @@ VS 2022 solution, `.gitignore`, README, decisions log.
 
 **Acceptance:** `AppleWinHarness.exe` builds in both Debug and Release.
 
-### M1 — Spike: host the AppleWin core headless
+### M1 — Spike: host the AppleWin core headless ✅
 Link the AppleWin core into the harness. Implement a minimal headless `FrameBase`. Drive `CpuExecute` from the harness loop at authentic speed, paced by the realtime loop (D9). Write a frame to disk as a PNG.
 
 **Acceptance:** the harness boots an Apple //e with no window and saves a PNG showing the boot screen. The spike also produces a list of the AppleWin patches it needed, which feeds the D2 decision.

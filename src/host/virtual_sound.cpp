@@ -21,6 +21,8 @@ VirtualSoundBuffer::VirtualSoundBuffer(uint32_t bytes, uint32_t rate, int channe
     : bytes_(bytes), rate_(rate), channels_(channels), voiceId_(voiceId), capture_(capture), clock_(std::move(clock)),
       ring_(bytes, 0)
 {
+    if (capture_)
+        capture_->RegisterVoice(voiceId_, rate_);
 }
 
 VirtualSoundBuffer::~VirtualSoundBuffer()

@@ -20,6 +20,7 @@ struct AudioCapture::State {
     uint64_t highFrame = 0;                   // timeline frames [0, highFrame) exist (ring holds the newest kAudioRingFrames)
     uint64_t newestCycle = 0;
     std::unordered_map<int, Voice> voices;
+    std::unordered_map<int, uint32_t> rates;   // per-voice sample rate (default kAudioSampleRate); survives Clear
 };
 
 AudioCapture::AudioCapture() : state_(std::make_unique<State>())
@@ -50,6 +51,11 @@ void AudioCapture::Commit(int voiceId, std::span<const int16_t> in, int channels
     Voice& v = s.voices[voiceId];
     const uint64_t n = in.size() / size_t(channels);
     const uint64_t f1 = CycleToFrame(endCycle);
+    const auto rit = s.rates.find(voiceId);
+    const uint64_t rate = rit == s.rates.end() ? kAudioSampleRate : rit->second;
+    // The N samples span N x CLK/rate cycles at the voice's own rate: that many cycles, and that many timeline frames.
+    const uint64_t spanFrames = (n * kAudioSampleRate + rate / 2) / rate;
+    const uint64_t spanCycles = (n * kCyclesPerFrameNum * kAudioSampleRate + kCyclesPerFrameDen * rate - 1) / (kCyclesPerFrameDen * rate);
 
     uint64_t f0 = 0;
     bool placed = true;
@@ -57,13 +63,12 @@ void AudioCapture::Commit(int voiceId, std::span<const int16_t> in, int channels
         if (endCycle <= v.prevEnd) placed = false;
         else {
             // A paused voice: a gap well beyond what N samples need is silence, and the commit is placed like a first one.
-            const uint64_t expected = (n * kCyclesPerFrameNum + kCyclesPerFrameDen - 1) / kCyclesPerFrameDen;
             const uint64_t slack = uint64_t(0.1 * kAudioBaseClockHz);
-            if (endCycle - v.prevEnd > expected + slack) f0 = f1 > n ? f1 - n : 0;
+            if (endCycle - v.prevEnd > spanCycles + slack) f0 = f1 > spanFrames ? f1 - spanFrames : 0;
             else f0 = CycleToFrame(v.prevEnd);
         }
     } else {
-        f0 = f1 > n ? f1 - n : 0;
+        f0 = f1 > spanFrames ? f1 - spanFrames : 0;
     }
     v.hasPrev = true;
     v.prevEnd = (std::max)(v.prevEnd, endCycle);
@@ -109,6 +114,12 @@ void AudioCapture::Commit(int voiceId, std::span<const int16_t> in, int channels
         s.ring[slot] = Saturate(s.ring[slot] + l);
         s.ring[slot + 1] = Saturate(s.ring[slot + 1] + r);
     }
+}
+
+void AudioCapture::RegisterVoice(int voiceId, uint32_t sampleRate)
+{
+    if (sampleRate == 0) throw std::invalid_argument("AudioCapture::RegisterVoice: rate must not be 0");
+    state_->rates[voiceId] = sampleRate;
 }
 
 void AudioCapture::ResetVoice(int voiceId)

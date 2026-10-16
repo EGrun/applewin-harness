@@ -319,6 +319,25 @@ TEST_CASE("capture: a gap just under the threshold is still stretched")
     CheckFrames(more, 4441 + 4900 - 439, 4441 + 4900 - 2, 300, 300);
 }
 
+TEST_CASE("capture: a 22,050 Hz voice's first commit spans N x CLK/22050 cycles")
+{
+    AudioCapture c;
+    c.RegisterVoice(5, 22050);
+    // 441 samples at 22,050 Hz last 10 ms = 882 timeline frames: [2000, 2882).
+    c.Commit(5, Constant(441, 100), 1, F2C(2882));
+    const auto all = c.Read(0, c.NewestCycle());
+    REQUIRE(all.size() == 2 * 2882);
+    CheckFrames(all, 0, 1998, 0, 0);
+    CheckFrames(all, 2002, 2880, 100, 100);
+    // After a 2 s pause the next commit is again 882 frames long, not 441.
+    const uint64_t end = 2882 + 88200 + 882;
+    c.Commit(5, Constant(441, 200), 1, F2C(end));
+    const auto more = c.Read(0, c.NewestCycle());
+    REQUIRE(more.size() == 2 * end);
+    CheckFrames(more, 2884, end - 882 - 2, 0, 0);
+    CheckFrames(more, end - 880, end - 2, 200, 200);
+}
+
 TEST_CASE("capture: Clear empties the timeline and forgets every voice")
 {
     AudioCapture c;

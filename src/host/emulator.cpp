@@ -265,6 +265,9 @@ void ProcessDueInput()
         } else if (op.kind == QueuedOp::Kind::Key) {
             if (std::holds_alternative<ResetKey>(op.key)) {
                 CtrlReset();   // does not wait for the strobe
+                // CtrlReset sets g_bFreshReset, which makes KeybQueueKeypress swallow the next CTRL-C (a Win32
+                // CTRL-BREAK artefact). Harness input never produces that spurious key, so clear it.
+                GetFrame().g_bFreshReset = false;
                 NoteFirst(op.id, now);
                 Complete(op.id, now, now);
                 g_input.fifo.pop_front();
@@ -637,8 +640,10 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
             std::erase_if(g_input.fifo, [id](const QueuedOp& o) { return o.id == id; });
             throw std::runtime_error("TypeText: keyboard not read");
         }
-        if (stepper.Step(UINT64_MAX))
+        if (stepper.Step(UINT64_MAX)) {
+            std::erase_if(g_input.fifo, [id](const QueuedOp& o) { return o.id == id; });   // window closed
             return false;
+        }
     }
 }
 

@@ -134,8 +134,8 @@ void PinPowerOnRandomness()
 {
     std::srand(1);
     BYTE* rnd = MemGetMainPtr(0x4E);
-    rnd[0] = 0;
-    rnd[1] = 0;
+    rnd[0] = 0x20;   // AppleWin ORs 0x20 into both (Memory.cpp, "Pooyan" needs them non-zero); pin to that floor
+    rnd[1] = 0x20;
 }
 
 }  // namespace

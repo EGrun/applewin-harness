@@ -26,6 +26,8 @@ FrameView BottomUp2x2() { return FrameView{kBottomUp2x2.data() + 8, 2, 2, -8}; }
 
 }  // namespace
 
+TEST_SUITE("windowed") {
+
 TEST_CASE("window: construction gives a visible AppleWinHarnessWindow with a 1120x768 client area")
 {
     Window w(L"window test");
@@ -71,3 +73,5 @@ TEST_CASE("window: WM_CLOSE closes it")
     CHECK(!w.Pump());
     CHECK(w.Closed());
 }
+
+}  // TEST_SUITE("windowed")

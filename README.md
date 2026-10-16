@@ -2,7 +2,7 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. See [project.md](project.md).
+**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 Part A (the `--serve` pipe server) is done; agent audio and speed controls are pending. See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
@@ -62,6 +62,39 @@ AppleWinHarness.exe --headless --disk1 "external\AppleWin\bin\DOS 3.3 System Mas
 AppleWinHarness.exe --realtime --disk1 "external\AppleWin\bin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT CHR$(7)\r" --frames 120
 ```
 
+## Serve (JSON-RPC over a named pipe)
+```
+AppleWinHarness.exe --serve [--headless]
+```
+- Prints one JSON line on stdout, `{"pipe":"\\\\.\\pipe\\applewin-harness-<id>","agent_token":"...","operator_token":"...","pid":<n>}`, and then serves. `--serve` can't be combined with `--realtime`, `--disk1`, `--png` or any step.
+- One session per process. The process exits 0 after `close_session`, or when the window is closed.
+- The protocol is in [docs/api_spec.md](docs/api_spec.md).
+
+A Python client using only the standard library lives in `tests/python/harness_client.py`:
+
+```python
+import sys
+sys.path.insert(0, "tests/python")
+from harness_client import Harness
+
+h = Harness.launch(headless=True)
+op = h.connect("operator")
+op.call("create_session", disks=[{"slot": 6, "drive": 1, "path": r"C:\disks\dos33.dsk"}], run_mode="stepped")
+op.call("step_frames", frames=720)
+agent = h.connect("agent")
+agent.call("type_text", text="PRINT 2+2\n", inter_key_delay_ms=0)
+op.call("step_frames", frames=60)
+frame = agent.call("get_frame", format="PNG")   # frame["data"] is base64
+op.call("close_session")
+h.close()
+```
+
+Run the Python tests (build first; `HARNESS_EXE` defaults to `bin\x64\Debug\AppleWinHarness.exe`):
+```
+set HARNESS_EXE=%CD%\bin\x64\Release\AppleWinHarness.exe
+python -m unittest discover -s tests/python -v
+```
+
 ## Tests
 ```
 REM everything
@@ -69,7 +102,7 @@ bin\x64\Debug\HarnessTests.exe
 REM what CI runs
 bin\x64\Debug\HarnessTests.exe -tse=windowed,audio
 ```
-Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64 and runs `HarnessTests.exe -tse=windowed,audio`.
+Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64, runs `HarnessTests.exe -tse=windowed,audio`, and then the Python pipe tests.
 
 ## License
 Not decided yet. The harness links AppleWin (GPL-2.0), so its license must be GPL-2.0-compatible (decision D6).

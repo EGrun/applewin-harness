@@ -23,6 +23,10 @@ jobs:
         run: msbuild AppleWinHarness.sln -m -p:Configuration=${{ matrix.config }} -p:Platform=x64
         # a failing msbuild exits non-zero, which fails the step
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Record harness temp path
         shell: pwsh
         run: '"HARNESS_TMP=$env:TEMP\applewin-harness" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
@@ -31,6 +35,14 @@ jobs:
         shell: pwsh
         run: |
           & "bin\x64\${{ matrix.config }}\HarnessTests.exe" "-tse=windowed,audio"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Python pipe tests (--serve --headless)
+        shell: pwsh
+        env:
+          HARNESS_EXE: ${{ github.workspace }}\bin\x64\${{ matrix.config }}\AppleWinHarness.exe
+        run: |
+          python -m unittest discover -s tests/python -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload harness temp files on failure

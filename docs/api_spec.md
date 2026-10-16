@@ -1,6 +1,6 @@
 # AppleWin Harness — API & Protocol Specification
 
-**Version:** 0.2 (draft). Design reasoning lives in [decisions.md](decisions.md).
+**Version:** 0.3 (draft). Part A of M3 (server, sessions, input, frames, execution control) is implemented. Sections marked "M3 Part B/C — pending" describe features that are not built yet. Design reasoning lives in [decisions.md](decisions.md).
 
 ## Overview
 The harness lets clients drive an AppleWin emulator that it hosts in-process. The API is split by role (D4):
@@ -10,85 +10,111 @@ The harness lets clients drive an AppleWin emulator that it hosts in-process. Th
 
 ## Launching
 ```
-AppleWinHarness.exe [--headless]
+AppleWinHarness.exe --serve [--headless]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| *(none)* | windowed | Opens a view-only window showing the live Apple screen and plays the Apple's sound (D8). Sound plays only in realtime mode. |
+| `--serve` | off | Serves this API on a named pipe. It cannot be combined with `--realtime`, `--disk1`, `--png` or any step (usage error, exit 2). |
+| *(no `--headless`)* | windowed | Opens a view-only window showing the live Apple screen and plays the Apple's sound (D8). Sound plays only in realtime mode. |
 | `--headless` | off | No window and no sound. Use it for CI, batch runs, and machines without a desktop. |
 
-- The display mode is fixed for the life of the process.
-- The display mode never changes emulation results.
+- **Announcement.** On start the server prints exactly one line to stdout and flushes it. Nothing else is ever written to stdout:
+  `{"pipe":"\\\\.\\pipe\\applewin-harness-<id>","agent_token":"<64 hex>","operator_token":"<64 hex>","pid":<n>}`
+  - The keys are in that order. `<id>` is 32 random hex characters.
+  - Each token is 32 random bytes from `BCryptGenRandom`, written as hex. They are never written anywhere else.
+- **One session per process.** The process serves at most one session (`create_session` once). Start another process for another session.
+- **Exit.** The process exits with 0 after `close_session` has been answered, or when the window is closed. It exits with 1 on a fatal error, after printing `error: …` to stderr. Working copies and the INI file are removed on every exit path.
+- The display mode is fixed for the life of the process, and it never changes emulation results.
 - In windowed mode, closing the window shuts the harness down. This works like `close_session` followed by exit.
 
 ## Transport (D3)
-- **Pipe:** a Windows named pipe, `\\.\pipe\applewin-harness-<session-id>`. Its ACL allows only the user who launched the harness.
+- **Pipe:** a Windows named pipe, `\\.\pipe\applewin-harness-<id>`, in byte mode with overlapped I/O. It allows at most 8 simultaneous connections. Remote clients are rejected (`PIPE_REJECT_REMOTE_CLIENTS`).
+- **ACL:** the DACL has exactly one ACE, an allow ACE for the SID of the user who launched the harness.
 - **Messages:** JSON-RPC 2.0, encoded as UTF-8, with one JSON object per message. Each message is prefixed with its length as a 4-byte little-endian integer.
-- **Notifications:** JSON-RPC notifications (no `id`) are used for events.
-- **Frames:** raw frames can optionally be sent through shared memory (see below).
+- **Framing:** a length of 0 or more than 16 MiB closes the connection. So does a connection that closes mid-message. The server keeps running.
+- **Send backlog:** replies and notifications are queued per connection and never block emulation. If a connection's unsent backlog passes 64 MiB, the server closes it.
+- **Notifications:** JSON-RPC notifications (no `id`) are used for events. Notifications sent by clients are ignored.
+- **Frames:** raw frames through shared memory are planned (see below) and not yet available.
 
 ### Handshake
 The first message on every connection must be `hello`:
 
 ```json
 { "jsonrpc": "2.0", "id": 1, "method": "hello",
-  "params": { "protocol_version": "0.2", "role": "agent", "token": "<token>" } }
+  "params": { "protocol_version": "0.3", "role": "agent", "token": "<token>" } }
 ```
 
-- The harness creates one token per role when it starts. It passes the tokens to whoever launched it, through stdout or an environment variable, and never writes them to disk.
-- The response is `{ protocol_version, role, display_mode: "windowed" | "headless" }`.
+- The harness creates one token per role when it starts. It passes them to whoever launched it in the announcement line on stdout, and never writes them to disk.
+- The response is `{ protocol_version: "0.3", role, display_mode: "windowed" | "headless" }`.
+- A `protocol_version` other than `"0.3"` returns `-32600` and the server closes the connection.
+- A wrong token or role, or any method other than `hello` as the first message, returns `-32001` and the server closes the connection. So does malformed JSON or an invalid request as the first message (the error reply is sent first).
 - The role is fixed for the life of the connection.
-- The server returns `-32001` if an agent connection calls an operator method.
+- The server returns `-32001` if an agent connection calls an operator method. The connection stays open.
 - Requests after `hello` don't carry a token.
+- After `hello`, malformed JSON returns `-32700`, a message that isn't a JSON-RPC 2.0 request returns `-32600`, an unknown method returns `-32601`, and bad params return `-32602`. The connection stays open in all of these.
 
 ## Time (D10)
 - **`emulated_cycles`** is the number of 6502 cycles since power-on.
 - **`emulated_ms`** is `emulated_cycles` divided by the base clock: about 1.0205 MHz (NTSC, 60 Hz) or the PAL clock (50 Hz). It ignores the speed setting.
 - **Every duration in the API is in emulated milliseconds.** This covers `hold_ms`, `inter_key_delay_ms` and `duration_ms`. As a result, a script gives the same results at any speed and in either run mode.
-- **Every input response includes `applied_at_cycle`.** That's the emulated cycle at which the input took effect.
+- **Every input response includes `input_id` and `applied_at_cycle`.** `applied_at_cycle` is the emulated cycle at which the input will take effect, or `null` if that isn't known yet. The exact cycles arrive in an `input_applied` notification (see Input replies).
 
 ## Agent API
+Before a session exists, every agent method returns `-32002`.
+
+### Input replies
+`type_text`, `press_key` and `set_joystick` reply straight away with `{ input_id, applied_at_cycle }`. They never wait for the input to take effect, because in stepped mode that only happens during a step, and a single-threaded client would deadlock.
+- Input takes effect at the start of the next step (D10). `applied_at_cycle` is the cycle at which it will take effect when that is already known: nothing is queued ahead of it and, for a key, the keyboard strobe is clear. Then it equals the current `emulated_cycles`. Otherwise it is `null`.
+- When an input has fully taken effect, that connection receives the notification `input_applied { input_id, first_cycle, last_cycle }`. For `type_text`, these are the cycles of the first and last key. For a held key or a joystick `duration_ms`, they are the press and the release.
+- Inputs are applied in order. A key also waits until the keyboard strobe is clear.
+- Auto-repeat on held keys is not implemented.
 
 ### Keyboard
 The Apple II keyboard sends 7-bit ASCII and has no separate modifier keys, so keys are given as characters or named specials, not PC scan codes.
 
 **`type_text`** `{ text: string, inter_key_delay_ms?: int = 30 }`
-Sends each character as one keypress. Newlines (`\n`) become RETURN. Lowercase is sent as-is; on an Apple II/II+ model the harness converts it to uppercase.
+Sends each character as one keypress. `text` may contain only characters 0x20 to 0x7E and `\n`, and is at most 4,096 characters; otherwise `-32602`. Newlines (`\n`) become RETURN. Lowercase is sent as-is (the //e is the only supported model).
+- Key *i* is applied at the later of the previous key's applied cycle plus `inter_key_delay_ms` (at the base clock) and the moment the strobe clears. With `inter_key_delay_ms: 0` this is the fastest the keyboard can take the keys.
 
 **`press_key`** `{ key: string | int, hold_ms?: int = 50 }`
 Presses a single key.
-- `key` is either one character, an ASCII code from 0 to 127, or one of these names: `RETURN`, `ESC`, `TAB`, `DELETE`, `LEFT`, `RIGHT`, `UP`, `DOWN`, `CTRL-<letter>`, `RESET`.
-- `RESET` sends CTRL-RESET.
-- `hold_ms` affects the //e any-key-down flag ($C010) and auto-repeat.
+- `key` is either one character from 0x20 to 0x7E, an ASCII code from 0 to 127, or one of these names: `RETURN` (0x0D), `ESC` (0x1B), `TAB` (0x09), `DELETE` (0x7F), `LEFT`, `RIGHT`, `UP`, `DOWN`, `CTRL-A` to `CTRL-Z` (0x01 to 0x1A), `RESET`. Anything else is `-32602`.
+- `RESET` sends CTRL-RESET. It does not wait for the strobe.
+- `hold_ms` sets how long the //e any-key-down flag ($C010 bit 7) stays set.
+- There is no upper limit on `hold_ms` yet (planned for M6).
 
 The Open-Apple and Solid-Apple keys are joystick buttons 0 and 1; use `set_joystick` for them.
 
 ### Joystick
-**`set_joystick`** `{ joystick?: 0|1 = 0, x?: 0..255, y?: 0..255, buttons?: { "0"?: bool, "1"?: bool, "2"?: bool }, duration_ms?: int }`
-- These are the native paddle values; 127 is centre.
+**`set_joystick`** `{ joystick?: 0 = 0, x?: 0..255, y?: 0..255, buttons?: { "0"?: bool, "1"?: bool }, duration_ms?: int }`
+- These are the native paddle values; 127 is centre. Positions start at 127.
 - Any field left out keeps its current value.
-- If `duration_ms` is set, the joystick returns to its previous state after that long.
+- If `duration_ms` is set, the joystick returns to its previous state after that long. There is no upper limit yet (planned for M6).
+- `joystick: 1` and button `"2"` return `-32006` (not yet supported).
 
 ### Screen
 **`get_frame`** `{ format?: "PNG" | "BGRA32" = "PNG", borders?: bool = false }`
 
-Returns `{ frame_id, width, height, stride, format, data? }`.
-- `data` is base64-encoded. It is left out if the session uses shared memory.
-- `BGRA32` is AppleWin's own framebuffer format, so no conversion is needed.
+Returns `{ frame_id, emulated_cycles, width, height, stride, format, data }`.
+- `data` is base64-encoded (RFC 4648, with padding).
+- The frame is the last presented frame. `frame_id` is the number of frames presented so far, and `emulated_cycles` is the time of the call.
+- `BGRA32` is AppleWin's own framebuffer format. The rows are top-down (top row first) and `stride = width × 4`.
+- `PNG` reports `stride = width × 3`.
 - **Size without borders:** 560×384 for II-series video modes, where each 280×192 Apple pixel is drawn as 2×2. VidHD modes are larger.
 - **Size with borders:** add 20 px on the left and right and 18 px on the top and bottom, giving 600×420.
 - JPEG is deliberately not supported: lossy compression breaks pixel and checksum assertions.
 
 **`subscribe_frames`** `{ every_n_frames?: int = 1 }`
-After this call the server sends `frame_ready` notifications.
+- `every_n_frames` is 1 to 600. After this call, the connection receives `frame_ready { frame_id, emulated_cycles, width, height }` after every *n*-th presented frame.
+- Counting starts at the subscribe call. Calling it again replaces the setting and restarts the count. `every_n_frames: 0` unsubscribes.
 
-**`get_text_screen`** *(optional; only available if the session sets `allow_text_screen`)*
+**`get_text_screen`** *(planned for M5; returns `-32006` for now)*
 Returns `{ mode: "40col" | "80col" | "graphics", lines: string[24] }`.
-- The text is decoded from video memory, which goes beyond strictly reading pixels. That's why it's opt-in.
+- The text is decoded from video memory, which goes beyond strictly reading pixels. That's why it's opt-in (`allow_text_screen`).
 - It returns `mode: "graphics"` with empty `lines` when the screen isn't in a text mode.
 
-### Sound (D12)
+### Sound (D12) — M3 Part B — pending
 The agent hears the same sound a person would: the speaker and Mockingboard, mixed together.
 - It's captured in emulated time, in every mode, including headless and stepped.
 - Playback volume and muting don't affect it.
@@ -108,33 +134,38 @@ After this call the server sends `sound_started` and `sound_stopped` notificatio
 - It "stops" once it has stayed below the threshold for `min_silence_ms`.
 
 ### Agent notifications
-- `frame_ready` `{ frame_id, emulated_ms, width, height, stride, format, shm_name? }`
-- `sound_started` `{ start_cycle, emulated_ms }`
-- `sound_stopped` `{ start_cycle, end_cycle, duration_ms, peak_db, dominant_hz }`. Fetch the actual samples with `get_audio { from_cycle: start_cycle }`.
+- `frame_ready` `{ frame_id, emulated_cycles, width, height }` (shared-memory fields are planned)
+- `input_applied` `{ input_id, first_cycle, last_cycle }`
+- `sound_started` *(M3 Part B — pending)* `{ start_cycle, emulated_ms }`
+- `sound_stopped` *(M3 Part B — pending)* `{ start_cycle, end_cycle, duration_ms, peak_db, dominant_hz }`. Fetch the actual samples with `get_audio { from_cycle: start_cycle }`.
 
 ## Operator API
 
 ### Sessions
-**`create_session`** `{ model?: "apple2" | "apple2plus" | "apple2e" | "apple2ee" = "apple2ee", disks?: [ { slot: 6, drive: 1|2, path } ], hard_disks?: [ { slot: 7, unit: 1|2, path } ], run_mode?: "realtime" | "stepped" = "realtime", speed?: { video_refresh?: 50 | 60 = 60, ...set_speed params }, allow_text_screen?: bool = false, shared_memory_frames?: bool = false }`
+**`create_session`** `{ model?: "apple2ee" = "apple2ee", disks?: [ { slot: 6, drive: 1|2 = 1, path } ], run_mode?: "realtime" | "stepped" = "realtime", speed?: {...}, allow_text_screen?: bool = false, shared_memory_frames?: bool = false }`
 
 Returns `{ session_id }`.
-- The harness copies each image into a working directory and mounts the copies. The original files are never opened for writing (D5).
-- In `stepped` mode, emulation only advances in response to `step_frames` or `step_cycles`.
-- `speed.video_refresh` picks the base clock: 60 means NTSC, 50 means PAL. It is fixed for the session, because AppleWin restarts the emulator to change it. The other `speed` fields set the initial speed (see Speed below).
+- `path` must be absolute (`-32602`). A missing file returns `-32005`.
+- The harness copies each image into a working directory (`%TEMP%\applewin-harness\<pid>\`) and mounts the copies. The original files are never opened for writing (D5).
+- A realtime session starts running. A stepped session starts paused, and emulation only advances in response to `step_frames`.
+- A second `create_session` returns `-32008`: there is one session per process.
+- **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `allow_text_screen: true`, `shared_memory_frames: true`, `speed.video_refresh: 50` (PAL), and any `speed` field until Part C. Planned shape for `speed`: `{ video_refresh?: 50 | 60 = 60, ...set_speed params }` (M3 Part C — pending).
 
-**`close_session`** `{ discard?: bool = true }` — stops the session and deletes its working copies. Use `export_disk` first to keep any results.
+**`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and exits the process with code 0. It is also valid when no session exists. Use `export_disk` first to keep any results (M4).
 
-**`list_disks`** — returns `[ { slot, drive, original_path, working_path, write_protected, format } ]`
+**`list_disks`** *(M4)* — returns `[ { slot, drive, original_path, working_path, write_protected, format } ]`
 
-**`export_disk`** `{ slot, drive, dest_path }` — copies a working image out of the session. It refuses to overwrite the original image.
+**`export_disk`** *(M4)* `{ slot, drive, dest_path }` — copies a working image out of the session. It refuses to overwrite the original image.
 
 ### Execution control
-- **`pause`** — returns once the emulation loop has stopped at a frame boundary.
-- **`resume`** — only valid in `realtime` mode. Realtime mode runs in 1 ms bursts of `effective_clock_hz × 1 ms` cycles, paced by a high-resolution timer (D9).
-- **`step_frames`** `{ frames: int }` — runs N video frames (17,030 cycles each at 60 Hz), then pauses. Returns `{ emulated_cycles }`. Input queued while paused takes effect at the start of the next step, which keeps runs deterministic.
-- **`step_cycles`** `{ cycles: int }` — *(planned for after M4)* runs N CPU cycles.
+Before a session exists, these return `-32002`.
+- **`pause`** `{}` — in realtime mode it runs until the next present, then pauses, and replies `{ emulated_cycles }`. If already paused, it replies at once.
+- **`resume`** `{}` — only valid in `realtime` mode (`-32008` in stepped mode). Replies `{}`. Realtime mode runs in 1 ms bursts, paced by a high-resolution timer (D9).
+- **`step_frames`** `{ frames: int }` — `frames` is 1 to 100000. Pauses first if the session is running, runs N video frames (17,030 cycles each at 60 Hz), then stays paused. Returns `{ emulated_cycles }`. Input queued while paused takes effect at the start of the next step, which keeps runs deterministic.
+- If the window is closed during `pause` or `step_frames`, the reply is `-32008` and the process then exits with 0.
+- **`step_cycles`** `{ cycles: int }` — *(planned for M4)* runs N CPU cycles.
 
-### Speed (D11)
+### Speed (D11) — M3 Part C — pending
 These commands offer exactly the speed controls AppleWin has, with AppleWin's value ranges. The harness implements them by calling AppleWin's own functions (`SetCurrentCLK6502`, `UseClockMultiplier`, `SetEnhanceDisk`), so clamping and rounding match AppleWin exactly.
 
 **`set_speed`** `{ machine_speed?: 0..40 | "authentic" | "max", clock_multiplier?: number, enhance_disk_speed?: bool, full_speed_override?: bool }`
@@ -169,13 +200,13 @@ Any field left out keeps its current value. Returns the same result as `get_spee
 - **At full speed in realtime mode**, frames are redrawn the way AppleWin does it, and `frame_ready` notifications are limited to 60 per wall-clock second.
 - **Speed is a session setting.** `restore_checkpoint` doesn't change it.
 
-### Checkpoints (D5)
+### Checkpoints (D5) — M4
 - **`checkpoint`** `{ name }` — pauses the emulator if it's running, flushes the disk buffers, writes a save state, and copies the working disks. Returns `{ checkpoint_id }`.
 - **`restore_checkpoint`** `{ checkpoint_id }` — restores the save state and the disks together, and leaves the emulator paused.
 - **`list_checkpoints`** — returns `[ { checkpoint_id, name, created_at, emulated_ms } ]`
 - **`delete_checkpoint`** `{ checkpoint_id }`
 
-### Test helpers
+### Test helpers (M4)
 **`get_state_checksum`** — returns `{ sha256 }`, a hash of main and aux RAM, the CPU registers and the memory soft-switch state. The exact list of fields is fixed during M4 and recorded here. Wall-clock time is never included.
 
 ### Operator notifications
@@ -203,29 +234,31 @@ Harness-specific codes:
 |---|---|
 | -32000 | Generic harness error |
 | -32001 | Unauthorized: bad token, or method not allowed for this role |
-| -32002 | No session |
+| -32002 | No session (agent or operator method that needs one, before `create_session`) |
 | -32003 | Resource locked |
 | -32004 | Checkpoint failed |
 | -32005 | Disk not found |
-| -32006 | Not supported (by this model or build) |
+| -32006 | Not supported (by this model or build, or not yet implemented) |
 | -32007 | Busy, try again |
-| -32008 | Invalid state (e.g. `resume` in stepped mode) |
+| -32008 | Invalid state (e.g. `resume` in stepped mode, a second `create_session`, window closed during a step) |
 | -32009 | Audio no longer buffered |
 
-Error objects look like `{ code, message, data? }`.
+Error objects look like `{ code, message, data? }`. `-32603` carries the C++ exception's `what()` in `message`.
 
 ## Limits
-- Input rate: by default, at most 200 keyboard or joystick events per emulated second.
-- Message size: 16 MiB per request or response.
-- Paths: `dest_path` and disk paths must be absolute and must not point into the harness working directory.
+- Message size: 16 MiB per request or response (framing). A larger length prefix closes the connection.
+- Send backlog: 64 MiB of unsent data per connection; beyond that the server closes it.
+- Connections: at most 8 at once.
+- Not limited yet (M6): input rate (planned: 200 events per emulated second), `inter_key_delay_ms`, `hold_ms` and `duration_ms` values, and request sizes below 16 MiB. A client can therefore schedule events arbitrarily far ahead.
+- Paths: disk paths must be absolute.
 
 ## Example: the M2 scenario over the API
 ```text
-operator → hello {role: "operator", ...}
+operator → hello {protocol_version: "0.3", role: "operator", ...}
 operator → create_session {disks: [{slot: 6, drive: 1, path: "C:\\disks\\dos33.dsk"}], run_mode: "stepped"}
-operator → step_frames {frames: 180}          # boot
+operator → step_frames {frames: 720}          # boot
 agent    → hello {role: "agent", ...}
-agent    → type_text {text: "PRINT 2+2\n"}
-operator → step_frames {frames: 30}
+agent    → type_text {text: "PRINT 2+2\n", inter_key_delay_ms: 0}
+operator → step_frames {frames: 60}
 agent    → get_frame {format: "PNG"}          # assert golden checksum
 ```

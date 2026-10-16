@@ -94,7 +94,9 @@ Add keyboard input and frame capture. Add the windowed presenter with sound, whi
 - Headless mode opens no audio device.
 
 ### M3 — JSON-RPC server
-Serve the named pipe with an ACL and the `hello` handshake. Implement the agent API (keys, joystick, `get_frame`, `subscribe_frames`) and the operator API for `pause`, `resume` and `step_frames`.
+**Status:** Part A (server) is done. Parts B (agent audio) and C (speed controls) are pending. See `docs/specs/m3.md`.
+
+Serve the named pipe with an ACL and the `hello` handshake. Implement the agent API (keys, joystick, `get_frame`, `subscribe_frames`) and the operator API for `create_session`, `close_session`, `pause`, `resume` and `step_frames`. `create_session` and `close_session` moved here from M4, because the M2 scenario over the pipe needs them. There is one session per process; multiple sessions need AppleWin re-initialisation work and come later.
 
 This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: the AppleWin capture patch, `get_audio` and `subscribe_audio` (D12).
 
@@ -106,8 +108,8 @@ This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: the
 - For a range of `clock_multiplier` inputs, the resulting `machine_speed` matches what AppleWin's `UseClockMultiplier` produces.
 - In headless mode, `PRINT CHR$(7)` produces a `sound_started` event followed by a `sound_stopped` event with a `dominant_hz` close to the bell's pitch. `get_audio` returns the bell.
 
-### M4 — Sessions, checkpoints, determinism
-Add `create_session`, `checkpoint`, `restore_checkpoint` and `get_state_checksum`. Add stepped run mode.
+### M4 — Checkpoints, determinism
+Add `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `list_disks`, `export_disk` and `step_cycles`. (`create_session`, `close_session` and stepped run mode arrive in M3.)
 
 **Acceptance:**
 - The same input script, run twice from the same checkpoint in stepped mode, produces identical state checksums and frame checksums.

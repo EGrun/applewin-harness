@@ -48,6 +48,12 @@ AppleWin already provides the seams this needs:
 - Optional shared memory carries raw frames.
 - TCP/WebSocket are out of scope until there's a concrete remote use case.
 
+**Update (M3 Part A, protocol 0.3):**
+- With `--serve`, the harness prints one announcement line on stdout, `{"pipe", "agent_token", "operator_token", "pid"}`, and nothing else. That line is how the tokens reach whoever launched it. They are never written to disk. Remote pipe clients are rejected, and the DACL has one allow ACE for the launching user.
+- `hello` carries `protocol_version: "0.3"`.
+- Input methods (`type_text`, `press_key`, `set_joystick`) reply at once with `{ input_id, applied_at_cycle }`, where `applied_at_cycle` is `null` unless it is already known. The exact cycles arrive in an `input_applied` notification. A reply deferred until the input was applied would deadlock a single-threaded client in stepped mode, because the input only takes effect during a step. D10 is met through the notification.
+- A connection whose outgoing backlog passes 64 MiB is closed, so a stalled client can't freeze emulation.
+
 ## D4 — Agent API vs operator API
 **Status:** Accepted
 

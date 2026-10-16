@@ -1,72 +1,550 @@
 #include "server/session.h"
 #include "server/protocol.h"
+#include "core/base64.h"
+#include "core/png_writer.h"
 #include "core/working_copy.h"
+#include <windows.h>
+#include <algorithm>
+#include <cstring>
+#include <exception>
+#include <iostream>
+#include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
-
-// Task 2 stubs: implemented in Task 5.
 
 namespace harness {
 
+namespace fs = std::filesystem;
+using nlohmann::json;
+
 namespace {
 
-[[noreturn]] void NotImplemented(const char* what)
+constexpr uint32_t kMaxTextChars = 4096;
+constexpr uint32_t kDefaultInterKeyDelayMs = 30;
+constexpr uint32_t kDefaultHoldMs = 50;
+constexpr uint32_t kMaxStepFrames = 100000;
+constexpr uint32_t kMaxEveryNFrames = 600;
+constexpr DWORD kIdleWaitMs = 50;
+constexpr uint64_t kMaxMs = UINT32_MAX;   // inter_key_delay_ms, hold_ms, duration_ms
+
+[[noreturn]] void InvalidParams(const std::string& message)
 {
-    throw RpcError{kInternalError, std::string(what) + ": not implemented"};
+    throw RpcError{kInvalidParams, message};
+}
+
+// The field, or nullptr when it is absent or null.
+const json* Field(const json& params, const char* name)
+{
+    const auto it = params.find(name);
+    if (it == params.end() || it->is_null()) return nullptr;
+    return &*it;
+}
+
+bool GetBool(const json& params, const char* name, bool fallback)
+{
+    const json* f = Field(params, name);
+    if (!f) return fallback;
+    if (!f->is_boolean()) InvalidParams(std::string(name) + " must be a boolean");
+    return f->get<bool>();
+}
+
+// An integer in [lo, hi]; fallback when absent (nullopt fallback: required).
+uint64_t GetUint(const json& params, const char* name, uint64_t lo, uint64_t hi, std::optional<uint64_t> fallback)
+{
+    const json* f = Field(params, name);
+    if (!f) {
+        if (!fallback) InvalidParams(std::string(name) + " is required");
+        return *fallback;
+    }
+    if (f->is_number_unsigned()) {
+        const uint64_t v = f->get<uint64_t>();
+        if (v >= lo && v <= hi) return v;
+    } else if (f->is_number_integer()) {
+        const int64_t v = f->get<int64_t>();
+        if (v >= 0 && uint64_t(v) >= lo && uint64_t(v) <= hi) return uint64_t(v);
+    } else {
+        InvalidParams(std::string(name) + " must be an integer");
+    }
+    InvalidParams(std::string(name) + " must be in " + std::to_string(lo) + ".." + std::to_string(hi));
+}
+
+std::string GetString(const json& params, const char* name, std::optional<std::string> fallback)
+{
+    const json* f = Field(params, name);
+    if (!f) {
+        if (!fallback) InvalidParams(std::string(name) + " is required");
+        return *fallback;
+    }
+    if (!f->is_string()) InvalidParams(std::string(name) + " must be a string");
+    return f->get<std::string>();
+}
+
+fs::path Utf8Path(const std::string& s)
+{
+    return fs::path(std::u8string(s.begin(), s.end()));
+}
+
+std::string PathUtf8(const fs::path& p)
+{
+    const std::u8string u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+
+void ReplaceAll(std::string& s, const std::string& from, const std::string& to)
+{
+    if (from.empty()) return;
+    for (size_t pos = 0; (pos = s.find(from, pos)) != std::string::npos; pos += to.size())
+        s.replace(pos, from.size(), to);
+}
+
+// press_key's key: one character 0x20-0x7E, an int 0..127, or a name (spec: Part A "Input queue").
+KeySpec ParseKey(const json& params)
+{
+    const json* f = Field(params, "key");
+    if (!f) InvalidParams("key is required");
+    if (f->is_number_integer()) {
+        const int64_t v = f->is_number_unsigned() ? int64_t(std::min<uint64_t>(f->get<uint64_t>(), 1000))
+                                                  : f->get<int64_t>();
+        if (v < 0 || v > 127) InvalidParams("key code must be in 0..127");
+        return KeySpec{uint8_t(v)};
+    }
+    if (!f->is_string()) InvalidParams("key must be a string or an integer");
+    const std::string k = f->get<std::string>();
+    if (k.size() == 1) {
+        const unsigned char c = static_cast<unsigned char>(k[0]);
+        if (c >= 0x20 && c <= 0x7E) return KeySpec{uint8_t(c)};
+        InvalidParams("key character must be 0x20-0x7E");
+    }
+    if (k == "RETURN") return KeySpec{uint8_t(0x0D)};
+    if (k == "ESC") return KeySpec{uint8_t(0x1B)};
+    if (k == "TAB") return KeySpec{uint8_t(0x09)};
+    if (k == "DELETE") return KeySpec{uint8_t(0x7F)};
+    if (k == "LEFT") return KeySpec{ArrowKey::Left};
+    if (k == "RIGHT") return KeySpec{ArrowKey::Right};
+    if (k == "UP") return KeySpec{ArrowKey::Up};
+    if (k == "DOWN") return KeySpec{ArrowKey::Down};
+    if (k == "RESET") return KeySpec{ResetKey{}};
+    if (k.size() == 6 && k.compare(0, 5, "CTRL-") == 0 && k[5] >= 'A' && k[5] <= 'Z')
+        return KeySpec{uint8_t(k[5] - 'A' + 1)};
+    InvalidParams("unknown key: " + k);
+}
+
+json InputReply(uint64_t id, std::optional<uint64_t> at)
+{
+    return json{{"input_id", id}, {"applied_at_cycle", at ? json(*at) : json(nullptr)}};
 }
 
 }  // namespace
 
 Session::Session(DisplayMode display, Emulator& emulator) : display_(display), emulator_(emulator)
 {
+    queueEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!queueEvent_) throw std::system_error(int(GetLastError()), std::system_category(), "CreateEventW");
 }
 
-Session::~Session() = default;
-
-void Session::Post(ConnectionPtr, nlohmann::json)
+Session::~Session()
 {
-    throw std::logic_error("Session::Post: not implemented");
+    Cleanup();
+    if (queueEvent_) CloseHandle(static_cast<HANDLE>(queueEvent_));
+}
+
+void Session::SetFatalErrorSource(std::function<std::string()> fatalError)
+{
+    fatalError_ = std::move(fatalError);
+}
+
+void Session::Post(ConnectionPtr connection, json request)
+{
+    // Connection thread. Never throws into the transport: a request that cannot be queued is answered here.
+    try {
+        Command c;
+        c.connection = connection;
+        c.id = request.contains("id") ? request["id"] : json(nullptr);
+        c.method = request.value("method", std::string());
+        if (const auto it = request.find("params"); it != request.end()) c.params = std::move(*it);
+        {
+            std::lock_guard lock(queueMutex_);
+            queue_.push_back(std::move(c));
+        }
+        SetEvent(static_cast<HANDLE>(queueEvent_));
+    } catch (const std::exception& e) {
+        try {
+            if (connection) connection->Send(MakeError(request.value("id", json()), kInternalError, e.what()));
+        } catch (...) {
+        }
+    }
+}
+
+bool Session::IsOperatorOnly(std::string_view method)
+{
+    return method == "create_session" || method == "close_session" || method == "pause" || method == "resume" ||
+           method == "step_frames";
 }
 
 int Session::RunMainLoop()
 {
-    throw std::logic_error("Session::RunMainLoop: not implemented");
-}
-
-bool Session::IsOperatorOnly(std::string_view)
-{
-    throw std::logic_error("Session::IsOperatorOnly: not implemented");
+    int rc = 0;
+    emulator_.SetPresentObserver([this] { SendFrameReady(); });
+    try {
+        for (;;) {
+            if (fatalError_) {
+                const std::string fatal = fatalError_();
+                if (!fatal.empty()) {
+                    std::cerr << "error: " << fatal << std::endl;
+                    rc = 1;
+                    break;
+                }
+            }
+            if (state_ == State::Running) {
+                // One realtime step (it pumps the window), then the commands that arrived meanwhile.
+                const bool open = emulator_.RunRealtimeStep();
+                SendInputApplied();
+                if (!open) break;   // window closed: exit 0
+            } else {
+                HANDLE h = static_cast<HANDLE>(queueEvent_);
+                MsgWaitForMultipleObjects(1, &h, FALSE, kIdleWaitMs, QS_ALLINPUT);
+                if (state_ != State::NoSession && !emulator_.PumpWindow()) break;   // window closed: exit 0
+            }
+            if (!DrainCommands()) break;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << std::endl;
+        rc = 1;
+    } catch (...) {
+        std::cerr << "error: unknown exception" << std::endl;
+        rc = 1;
+    }
+    Cleanup();
+    return rc;
 }
 
 bool Session::DrainCommands()
 {
-    throw std::logic_error("Session::DrainCommands: not implemented");
+    std::deque<Command> batch;
+    {
+        std::lock_guard lock(queueMutex_);
+        batch.swap(queue_);
+    }
+    for (const Command& c : batch) {
+        Dispatch(c);
+        if (exitRequested_) return false;
+    }
+    return true;
 }
 
-void Session::Dispatch(const Command&)
+void Session::Dispatch(const Command& command)
 {
-    throw std::logic_error("Session::Dispatch: not implemented");
+    const ConnectionPtr& conn = command.connection;
+    json reply;
+    try {
+        if (!command.params.is_null() && !command.params.is_object())
+            throw RpcError{kInvalidParams, "params must be an object"};
+        const json params = command.params.is_object() ? command.params : json::object();
+        const std::string& m = command.method;
+        json result;
+        if (m == "create_session") result = CreateSession(params);
+        else if (m == "close_session") result = CloseSession(params);
+        else if (m == "pause") result = Pause(params);
+        else if (m == "resume") result = Resume(params);
+        else if (m == "step_frames") result = StepFrames(params);
+        else if (m == "get_frame") result = GetFrame(params);
+        else if (m == "subscribe_frames") result = SubscribeFrames(conn, params);
+        else if (m == "type_text") result = TypeText(conn, params);
+        else if (m == "press_key") result = PressKey(conn, params);
+        else if (m == "set_joystick") result = SetJoystick(conn, params);
+        else throw RpcError{kMethodNotFound, "method not found: " + m};
+        reply = MakeResult(command.id, std::move(result));
+    } catch (const RpcError& e) {
+        reply = MakeError(command.id, e.code, e.message);
+    } catch (const std::exception& e) {
+        reply = MakeError(command.id, kInternalError, e.what());
+    }
+    try {
+        conn->Send(reply);
+    } catch (const std::exception& e) {   // a result over 16 MiB
+        try { conn->Send(MakeError(command.id, kInternalError, e.what())); } catch (...) {}
+    }
 }
 
 void Session::SendInputApplied()
 {
-    throw std::logic_error("Session::SendInputApplied: not implemented");
+    for (const InputApplied& a : emulator_.TakeAppliedInputs()) {
+        const auto it = inputOwners_.find(a.inputId);
+        if (it == inputOwners_.end()) continue;
+        const ConnectionPtr conn = it->second;
+        inputOwners_.erase(it);
+        try {
+            conn->Send(MakeNotification("input_applied", json{{"input_id", a.inputId},
+                                                              {"first_cycle", a.firstCycle},
+                                                              {"last_cycle", a.lastCycle}}));
+        } catch (...) {
+        }
+    }
 }
 
 void Session::SendFrameReady()
 {
-    throw std::logic_error("Session::SendFrameReady: not implemented");
+    // Present observer: runs inside a run on the main thread and must not throw.
+    try {
+        if (frameSubscriptions_.empty()) return;
+        bool haveFrame = false;
+        json params;
+        for (auto& [id, sub] : frameSubscriptions_) {
+            if (++sub.presentsSeen % sub.everyNFrames != 0) continue;
+            if (!haveFrame) {
+                const FrameView f = emulator_.Frame(false);
+                params = json{{"frame_id", emulator_.PresentedFrames()},
+                              {"emulated_cycles", emulator_.EmulatedCycles()},
+                              {"width", f.width},
+                              {"height", f.height}};
+                haveFrame = true;
+            }
+            sub.connection->Send(MakeNotification("frame_ready", params));
+        }
+    } catch (...) {
+    }
 }
 
-nlohmann::json Session::CreateSession(const nlohmann::json&) { NotImplemented("create_session"); }
-nlohmann::json Session::CloseSession(const nlohmann::json&) { NotImplemented("close_session"); }
-nlohmann::json Session::Pause(const nlohmann::json&) { NotImplemented("pause"); }
-nlohmann::json Session::Resume(const nlohmann::json&) { NotImplemented("resume"); }
-nlohmann::json Session::StepFrames(const nlohmann::json&) { NotImplemented("step_frames"); }
-nlohmann::json Session::GetFrame(const nlohmann::json&) { NotImplemented("get_frame"); }
-nlohmann::json Session::SubscribeFrames(const ConnectionPtr&, const nlohmann::json&) { NotImplemented("subscribe_frames"); }
-nlohmann::json Session::TypeText(const ConnectionPtr&, const nlohmann::json&) { NotImplemented("type_text"); }
-nlohmann::json Session::PressKey(const ConnectionPtr&, const nlohmann::json&) { NotImplemented("press_key"); }
-nlohmann::json Session::SetJoystick(const ConnectionPtr&, const nlohmann::json&) { NotImplemented("set_joystick"); }
+bool Session::PauseRunning()
+{
+    if (state_ != State::Running) return true;
+    const uint64_t before = emulator_.PresentedFrames();
+    bool open = true;
+    while (open && emulator_.PresentedFrames() == before)
+        open = emulator_.RunRealtimeStep();
+    emulator_.StopRealtime();
+    state_ = State::Paused;
+    SendInputApplied();
+    return open;
+}
+
+void Session::Cleanup() noexcept
+{
+    try { emulator_.SetPresentObserver({}); } catch (...) {}
+    if (state_ != State::NoSession) {
+        try { emulator_.Shutdown(); } catch (...) {}   // ejects the disks, so the working copies can be deleted
+        state_ = State::NoSession;
+    }
+    copies_.clear();   // each WorkingCopy deletes its file
+    std::error_code ec;
+    if (!workDir_.empty()) fs::remove_all(workDir_, ec);
+    if (!ini_.empty()) fs::remove(ini_, ec);
+    frameSubscriptions_.clear();
+    inputOwners_.clear();
+}
+
+// ---- Operator methods ----
+
+json Session::CreateSession(const json& params)
+{
+    if (state_ != State::NoSession || exitRequested_) throw RpcError{kInvalidState, "a session already exists"};
+
+    // Options deferred to later milestones (R4) and Part C.
+    if (Field(params, "speed")) throw RpcError{kNotSupported, "speed is not supported yet"};
+    const std::string model = GetString(params, "model", std::string("apple2ee"));
+    if (model != "apple2ee") throw RpcError{kNotSupported, "model " + model + " is not supported"};
+    if (GetBool(params, "allow_text_screen", false))
+        throw RpcError{kNotSupported, "allow_text_screen is not supported"};
+    if (GetBool(params, "shared_memory_frames", false))
+        throw RpcError{kNotSupported, "shared_memory_frames is not supported"};
+    if (Field(params, "hard_disks")) throw RpcError{kNotSupported, "hard disks are not supported"};
+    const std::string runMode = GetString(params, "run_mode", std::string("realtime"));
+    if (runMode != "realtime" && runMode != "stepped") InvalidParams("run_mode must be \"realtime\" or \"stepped\"");
+
+    fs::path images[2];
+    if (const json* disks = Field(params, "disks")) {
+        if (!disks->is_array()) InvalidParams("disks must be an array");
+        for (const json& d : *disks) {
+            if (!d.is_object()) InvalidParams("each disk must be an object");
+            const uint64_t slot = GetUint(d, "slot", 0, 7, std::nullopt);
+            if (slot != 6) InvalidParams("disk slot must be 6");
+            const uint64_t drive = GetUint(d, "drive", 1, 2, std::nullopt);
+            if (!images[drive - 1].empty()) InvalidParams("drive " + std::to_string(drive) + " is given twice");
+            const fs::path p = Utf8Path(GetString(d, "path", std::nullopt));
+            if (!p.is_absolute()) InvalidParams("disk path must be absolute: " + PathUtf8(p));
+            images[drive - 1] = p;
+        }
+        for (const fs::path& p : images) {
+            std::error_code ec;
+            if (!p.empty() && !fs::is_regular_file(p, ec)) throw RpcError{kDiskNotFound, "disk not found: " + PathUtf8(p)};
+        }
+    }
+
+    const std::string pid = std::to_string(GetCurrentProcessId());
+    const fs::path dir = fs::temp_directory_path() / "applewin-harness";
+    fs::create_directories(dir);
+    workDir_ = fs::absolute(dir / pid);
+    ini_ = fs::absolute(dir / (pid + ".ini"));
+
+    // Working copies (D5). Two images with the same file name keep apart: drive 2's then goes in a subdirectory.
+    fs::path copyPaths[2];
+    try {
+        for (int i = 0; i < 2; ++i) {
+            if (images[i].empty()) continue;
+            fs::path where = workDir_;
+            if (i == 1 && !images[0].empty() && images[0].filename() == images[1].filename()) where /= "drive2";
+            copies_.push_back(std::make_unique<WorkingCopy>(images[i], where));
+            copyPaths[i] = copies_.back()->Path();
+        }
+        EmulatorConfig cfg;
+        cfg.configIni = ini_;
+        cfg.display = display_;
+        cfg.disk1 = copyPaths[0];
+        emulator_.Start(cfg);
+        try {
+            if (!copyPaths[1].empty()) emulator_.InsertDisk(1, copyPaths[1]);
+        } catch (...) {
+            emulator_.Shutdown();
+            throw;
+        }
+    } catch (const std::exception& e) {
+        // Name the user's images, not the working copies, and leave nothing behind.
+        std::string what = e.what();
+        for (int i = 0; i < 2; ++i)
+            if (!copyPaths[i].empty()) ReplaceAll(what, copyPaths[i].string(), images[i].string());
+        copies_.clear();   // Start and the drive-2 insert shut the emulator down on failure
+        std::error_code ec;
+        fs::remove_all(workDir_, ec);
+        fs::remove(ini_, ec);
+        throw RpcError{kInternalError, what};
+    }
+
+    realtime_ = runMode == "realtime";
+    state_ = realtime_ ? State::Running : State::Paused;
+    return json{{"session_id", "1"}};   // one session per process (P6)
+}
+
+json Session::CloseSession(const json&)
+{
+    exitRequested_ = true;   // R6: also valid with no session. The reply is sent, then the loop exits (code 0).
+    return json::object();
+}
+
+json Session::Pause(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    if (!PauseRunning()) {
+        exitRequested_ = true;
+        throw RpcError{kInvalidState, "the window was closed"};
+    }
+    return json{{"emulated_cycles", emulator_.EmulatedCycles()}};
+}
+
+json Session::Resume(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    if (!realtime_) throw RpcError{kInvalidState, "resume is only valid in a realtime session"};
+    if (state_ == State::Paused) {
+        emulator_.StopRealtime();   // the next step starts a fresh paced run
+        state_ = State::Running;
+    }
+    return json::object();
+}
+
+json Session::StepFrames(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const uint64_t frames = GetUint(params, "frames", 1, kMaxStepFrames, std::nullopt);
+    bool open = PauseRunning();
+    if (open) open = emulator_.RunFrames(uint32_t(frames), Pacing::Stepped);
+    SendInputApplied();
+    if (!open) {
+        exitRequested_ = true;
+        throw RpcError{kInvalidState, "the window was closed"};
+    }
+    return json{{"emulated_cycles", emulator_.EmulatedCycles()}};
+}
+
+// ---- Agent methods ----
+
+json Session::GetFrame(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const std::string format = GetString(params, "format", std::string("PNG"));
+    if (format != "PNG" && format != "BGRA32") InvalidParams("format must be \"PNG\" or \"BGRA32\"");
+    const bool borders = GetBool(params, "borders", false);
+    const FrameView f = emulator_.Frame(borders);
+    json result{{"frame_id", emulator_.PresentedFrames()},
+                {"emulated_cycles", emulator_.EmulatedCycles()},
+                {"width", f.width},
+                {"height", f.height},
+                {"format", format}};
+    if (format == "PNG") {
+        result["stride"] = f.width * 3;   // the PNG's 8-bit RGB rows
+        result["data"] = Base64Encode(EncodePng(f));
+    } else {
+        const size_t rowBytes = size_t(f.width) * 4;
+        std::vector<uint8_t> pixels(rowBytes * f.height);
+        for (uint32_t y = 0; y < f.height; ++y)
+            std::memcpy(pixels.data() + y * rowBytes, f.topRow + ptrdiff_t(y) * f.strideBytes, rowBytes);
+        result["stride"] = rowBytes;
+        result["data"] = Base64Encode(pixels);
+    }
+    return result;
+}
+
+json Session::SubscribeFrames(const ConnectionPtr& connection, const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const uint64_t n = GetUint(params, "every_n_frames", 0, kMaxEveryNFrames, 1);
+    if (n == 0) {
+        frameSubscriptions_.erase(connection->id());
+    } else {
+        frameSubscriptions_[connection->id()] = FrameSubscription{connection, uint32_t(n), 0};
+    }
+    return json::object();
+}
+
+json Session::TypeText(const ConnectionPtr& connection, const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    std::string text = GetString(params, "text", std::nullopt);
+    for (char& c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u == '\n') c = '\r';   // RETURN
+        else if (u < 0x20 || u > 0x7E) InvalidParams("text may only contain 0x20-0x7E and \\n");
+    }
+    if (text.size() > kMaxTextChars) InvalidParams("text is limited to 4096 characters");
+    const uint64_t delay = GetUint(params, "inter_key_delay_ms", 0, kMaxMs,
+                                   kDefaultInterKeyDelayMs);
+    const uint64_t id = emulator_.QueueText(text, uint32_t(delay));
+    inputOwners_[id] = connection;
+    return InputReply(id, emulator_.ScheduledCycle(id));
+}
+
+json Session::PressKey(const ConnectionPtr& connection, const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const KeySpec key = ParseKey(params);
+    const uint64_t hold = GetUint(params, "hold_ms", 0, kMaxMs, kDefaultHoldMs);
+    const uint64_t id = emulator_.QueueKey(key, uint32_t(hold));
+    inputOwners_[id] = connection;
+    return InputReply(id, emulator_.ScheduledCycle(id));
+}
+
+json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const uint64_t joystick = GetUint(params, "joystick", 0, 1, 0);
+    if (joystick == 1) throw RpcError{kNotSupported, "joystick 1 is not supported"};
+    JoystickChange change;
+    if (Field(params, "x")) change.x = uint8_t(GetUint(params, "x", 0, 255, std::nullopt));
+    if (Field(params, "y")) change.y = uint8_t(GetUint(params, "y", 0, 255, std::nullopt));
+    if (const json* buttons = Field(params, "buttons")) {
+        if (!buttons->is_object()) InvalidParams("buttons must be an object");
+        for (const auto& [name, value] : buttons->items()) {
+            if (name == "2") throw RpcError{kNotSupported, "button 2 is not supported"};
+            if (name != "0" && name != "1") InvalidParams("unknown button: " + name);
+            if (value.is_null()) continue;
+            if (!value.is_boolean()) InvalidParams("button " + name + " must be a boolean");
+            (name == "0" ? change.button0 : change.button1) = value.get<bool>();
+        }
+    }
+    const uint64_t duration = GetUint(params, "duration_ms", 0, kMaxMs, 0);
+    const uint64_t id = emulator_.QueueJoystick(change, uint32_t(duration));
+    inputOwners_[id] = connection;
+    return InputReply(id, emulator_.ScheduledCycle(id));
+}
 
 }  // namespace harness

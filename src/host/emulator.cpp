@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -50,6 +51,7 @@ bool g_started = false;
 bool g_soundActive = false;   // windowed start, DSInit() succeeded: DirectSound is up and must be DSUninit()ed
 std::unique_ptr<Window> g_window;   // windowed mode only
 uint64_t g_cyclesAtPowerOn = 0;   // g_nCumulativeCycles at the last power-on (D10)
+std::function<void()> g_presentObserver;   // SetPresentObserver
 
 HarnessFrame& HostFrame()
 {
@@ -399,6 +401,9 @@ private:
     RealtimeUnmute unmute_{realtime_};   // after realtime_; if the constructor body throws, its destructor re-mutes
 };
 
+// The open-ended realtime run of RunRealtimeStep (null when none is open).
+std::unique_ptr<Stepper> g_realtime;
+
 // AppleWin seeds zero-page $4E/$4F (RNDL/RNDH) from rand() ^ timeGetTime() on every power-on (Memory.cpp
 // getRandomTime, a Pooyan work-around), whatever the power-on memory pattern. The monitor's key-wait loop increments
 // them, so the cycle count of every wait for a key (and so the frame hash) would differ between runs. Pin them, and
@@ -443,10 +448,6 @@ void StartWindowAndSound()
     HarnessFrame& frame = HostFrame();
     g_window = std::make_unique<Window>(L"AppleWin Harness (view only)");
     frame.g_hFrameWindow = g_window->Handle();
-    frame.SetPresentHook([] {
-        g_window->Show(HostFrame().PresentedFrame(false));
-        g_window->Pump();
-    });
     if (DSInit()) {
         g_bDisableDirectSound = false;
         frame.EnableSound(true);
@@ -489,6 +490,15 @@ void Emulator::Start(const EmulatorConfig& config)
     } releaseIfNotStarted;
     if (config.display == DisplayMode::Windowed)
         StartWindowAndSound();
+    // After each present: show the frame in the window (windowed), then the observer (both modes).
+    HostFrame().SetPresentHook([] {
+        if (g_window) {
+            g_window->Show(HostFrame().PresentedFrame(false));
+            g_window->Pump();
+        }
+        if (g_presentObserver)
+            g_presentObserver();
+    });
 
     // 2. Version (AppleWin reads it from its exe's version resource; the harness uses version.h directly).
     SetAppleWinVersion(APPLEWIN_VERSION);
@@ -547,6 +557,7 @@ void Emulator::Shutdown()
 {
     if (!g_started)
         return;
+    g_realtime.reset();
     ClearInput();
     // Ruling R10: Shutdown owns releasing the disk images; otherwise AppleWin keeps the image files open.
     if (GetCardMgr().QuerySlot(SLOT6) == CT_Disk2) {
@@ -564,6 +575,7 @@ void Emulator::PowerCycle()
 {
     RequireStarted();
     // ResetMachineState() already boots the Disk II card (Utilities.cpp); a second Boot() would load a disk image twice.
+    g_realtime.reset();
     ClearInput();   // discards queued input and releases held keys
     ResetMachineState();
     PinPowerOnRandomness();
@@ -575,6 +587,7 @@ void Emulator::PowerCycle()
 bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
 {
     RequireStarted();
+    g_realtime.reset();
     if (frames == 0)
         return true;
     Stepper stepper(pacing);   // Realtime: sound unmuted for this scope
@@ -589,6 +602,7 @@ bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
 bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
 {
     RequireStarted();
+    g_realtime.reset();
     using clock = std::chrono::steady_clock;
     // The pacer catches up short stalls and drops time after long ones, so stop on elapsed wall-clock time (not a tick
     // count) to keep the run length honest.
@@ -599,6 +613,35 @@ bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
             return false;
     }
     return true;
+}
+
+bool Emulator::RunRealtimeStep()
+{
+    RequireStarted();
+    if (!g_realtime)
+        g_realtime = std::make_unique<Stepper>(Pacing::Realtime);   // fresh pacing; sound unmuted until it ends
+    if (g_realtime->Step(UINT64_MAX)) {
+        g_realtime.reset();
+        return false;
+    }
+    return true;
+}
+
+void Emulator::StopRealtime()
+{
+    g_realtime.reset();
+}
+
+bool Emulator::PumpWindow()
+{
+    if (!g_started || !g_window)
+        return true;
+    return g_window->Pump();
+}
+
+void Emulator::SetPresentObserver(std::function<void()> observer)
+{
+    g_presentObserver = std::move(observer);
 }
 
 uint64_t Emulator::EmulatedCycles() const
@@ -615,6 +658,7 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
         if (u != 0x0D && (u < 0x20 || u > 0x7E))
             throw std::invalid_argument("TypeText: only 0x0D and 0x20-0x7E can be typed");
     }
+    g_realtime.reset();
     if (text.empty())
         return true;
     // M2's behaviour on the input queue: queue the text with no delay and run until its last key has been applied. A key

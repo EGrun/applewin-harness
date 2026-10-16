@@ -4,6 +4,7 @@
 #include "core/working_copy.h"
 #include "server/pipe_server.h"
 #include "server/protocol.h"
+#include "server/session.h"
 #include <nlohmann/json.hpp>
 #include <windows.h>
 #include <chrono>
@@ -199,26 +200,23 @@ int Run(const Args& a)
     return rc;
 }
 
-// The JSON-RPC server.
-// TEMPORARY (M3A Task 4): transport only. Every authenticated request gets -32601 and the process serves until it is
-// killed. Task 5 replaces this with the Session (create_session, close_session, the main loop and cleanup).
+// The JSON-RPC server (spec: docs/specs/m3.md, Part A "Launch"): announce, serve until close_session, the window
+// closing (exit 0) or a fatal error (exit 1). The session removes the working copies and the INI on every path.
 int Serve(const Args& a)
 {
     try {
+        const auto display = a.headless ? harness::DisplayMode::Headless : harness::DisplayMode::Windowed;
         const std::wstring pipe = harness::PipeServer::RandomPipeName();
         harness::Tokens tokens{harness::PipeServer::RandomToken(), harness::PipeServer::RandomToken()};
         const std::string agentToken = tokens.agent, operatorToken = tokens.operatorToken;
-        auto isOperatorOnly = [](std::string_view m) {
-            return m == "create_session" || m == "close_session" || m == "pause" || m == "resume" ||
-                   m == "step_frames";
-        };
-        auto onRequest = [](harness::ConnectionPtr c, nlohmann::json request) {
-            c->Send(harness::MakeError(request["id"], harness::kMethodNotFound, "method not found"));
-        };
-        harness::PipeServer server(pipe, std::move(tokens), onRequest, isOperatorOnly,
-                                   a.headless ? harness::DisplayMode::Headless : harness::DisplayMode::Windowed);
+        // The session outlives the server: connection threads post to it until Stop has joined them.
+        harness::Session session(display, harness::Emulator::Instance());
+        harness::PipeServer server(
+            pipe, std::move(tokens),
+            [&session](harness::ConnectionPtr c, nlohmann::json request) { session.Post(std::move(c), std::move(request)); },
+            &harness::Session::IsOperatorOnly, display);
         server.Start();
-        // The announcement (spec: Part A "Launch"): exactly one line, keys in the spec's order (ruling R7).
+        // The announcement: exactly one line, keys in the spec's order (ruling R7).
         nlohmann::ordered_json line;
         std::string pipeUtf8;   // the name is ASCII
         for (wchar_t ch : pipe) pipeUtf8.push_back(static_cast<char>(ch));
@@ -228,9 +226,10 @@ int Serve(const Args& a)
         line["pid"] = GetCurrentProcessId();
         std::cout << line.dump() << "\n";
         std::cout.flush();
-        while (server.FatalError().empty()) Sleep(100);
-        std::cerr << "error: " << server.FatalError() << "\n";
-        return kExitFailure;
+        session.SetFatalErrorSource([&server] { return server.FatalError(); });
+        const int rc = session.RunMainLoop();
+        server.Stop();   // after the last replies (close_session's {}) have been written
+        return rc;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return kExitFailure;

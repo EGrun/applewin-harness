@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -61,6 +62,18 @@ public:
     // only during a Realtime run. Returns false if the window was closed (checked after every step).
     bool RunFrames(uint32_t frames, Pacing pacing = Pacing::Stepped);
     bool RunRealtime(std::chrono::milliseconds wallTime);   // paced bursts; same feedback, unmute and close rules
+    // One open-ended realtime run, a step at a time (the server's Running state): each call runs one paced step of at
+    // most 1 ms. The pacing state (BurstBudget, RealtimePacer) and the sound unmute persist from one call to the next,
+    // so the long-run rate is exact; StopRealtime ends the run (and mutes), and the next call starts a fresh one. Any
+    // other run, PowerCycle and Shutdown also end it. Returns false if the window was closed.
+    bool RunRealtimeStep();
+    void StopRealtime();   // no-op when no realtime run is open
+    // Windowed: dispatches the window's pending messages; false once the window has been closed. Headless, or before
+    // Start: true.
+    bool PumpWindow();
+    // Called on the emulating thread after every presented frame (inside a run), in both display modes; an empty
+    // function removes it. Persists across Start and Shutdown. Must not throw.
+    void SetPresentObserver(std::function<void()> observer);
     // Types bytes 0x0D or 0x20-0x7E with the emulated keyboard (std::invalid_argument before typing anything
     // otherwise). Waits for the strobe to clear before each byte; throws std::runtime_error("TypeText: keyboard not
     // read") after 600 frames of emulated time. Returns right after queueing the last byte; false if the window closed.

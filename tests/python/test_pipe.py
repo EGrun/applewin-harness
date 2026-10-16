@@ -246,14 +246,23 @@ class ExecutionControlTest(PipeTestCase):
         h = self.launch()
         op = h.connect("operator")
         op.call("create_session", run_mode="realtime")
+        agent = h.connect("agent")
         time.sleep(0.3)
         paused = op.call("pause")["emulated_cycles"]
         self.assertGreater(paused, 0)
+        # Observe the emulator through get_frame (not the pause reply) before and after 500 ms of wall-clock time.
+        before = agent.call("get_frame", format="BGRA32")
+        self.assertEqual(before["emulated_cycles"], paused)
         time.sleep(0.5)
-        self.assertEqual(op.call("pause")["emulated_cycles"], paused, "cycles changed while paused")
+        after = agent.call("get_frame", format="BGRA32")
+        self.assertEqual((after["frame_id"], after["emulated_cycles"]), (before["frame_id"], before["emulated_cycles"]),
+                         "the emulator ran while paused")
+        self.assertEqual(op.call("pause")["emulated_cycles"], paused, "pause while paused did not reply at once")
         self.assertEqual(op.call("resume"), {})
         time.sleep(0.5)
-        self.assertGreater(op.call("pause")["emulated_cycles"], paused, "cycles did not advance after resume")
+        resumed = agent.call("get_frame", format="BGRA32")
+        self.assertGreater(resumed["emulated_cycles"], paused, "cycles did not advance after resume")
+        self.assertGreater(resumed["frame_id"], before["frame_id"], "no frames presented after resume")
 
     def test_resume_in_a_stepped_session_gets_32008(self):
         h = self.launch()
@@ -347,6 +356,9 @@ class AgentMethodsTest(PipeTestCase):
     def test_subscribe_frames_every_2_over_10_frames(self):
         h = self.launch()
         op = self.stepped_session(h)
+        # The first present comes about one frame after power-on (AppleWin presents once the beam leaves the vertical
+        # blank), so the first 10 frames hold only 9 presents. One frame first puts the presents in step.
+        op.call("step_frames", frames=1)
         agent = h.connect("agent")
         agent.call("subscribe_frames", every_n_frames=2)
         op.call("step_frames", frames=10)

@@ -55,7 +55,8 @@ public:
     // Creates the first instance (FILE_FLAG_FIRST_PIPE_INSTANCE, a DACL with a single allow ACE for the current
     // user, PIPE_REJECT_REMOTE_CLIENTS) and starts accepting. Throws std::runtime_error on failure.
     void Start();
-    // Cancels all I/O, closes every connection and joins the threads. Safe to call twice (sequentially). Call it from
+    // Waits up to 2 s for every connection's queued messages to be written, then cancels all I/O, closes every
+    // connection and joins the threads. Safe to call twice (sequentially). Call it from
     // the thread that owns the server, never from onRequest.
     void Stop();
     // Empty while healthy. Otherwise the server has stopped accepting and closed every connection (for example a

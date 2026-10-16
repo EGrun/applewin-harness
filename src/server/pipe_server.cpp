@@ -186,6 +186,13 @@ public:
         return true;
     }
 
+    // Any thread: true once every queued message has been written, or the connection has closed.
+    bool Drained()
+    {
+        std::lock_guard lock(queueMutex_);
+        return backlog_ == 0 || closed_.load();
+    }
+
     // Any thread: stops pending and future I/O and drops the queue. The handle stays open until Finish.
     void Cancel()
     {
@@ -694,6 +701,10 @@ void PipeServer::Stop()
         std::lock_guard lock(d.recordsMutex);
         all.swap(d.records);
     }
+    // Let queued replies (close_session's {}) reach their clients first: up to 2 s for every writer to catch up.
+    const ULONGLONG drainDeadline = GetTickCount64() + 2000;
+    for (auto& r : all)
+        while (!r.conn->Drained() && GetTickCount64() < drainDeadline) Sleep(2);
     for (auto& r : all) r.conn->Cancel();
     for (auto& r : all)
         if (r.thread.joinable()) r.thread.join();

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,10 @@ public:
     // are removed before it returns, on every path.
     int RunMainLoop();
 
+    // Polled by RunMainLoop (PipeServer::FatalError): a non-empty result is a fatal error (exit 1). Set before
+    // RunMainLoop.
+    void SetFatalErrorSource(std::function<std::string()> fatalError);
+
     // The operator-only methods (create_session, close_session, pause, resume, step_frames); PipeServer's
     // isOperatorOnly.
     static bool IsOperatorOnly(std::string_view method);
@@ -52,13 +57,16 @@ private:
     struct FrameSubscription {
         ConnectionPtr connection;
         uint32_t everyNFrames = 0;
+        uint64_t presentsSeen = 0;   // presents since the subscription was (re)set
     };
 
     // Main thread.
     bool DrainCommands();                    // false once the process must exit
     void Dispatch(const Command& command);   // replies with the result, an RpcError, or -32603 with what()
     void SendInputApplied();                 // input_applied for every entry of Emulator::TakeAppliedInputs()
-    void SendFrameReady();                   // frame_ready to the subscribers that are due
+    void SendFrameReady();                   // frame_ready to the subscribers that are due (the present observer)
+    bool PauseRunning();                     // Running: run until the next present, then Paused; false if the window closed
+    void Cleanup() noexcept;                 // emulator shut down, working copies, work dir and INI removed
 
     // Operator methods. Each returns the result object or throws RpcError.
     nlohmann::json CreateSession(const nlohmann::json& params);
@@ -84,6 +92,7 @@ private:
     State state_ = State::NoSession;
     bool realtime_ = false;
     bool exitRequested_ = false;
+    std::function<std::string()> fatalError_;
     std::filesystem::path workDir_;   // %TEMP%\applewin-harness\<pid>
     std::filesystem::path ini_;       // %TEMP%\applewin-harness\<pid>.ini
     std::vector<std::unique_ptr<WorkingCopy>> copies_;

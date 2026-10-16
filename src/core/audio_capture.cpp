@@ -55,7 +55,13 @@ void AudioCapture::Commit(int voiceId, std::span<const int16_t> in, int channels
     bool placed = true;
     if (v.hasPrev) {
         if (endCycle <= v.prevEnd) placed = false;
-        else f0 = CycleToFrame(v.prevEnd);
+        else {
+            // A paused voice: a gap well beyond what N samples need is silence, and the commit is placed like a first one.
+            const uint64_t expected = (n * kCyclesPerFrameNum + kCyclesPerFrameDen - 1) / kCyclesPerFrameDen;
+            const uint64_t slack = uint64_t(0.1 * kAudioBaseClockHz);
+            if (endCycle - v.prevEnd > expected + slack) f0 = f1 > n ? f1 - n : 0;
+            else f0 = CycleToFrame(v.prevEnd);
+        }
     } else {
         f0 = f1 > n ? f1 - n : 0;
     }
@@ -97,8 +103,8 @@ void AudioCapture::Commit(int voiceId, std::span<const int16_t> in, int channels
             const int64_t base = tail ? b : a;
             return int(base + (int64_t(b - a) * num2) / int64_t(m));
         };
-        l = interp(0);
-        r = ch == 2 ? interp(1) : l;
+        l = Saturate(interp(0));
+        r = ch == 2 ? Saturate(interp(1)) : l;
         const size_t slot = size_t((f0 + j) % kAudioRingFrames) * 2;
         s.ring[slot] = Saturate(s.ring[slot] + l);
         s.ring[slot + 1] = Saturate(s.ring[slot + 1] + r);

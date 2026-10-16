@@ -25,8 +25,9 @@ inline constexpr uint64_t kCyclesPerFrameDen = 8778;
 // cycles before endCycle (clamped at 0). The N frames are resampled linearly (input frame i sits at timeline position
 // start + i x M / N, M = the number of timeline frames; past the last input frame the final step's slope continues) onto the timeline frames
 // [CycleToFrame(start), CycleToFrame(endCycle)) and added to what is there with saturation to int16. A mono commit
-// (channels == 1) goes to both channels. A commit whose interval is empty (endCycle not after the voice's previous end)
-// adds nothing but still counts as that voice's latest commit. Frames older than the ring are dropped.
+// (channels == 1) goes to both channels. If the interval exceeds N x (CLK_6502_NTSC / 44100) cycles by more than 100 ms,
+// the voice was paused: the gap is silence and the commit is placed like a first commit. A commit whose interval is
+// empty (endCycle not after the voice's previous end) adds nothing but still counts as that voice's latest commit. Frames older than the ring are dropped.
 //
 // Not thread-safe: the emulating thread commits and the session reads, on the same thread (Part A threading).
 class AudioCapture {

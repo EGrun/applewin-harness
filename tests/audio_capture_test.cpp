@@ -289,6 +289,36 @@ TEST_CASE("capture: a single commit longer than the ring keeps its newest 30 s")
     CHECK_THROWS_AS(c.Read(F2C(total - harness::kAudioRingFrames) - 1, F2C(total)), std::out_of_range);
 }
 
+TEST_CASE("capture: a paused voice leaves a silent gap")
+{
+    AudioCapture c;
+    c.Commit(0, Constant(441, 100), 1, F2C(441));
+    // Paused for 2 s (88,200 frames), then 441 frames: they land in the 441 frames before the end, not stretched.
+    const uint64_t end = 441 + 88200 + 441;
+    c.Commit(0, Constant(441, 200), 1, F2C(end));
+    const auto all = c.Read(0, c.NewestCycle());
+    REQUIRE(all.size() == 2 * end);
+    CheckFrames(all, 2, 439, 100, 100);
+    CheckFrames(all, 443, end - 443, 0, 0);
+    CheckFrames(all, end - 439, end - 2, 200, 200);
+}
+
+TEST_CASE("capture: a gap just under the threshold is still stretched")
+{
+    AudioCapture c;
+    c.Commit(0, Constant(441, 100), 1, F2C(441));
+    // 441 frames over 4,000 frames (~90 ms late): under the 100 ms slack, so they fill the whole interval.
+    c.Commit(0, Constant(441, 200), 1, F2C(441 + 4000));
+    const auto all = c.Read(0, c.NewestCycle());
+    REQUIRE(all.size() == 2 * 4441);
+    CheckFrames(all, 443, 4439, 200, 200);
+    // Just over: 441 frames over 4,500 frames (> 441 + 4,410) are silence, then the last 441.
+    c.Commit(0, Constant(441, 300), 1, F2C(4441 + 4900));
+    const auto more = c.Read(0, c.NewestCycle());
+    CheckFrames(more, 4443, 4441 + 4900 - 443, 0, 0);
+    CheckFrames(more, 4441 + 4900 - 439, 4441 + 4900 - 2, 300, 300);
+}
+
 TEST_CASE("capture: Clear empties the timeline and forgets every voice")
 {
     AudioCapture c;

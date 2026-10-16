@@ -4,8 +4,9 @@
 
 namespace harness {
 
-MonitoredSoundBuffer::MonitoredSoundBuffer(std::shared_ptr<SoundBuffer> inner, uint32_t bufferBytes)
-    : inner_(std::move(inner)), bufferBytes_(bufferBytes)
+MonitoredSoundBuffer::MonitoredSoundBuffer(std::shared_ptr<SoundBuffer> inner, uint32_t bufferBytes,
+                                         std::shared_ptr<uint64_t> sharedUnderruns)
+    : inner_(std::move(inner)), bufferBytes_(bufferBytes), sharedUnderruns_(std::move(sharedUnderruns))
 {
     LONG v = 0;
     recordedVolume_ = (inner_ && SUCCEEDED(inner_->GetVolume(&v))) ? v : 0;   // 0 = DSBVOLUME_MAX
@@ -27,8 +28,11 @@ HRESULT MonitoredSoundBuffer::GetCurrentPosition(LPDWORD lpdwCurrentPlayCursor, 
         // Mirrors SoundCore_ValidateAndAlignWriteOffset's unsafe zone (strict comparisons).
         const DWORD off = committedEnd_;
         const bool unsafe = (write > play) ? (off > play && off < write) : (off > play || off < write);
-        if (unsafe)
+        if (unsafe) {
             ++underruns_;
+            if (sharedUnderruns_)
+                ++*sharedUnderruns_;
+        }
         tracking_ = false;
     }
     return hr;

@@ -34,6 +34,8 @@ public:
     // DXSoundBuffer::create(...), or nullptr if that returns nullptr.
     void EnableSound(bool enabled);
     void SetSoundMuted(bool muted);        // every buffer created so far, and buffers created later
+    // Test seam: replaces DXSoundBuffer::create as the source of inner buffers (empty = the default).
+    void SetInnerSoundBufferFactory(std::function<std::shared_ptr<SoundBuffer>(uint32_t, uint32_t, int)> factory);
     uint64_t SoundUnderruns() const;       // sum over all buffers
     size_t SoundBuffersCreated() const;    // non-null buffers returned
 
@@ -75,7 +77,10 @@ private:
     std::function<void()> presentHook_;
     bool soundEnabled_ = false;
     bool soundMuted_ = false;
-    std::vector<std::shared_ptr<MonitoredSoundBuffer>> soundBuffers_;
+    std::vector<std::weak_ptr<MonitoredSoundBuffer>> soundBuffers_;   // weak: AppleWin owns the buffers
+    std::shared_ptr<uint64_t> underrunTotal_ = std::make_shared<uint64_t>(0);   // includes dead buffers
+    size_t buffersCreated_ = 0;
+    std::function<std::shared_ptr<SoundBuffer>(uint32_t, uint32_t, int)> innerFactory_;
 };
 
 }  // namespace harness

@@ -18,7 +18,9 @@ namespace harness {
 //   for the next partial commit.
 class MonitoredSoundBuffer final : public SoundBuffer {
 public:
-    MonitoredSoundBuffer(std::shared_ptr<SoundBuffer> inner, uint32_t bufferBytes);
+    // sharedUnderruns (optional) is incremented alongside the per-buffer count, so a total can outlive the buffer.
+    MonitoredSoundBuffer(std::shared_ptr<SoundBuffer> inner, uint32_t bufferBytes,
+                         std::shared_ptr<uint64_t> sharedUnderruns = nullptr);
     ~MonitoredSoundBuffer() override = default;
 
     HRESULT SetCurrentPosition(DWORD dwNewPosition) override;
@@ -49,6 +51,7 @@ private:
     DWORD lockOffset_ = 0;
     DWORD committedEnd_ = 0;
     uint64_t underruns_ = 0;
+    std::shared_ptr<uint64_t> sharedUnderruns_;
 };
 
 }  // namespace harness

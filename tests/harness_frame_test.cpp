@@ -136,3 +136,36 @@ TEST_CASE("frame: with sound disabled CreateSoundBuffer returns null and no buff
     CHECK(f.SoundBuffersCreated() == 0);
     CHECK(f.SoundUnderruns() == 0);
 }
+
+#include "support/fake_sound_buffer.h"
+
+TEST_CASE("frame: sound buffers are not kept alive, and their underruns are still counted")
+{
+    HarnessFrame f;
+    f.EnableSound(true);
+    std::weak_ptr<harness::testsupport::FakeSoundBuffer> innerWatch;
+    std::shared_ptr<harness::testsupport::FakeSoundBuffer> fake;
+    f.SetInnerSoundBufferFactory([&](uint32_t bytes, uint32_t, int) {
+        fake = std::make_shared<harness::testsupport::FakeSoundBuffer>(bytes);
+        innerWatch = fake;
+        return fake;
+    });
+    auto buf = f.CreateSoundBuffer(4096, 44100, 1, "x");
+    REQUIRE(buf);
+    fake->playCursor = 100;
+    fake->writeCursor = 200;
+    LPVOID p1 = nullptr, p2 = nullptr;
+    DWORD n1 = 0, n2 = 0;
+    REQUIRE(buf->Lock(0, 150, &p1, &n1, &p2, &n2, 0) == S_OK);
+    REQUIRE(buf->Unlock(p1, n1, p2, n2) == S_OK);
+    DWORD play = 0, write = 0;
+    buf->GetCurrentPosition(&play, &write);
+    CHECK(f.SoundUnderruns() == 1);
+
+    fake.reset();
+    CHECK(!innerWatch.expired());   // still held by the monitor
+    buf.reset();
+    CHECK(innerWatch.expired());    // the frame did not keep the buffer alive
+    CHECK(f.SoundUnderruns() == 1);
+    CHECK(f.SoundBuffersCreated() == 1);
+}

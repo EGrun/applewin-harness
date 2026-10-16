@@ -10,7 +10,7 @@ Short records of design decisions. Each one has a status: **Accepted**, **Propos
 C++20, Visual Studio 2022 (v143 toolset), x64 only. This matches the AppleWin codebase, which the harness links against (see D2).
 
 ## D2 — Integration: the harness hosts the AppleWin core
-**Status:** Proposed — confirmed or rejected by the M1 spike
+**Status:** Accepted
 
 The harness is its own executable and links AppleWin's emulation core in-process. It replaces the Win32 window by implementing AppleWin's `FrameBase` interface with a headless frontend. The harness owns the main loop.
 
@@ -32,6 +32,8 @@ AppleWin already provides the seams this needs:
 - Does the core link cleanly without `Win32Frame`, DirectInput and the registry (`-noreg`)?
 - Does it run correctly with no sound buffers at all (headless mode)? AppleWin already handles this case, because it runs when the PC has no audio device.
 - How many AppleWin source patches are needed? Keep them as a small, documented patch set.
+
+**Spike outcome (M1):** the spike confirmed D2. The AppleWin core links unchanged into the harness and the AppleWin patch list is empty (no file under `external/AppleWin` is modified). `Win32Frame.cpp` is still compiled into the core library but is never instantiated. Known limitation: AppleWin's debugger assumes the frontend is a `Win32Frame` (`DebugInitialize` calls `Win32Frame::GetWin32Frame` and throws `std::bad_cast` on `HeadlessFrame`), so it is skipped. A later debugger feature needs either an AppleWin patch or a frontend derived from `Win32Frame`.
 
 **Rejected alternatives:**
 - *Plugin inside AppleWin.exe:* works, but adds cross-thread pause/step complexity for no benefit over D2.

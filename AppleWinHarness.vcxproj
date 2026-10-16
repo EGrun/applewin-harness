@@ -37,6 +37,7 @@
 	<ClCompile>
 	  <LanguageStandard>stdcpp20</LanguageStandard>
 	  <WarningLevel>Level4</WarningLevel>
+	  <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)external\AppleWin\source;$(MSBuildThisFileDirectory)external\AppleWin\source\cpu;$(MSBuildThisFileDirectory)external\AppleWin\source\debugger;$(MSBuildThisFileDirectory)external\AppleWin\zlib;$(MSBuildThisFileDirectory)external\AppleWin\libyaml\include;$(MSBuildThisFileDirectory)external\AppleWinesource;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
 	  <SDLCheck>true</SDLCheck>
 	  <ConformanceMode>true</ConformanceMode>
 	</ClCompile>

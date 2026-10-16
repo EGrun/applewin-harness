@@ -35,6 +35,11 @@ msbuild AppleWinHarness.sln -p:Configuration=Debug -p:Platform=x64
 The executable is written to `bin\x64\<Configuration>\AppleWinHarness.exe`.
 
 ## Run
+```
+AppleWinHarness.exe --boot-frames <n> [--png <path>]
+```
+Boots an Apple //e Enhanced headless (no window, no sound), runs `n` frames as fast as possible, optionally saves the 560x384 screen to `<path>` as a PNG, and prints `sha256 <hash>` of the frame. Exit codes: 0 success, 2 bad arguments (usage on stderr), 1 any other failure (error on stderr).
+
 Display modes become available in M2:
 
 ```

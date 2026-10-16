@@ -74,6 +74,8 @@ Link the AppleWin core into the harness. Implement a minimal headless `FrameBase
 
 **Acceptance:** the harness boots an Apple //e with no window and saves a PNG showing the boot screen. The spike also produces a list of the AppleWin patches it needed, which feeds the D2 decision.
 
+**Patch list:** empty. The core links unchanged and no file under `external/AppleWin` is modified.
+
 **Exit criteria:**
 - If the core can't be separated from Win32 with a small patch set, revisit D2 (fallback: plugin inside AppleWin.exe).
 - Resolve D6 (licensing) before publishing.

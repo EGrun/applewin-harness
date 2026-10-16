@@ -60,7 +60,9 @@ void RealtimePacer::WaitForTick()
         WaitForSingleObject(static_cast<HANDLE>(timer_), INFINITE);
     }
     nextTick_ += freq / 1000;
-    // If we fell badly behind, resync rather than burst-firing to catch up.
+    // Stalls of 50 ms or less are made up: WaitForTick returns immediately on each call until the
+    // deadline (advancing 1 ms per call) catches up. A longer stall resyncs the deadline to now + 1 ms and
+    // drops the missed wall-clock time (as AppleWin does, it does not catch up after a long stall).
     const long long t = Qpc();
     if (t - nextTick_ > freq / 20) nextTick_ = t + freq / 1000;
 }

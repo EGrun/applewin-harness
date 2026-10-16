@@ -111,11 +111,12 @@ public:
     const std::vector<std::string>& Messages() const;  // FrameMessageBox calls so far
 
     // The agent-audio timeline (D14): every sound voice, mixed, by emulated cycle since power-on; cleared by Start and
-    // PowerCycle. M3B Task 2 wires it (until then it is an empty stub capture).
+    // PowerCycle. Fed by the VirtualSoundBuffers AppleWin creates, in every mode.
     const AudioCapture& Audio() const;
 
+    // Windowed playback (AudioOutput, M3B Task 5). Until Task 5: 0 and false (windowed mode is silent, ruling B1).
     uint64_t SoundUnderruns() const;
-    bool SoundActive() const;            // true when windowed and DSInit() succeeded
+    bool SoundActive() const;
 private:
     Emulator() = default;
 };

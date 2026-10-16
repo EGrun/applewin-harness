@@ -14,6 +14,8 @@
 #pragma warning(push, 3)
 #include "Interface.h"
 #include "Keyboard.h"
+#include "SoundBuffer.h"
+#include "SoundCore.h"
 #pragma warning(pop)
 
 using namespace harness;
@@ -153,12 +155,17 @@ TEST_CASE("emulator: InsertDisk of a missing image throws runtime_error")
     CHECK_THROWS_AS(e.InsertDisk(0, missing), std::runtime_error);
 }
 
-TEST_CASE("emulator: headless start is silent")
+// Ruling B4 (M3B): AppleWin's voices are now VirtualSoundBuffers in every mode, so "silent" means no device: dsound.dll
+// is never loaded headless and the harness's DSInit() opened none.
+TEST_CASE("emulator: headless start opens no audio device")
 {
     auto& e = StartedEmulator();
+    e.RunFrames(2);
     CHECK(GetModuleHandleW(L"dsound.dll") == nullptr);
+    CHECK(DSAvailable());                                       // the harness's DSInit() succeeded
+    CHECK(GetAudioDeviceName() == "harness");   // set by the harness DSInit(), not a DirectSound device
     CHECK(e.SoundActive() == false);
-    CHECK(static_cast<HarnessFrame&>(GetFrame()).SoundBuffersCreated() == 0);
+    CHECK(static_cast<HarnessFrame&>(GetFrame()).SoundBuffersCreated() > 0);   // the speaker's virtual buffer
     CHECK(e.SoundUnderruns() == 0);
 }
 

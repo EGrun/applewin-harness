@@ -67,11 +67,16 @@ private:
     int voiceId_;
     AudioCapture* capture_;
     CycleClock clock_;
+    std::vector<uint8_t> ring_;
+    uint32_t commitEnd_ = 0;   // byte offset in the ring of the end of the last (partial) commit
+    LONG volume_ = DSBVOLUME_MAX;
+    DWORD status_ = 0;
+    std::vector<int16_t> scratch_;   // the samples of one commit, in order
 };
 
 }  // namespace harness
 
-// The replacement for AppleWin's Windows/DXSoundBuffer.cpp translation unit (D14) is in virtual_sound.cpp behind
-// HARNESS_VIRTUAL_SOUND (0 until M3B Task 2 removes DXSoundBuffer.cpp from AppleWinCore): DSInit() (succeeds, opens no
-// device), DSUninit(), DSAvailable(), GetDefaultAudioDeviceName() ("harness") and DXSoundBuffer::create (returns null).
-// They are declared by AppleWin's Windows/DXSoundBuffer.h and SoundBuffer.h.
+// virtual_sound.cpp is also the replacement for AppleWin's Windows/DXSoundBuffer.cpp translation unit (D14), which
+// build/AppleWinCore.vcxproj no longer compiles: DSInit() (succeeds, opens no device, never touches DirectSound),
+// DSUninit(), DSAvailable(), GetDefaultAudioDeviceName() ("harness") and DXSoundBuffer::create (returns null). They are
+// declared by AppleWin's Windows/DXSoundBuffer.h and SoundBuffer.h.

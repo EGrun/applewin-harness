@@ -8,8 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "Windows/DXSoundBuffer.h"
-#include "host/monitored_sound_buffer.h"
+#include "host/virtual_sound.h"
 
 namespace harness {
 
@@ -88,20 +87,8 @@ std::shared_ptr<NetworkBackend> HarnessFrame::CreateNetworkBackend(const std::st
 
 std::shared_ptr<SoundBuffer> HarnessFrame::CreateSoundBuffer(uint32_t dwBufferSize, uint32_t nSampleRate, int nChannels, const char*)
 {
-    if (!soundEnabled_)
-        return nullptr;
-    std::shared_ptr<SoundBuffer> inner =
-        innerFactory_ ? innerFactory_(dwBufferSize, nSampleRate, nChannels)
-                      : DXSoundBuffer::create(dwBufferSize, nSampleRate, nChannels);
-    if (!inner)
-        return nullptr;
-    auto monitored = std::make_shared<MonitoredSoundBuffer>(std::move(inner), dwBufferSize, underrunTotal_);
-    if (soundMuted_)
-        monitored->SetMuted(true);
-    std::erase_if(soundBuffers_, [](const auto& w) { return w.expired(); });
-    soundBuffers_.push_back(monitored);
-    ++buffersCreated_;
-    return monitored;
+    const int voiceId = int(buffersCreated_++);
+    return std::make_shared<VirtualSoundBuffer>(dwBufferSize, nSampleRate, nChannels, voiceId, capture_, captureClock_);
 }
 
 // Same logic as Win32Frame::GetResource (external/AppleWin/source/Windows/Win32Frame.cpp).
@@ -127,24 +114,10 @@ void HarnessFrame::Restart()
     restartRequested_ = true;
 }
 
-void HarnessFrame::EnableSound(bool enabled) { soundEnabled_ = enabled; }
-
-void HarnessFrame::SetSoundMuted(bool muted)
+void HarnessFrame::SetAudioCapture(AudioCapture* capture, std::function<uint64_t()> clock)
 {
-    soundMuted_ = muted;
-    std::erase_if(soundBuffers_, [](const auto& w) { return w.expired(); });
-    for (auto& w : soundBuffers_)
-        if (auto b = w.lock())
-            b->SetMuted(muted);
+    capture_ = capture;
+    captureClock_ = std::move(clock);
 }
-
-void HarnessFrame::SetInnerSoundBufferFactory(std::function<std::shared_ptr<SoundBuffer>(uint32_t, uint32_t, int)> f)
-{
-    innerFactory_ = std::move(f);
-}
-
-uint64_t HarnessFrame::SoundUnderruns() const { return *underrunTotal_; }
-
-size_t HarnessFrame::SoundBuffersCreated() const { return buffersCreated_; }
 
 }  // namespace harness

@@ -35,7 +35,6 @@
     <ClCompile Include="..\src\host\harness_frame.cpp" />
     <ClCompile Include="..\src\host\applewin_host.cpp" />
     <ClCompile Include="..\src\core\working_copy.cpp" />
-    <ClCompile Include="..\src\host\monitored_sound_buffer.cpp" />
     <ClCompile Include="..\src\host\window.cpp" />
     <ClCompile Include="..\src\server\pipe_server.cpp" />
     <ClCompile Include="..\src\server\protocol.cpp" />
@@ -56,7 +55,6 @@
     <ClInclude Include="..\src\host\emulator.h" />
     <ClInclude Include="..\src\host\harness_frame.h" />
     <ClInclude Include="..\src\core\working_copy.h" />
-    <ClInclude Include="..\src\host\monitored_sound_buffer.h" />
     <ClInclude Include="..\src\host\window.h" />
     <ClInclude Include="..\src\server\pipe_server.h" />
     <ClInclude Include="..\src\server\protocol.h" />

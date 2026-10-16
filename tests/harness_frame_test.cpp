@@ -1,6 +1,7 @@
 // HarnessFrame unit tests.
 #include "doctest/doctest.h"
 #include "host/harness_frame.h"
+#include "host/virtual_sound.h"
 #include "support/emulator_fixture.h"
 #include "resource.h"
 
@@ -38,12 +39,6 @@ TEST_CASE("frame: FrameMessageBox records and returns IDOK")
     CHECK(f.FrameMessageBox("t", "c", MB_OK) == IDOK);
     REQUIRE(!f.messages().empty());
     CHECK(f.messages().back() == "c: t");
-}
-
-TEST_CASE("frame: CreateSoundBuffer returns null")
-{
-    HarnessFrame f;
-    CHECK(!f.CreateSoundBuffer(4096, 44100, 1, "x"));   // bool: SoundBuffer is incomplete, doctest cannot stringify it
 }
 
 // ---- M2: presented frame, present hook, sound (spec: docs/specs/m2.md, "src/host/harness_frame.h") ----
@@ -129,45 +124,26 @@ TEST_CASE("frame: the present hook is called once per present")
     CHECK(calls == 3);
 }
 
-TEST_CASE("frame: with sound disabled CreateSoundBuffer returns null and no buffer is counted")
-{
-    HarnessFrame f;   // sound is off by default
-    CHECK(!f.CreateSoundBuffer(4096, 44100, 1, "x"));
-    CHECK(f.SoundBuffersCreated() == 0);
-    CHECK(f.SoundUnderruns() == 0);
-}
-
-#include "support/fake_sound_buffer.h"
-
-TEST_CASE("frame: sound buffers are not kept alive, and their underruns are still counted")
+TEST_CASE("frame: CreateSoundBuffer returns VirtualSoundBuffers with a per-frame voice counter (D14)")
 {
     HarnessFrame f;
-    f.EnableSound(true);
-    std::weak_ptr<harness::testsupport::FakeSoundBuffer> innerWatch;
-    std::shared_ptr<harness::testsupport::FakeSoundBuffer> fake;
-    f.SetInnerSoundBufferFactory([&](uint32_t bytes, uint32_t, int) {
-        fake = std::make_shared<harness::testsupport::FakeSoundBuffer>(bytes);
-        innerWatch = fake;
-        return fake;
-    });
-    auto buf = f.CreateSoundBuffer(4096, 44100, 1, "x");
-    REQUIRE(buf);
-    DWORD play = 0, write = 0;
-    buf->GetCurrentPosition(&play, &write);   // play cursor 0, then 100: playback has begun (counting armed, R11)
-    fake->playCursor = 100;
-    fake->writeCursor = 200;
-    buf->GetCurrentPosition(&play, &write);
-    LPVOID p1 = nullptr, p2 = nullptr;
-    DWORD n1 = 0, n2 = 0;
-    REQUIRE(buf->Lock(0, 150, &p1, &n1, &p2, &n2, 0) == S_OK);
-    REQUIRE(buf->Unlock(p1, n1, p2, n2) == S_OK);
-    buf->GetCurrentPosition(&play, &write);
-    CHECK(f.SoundUnderruns() == 1);
+    auto a = f.CreateSoundBuffer(4096, 44100, 1, "x");
+    auto b = f.CreateSoundBuffer(8192, 22050, 2, "y");
+    auto* va = dynamic_cast<harness::VirtualSoundBuffer*>(a.get());
+    auto* vb = dynamic_cast<harness::VirtualSoundBuffer*>(b.get());
+    REQUIRE(va);
+    REQUIRE(vb);
+    CHECK(va->VoiceId() == 0);
+    CHECK(vb->VoiceId() == 1);
+    CHECK(vb->Bytes() == 8192);
+    CHECK(vb->Rate() == 22050);
+    CHECK(vb->Channels() == 2);
+    CHECK(f.SoundBuffersCreated() == 2);
 
-    fake.reset();
-    CHECK(!innerWatch.expired());   // still held by the monitor
-    buf.reset();
-    CHECK(innerWatch.expired());    // the frame did not keep the buffer alive
-    CHECK(f.SoundUnderruns() == 1);
-    CHECK(f.SoundBuffersCreated() == 1);
+    std::weak_ptr<SoundBuffer> watch = a;
+    a.reset();
+    CHECK(watch.expired());   // the frame does not keep buffers alive (AppleWin owns them)
+    HarnessFrame g;
+    auto c = g.CreateSoundBuffer(4096, 44100, 1, "z");
+    CHECK(dynamic_cast<harness::VirtualSoundBuffer&>(*c).VoiceId() == 0);   // per frame
 }

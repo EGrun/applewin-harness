@@ -11,7 +11,7 @@
 
 namespace harness {
 
-class MonitoredSoundBuffer;
+class AudioCapture;
 
 // AppleWin's FrameBase for both display modes (D8). Owns no window and never shows a message box.
 class HarnessFrame final : public FrameBase {
@@ -30,14 +30,11 @@ public:
     FrameView PresentedFrame(bool borders) const;
     void SetPresentHook(std::function<void()> hook);   // called after each snapshot; an empty hook does nothing
 
-    // Sound. Off (the default): CreateSoundBuffer returns nullptr. On: it returns a MonitoredSoundBuffer wrapping
-    // DXSoundBuffer::create(...), or nullptr if that returns nullptr.
-    void EnableSound(bool enabled);
-    void SetSoundMuted(bool muted);        // every buffer created so far, and buffers created later
-    // Test seam: replaces DXSoundBuffer::create as the source of inner buffers (empty = the default).
-    void SetInnerSoundBufferFactory(std::function<std::shared_ptr<SoundBuffer>(uint32_t, uint32_t, int)> factory);
-    uint64_t SoundUnderruns() const;       // sum over all buffers
-    size_t SoundBuffersCreated() const;    // non-null buffers returned
+    // Sound (D14): CreateSoundBuffer returns a VirtualSoundBuffer in every mode, with voice id 0, 1, 2, ... (a counter per
+    // frame). Its commits go to the capture set here (null: nothing is captured) at the clock's cycle (empty: AppleWin's
+    // g_nCumulativeCycles). Applies to buffers created after the call.
+    void SetAudioCapture(AudioCapture* capture, std::function<uint64_t()> clock = {});
+    size_t SoundBuffersCreated() const { return buffersCreated_; }
 
     void Initialize(bool resetVideoState) override;
     void Destroy() override;
@@ -75,12 +72,9 @@ private:
     bool restartRequested_ = false;
     std::vector<uint8_t> snapshot_;
     std::function<void()> presentHook_;
-    bool soundEnabled_ = false;
-    bool soundMuted_ = false;
-    std::vector<std::weak_ptr<MonitoredSoundBuffer>> soundBuffers_;   // weak: AppleWin owns the buffers
-    std::shared_ptr<uint64_t> underrunTotal_ = std::make_shared<uint64_t>(0);   // includes dead buffers
-    size_t buffersCreated_ = 0;
-    std::function<std::shared_ptr<SoundBuffer>(uint32_t, uint32_t, int)> innerFactory_;
+    AudioCapture* capture_ = nullptr;
+    std::function<uint64_t()> captureClock_;
+    size_t buffersCreated_ = 0;   // also the next voice id
 };
 
 }  // namespace harness

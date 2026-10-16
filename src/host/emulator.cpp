@@ -49,7 +49,7 @@ namespace harness {
 namespace {
 
 bool g_started = false;
-bool g_soundActive = false;   // windowed start, DSInit() succeeded: DirectSound is up and must be DSUninit()ed
+bool g_dsInitialized = false;   // DSInit() (D14: the harness's own, opens no device) succeeded; DSUninit() pending
 std::unique_ptr<Window> g_window;   // windowed mode only
 uint64_t g_cyclesAtPowerOn = 0;   // g_nCumulativeCycles at the last power-on (D10)
 std::function<void()> g_presentObserver;   // SetPresentObserver
@@ -57,6 +57,20 @@ std::function<void()> g_presentObserver;   // SetPresentObserver
 HarnessFrame& HostFrame()
 {
     return static_cast<HarnessFrame&>(GetFrame());
+}
+
+// The agent-audio timeline (D14), fed by every VirtualSoundBuffer. Never destroyed: AppleWin owns the buffers, and a
+// buffer's destructor (ResetVoice) may run late.
+AudioCapture& Capture()
+{
+    static AudioCapture* const capture = new AudioCapture();
+    return *capture;
+}
+
+// The capture's clock: EmulatedCycles(), clamped at 0 (D10: cycles since the last power-on).
+uint64_t CaptureClock()
+{
+    return g_nCumulativeCycles >= g_cyclesAtPowerOn ? g_nCumulativeCycles - g_cyclesAtPowerOn : 0;
 }
 
 void RequireStarted()
@@ -329,9 +343,10 @@ void ProcessDueInput()
 
 
 // The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
-// holds the sound rule and the window-closed rule for all three.
+// holds the window-closed rule for all three.
 // Stepped: period-sized steps, no pacing. Realtime (D9): a BurstBudget burst corrected by the speaker's cycle
-// feedback, then wait for the 1 ms tick.
+// feedback, then wait for the 1 ms tick. With virtual sound buffers (D14) that feedback is always 0; M3B Task 5
+// replaces it with AudioOutput's feedback.
 class Stepper {
 public:
     explicit Stepper(Pacing pacing)
@@ -374,32 +389,10 @@ private:
         return g_window->Closed();
     }
 
-    // Sound rule (D8): playback is unmuted only for the lifetime of a Realtime run, and muted again when the run
-    // returns or throws.
-    class RealtimeUnmute {
-    public:
-        explicit RealtimeUnmute(bool realtime) : active_(realtime && g_soundActive)
-        {
-            if (active_)
-                HostFrame().SetSoundMuted(false);
-        }
-        ~RealtimeUnmute()
-        {
-            if (active_)
-                HostFrame().SetSoundMuted(true);
-        }
-        RealtimeUnmute(const RealtimeUnmute&) = delete;
-        RealtimeUnmute& operator=(const RealtimeUnmute&) = delete;
-
-    private:
-        bool active_;
-    };
-
     bool realtime_;
     uint32_t period_;
     std::optional<BurstBudget> budget_;
     std::optional<RealtimePacer> pacer_;
-    RealtimeUnmute unmute_{realtime_};   // after realtime_; if the constructor body throws, its destructor re-mutes
 };
 
 // The open-ended realtime run of RunRealtimeStep (null when none is open).
@@ -417,9 +410,9 @@ void PinPowerOnRandomness()
     rnd[1] = 0x20;
 }
 
-// Releases every sound voice, DirectSound and the window: the windowed part of Shutdown (also used when a windowed Start
-// fails). DSUninit() asserts that no voice is left, so the speaker, every Mockingboard card's SSI263 voices and the
-// Mockingboard manager's voice are released first. Harmless in headless mode, and when called again.
+// Releases every sound voice, the (virtual) sound system and the window: part of Shutdown (also used when Start fails).
+// DSUninit() asserts that no voice is left, so the speaker, every Mockingboard card's SSI263 voices and the
+// Mockingboard manager's voice are released first. Harmless when called again.
 void ReleaseSoundAndWindow()
 {
     SpkrDestroy();   // speaker voice and buffers (AppleWin calls it from WM_DESTROY); pairs with SpkrInitialize()
@@ -431,33 +424,23 @@ void ReleaseSoundAndWindow()
             GetCardMgr().GetRef(slot).Destroy();
     }
     mbMgr.Destroy();
-    if (g_soundActive) {
+    if (g_dsInitialized) {
         DSUninit();
-        g_soundActive = false;
+        g_dsInitialized = false;
     }
     HarnessFrame& frame = HostFrame();
     frame.SetPresentHook({});
-    frame.EnableSound(false);
-    frame.SetSoundMuted(false);
+    frame.SetAudioCapture(nullptr);
     g_window.reset();
     frame.g_hFrameWindow = nullptr;
 }
 
-// Windowed start, before the M1 startup (spec): window, g_hFrameWindow, DSInit(), then the sound decision.
-void StartWindowAndSound()
+// Windowed start, before the M1 startup (spec): the window and g_hFrameWindow. No DirectSound (D14): playback is
+// AudioOutput's (M3B Task 5).
+void StartWindow()
 {
-    HarnessFrame& frame = HostFrame();
     g_window = std::make_unique<Window>(L"AppleWin Harness (view only)");
-    frame.g_hFrameWindow = g_window->Handle();
-    if (DSInit()) {
-        g_bDisableDirectSound = false;
-        frame.EnableSound(true);
-        frame.SetSoundMuted(true);   // unmuted only during Realtime runs (D8)
-        g_soundActive = true;
-    } else {
-        std::cerr << "warning: no audio device; running without sound" << std::endl;
-        g_bDisableDirectSound = true;
-    }
+    HostFrame().g_hFrameWindow = g_window->Handle();
 }
 
 }  // namespace
@@ -481,16 +464,19 @@ void Emulator::Start(const EmulatorConfig& config)
     g_sProgramDir = exeDir;
     g_sConfigFile = config.configIni.string();
     g_nMemoryClearType = MIP_ZERO;
-    // Sound. Headless: none (as AppleWin's -no-dsound switch); speaker and Mockingboard skip DirectSound and never show
-    // the "unable to initialize a waveform output device" message box. Windowed: DirectSound if DSInit() succeeds.
-    g_bDisableDirectSound = true;
     // Any exception out of Start leaves the emulator stopped (failures after g_started go through Shutdown()); this
-    // also releases a window and DirectSound set up before the failure.
+    // also releases a window and the sound system set up before the failure.
     struct ReleaseIfNotStarted {
         ~ReleaseIfNotStarted() { if (!g_started) ReleaseSoundAndWindow(); }
     } releaseIfNotStarted;
     if (config.display == DisplayMode::Windowed)
-        StartWindowAndSound();
+        StartWindow();
+    // Sound (D14), every mode: the harness's DSInit() opens no device, and every buffer AppleWin creates is a
+    // VirtualSoundBuffer feeding the capture. So the speaker and Mockingboard always run their sound paths.
+    g_bDisableDirectSound = false;
+    g_dsInitialized = DSInit();
+    Capture().Clear();
+    HostFrame().SetAudioCapture(&Capture(), CaptureClock);
     // After each present: show the frame in the window (windowed), then the observer (both modes).
     HostFrame().SetPresentHook([] {
         if (g_window) {
@@ -523,7 +509,7 @@ void Emulator::Start(const EmulatorConfig& config)
     ResetJoystick();
     VideoSwitchVideocardPalette(RGB_GetVideocard(), GetVideo().GetVideoType());
     GetFrame().Initialize(true);
-    // AppleWin calls SpkrInitialize() from WM_CREATE, after DSInit() (here: after the sound decision above). Without it
+    // AppleWin calls SpkrInitialize() from WM_CREATE, after DSInit() (here: after DSInit() above). Without it
     // the speaker sample buffer is null and the first SpkrUpdate() crashes.
     SpkrInitialize();
     // DebugInitialize() is deliberately NOT called (the spec lists it as skipped): its first statement,
@@ -552,6 +538,7 @@ void Emulator::Start(const EmulatorConfig& config)
     }
     Boot();
     g_cyclesAtPowerOn = g_nCumulativeCycles;
+    Capture().Clear();   // the timeline starts at this power-on
 }
 
 void Emulator::Shutdown()
@@ -567,7 +554,7 @@ void Emulator::Shutdown()
         card.EjectDisk(DRIVE_2);
     }
     GetFrame().Destroy();
-    ReleaseSoundAndWindow();   // every sound voice, then DSUninit() (windowed), then the window
+    ReleaseSoundAndWindow();   // every sound voice, then DSUninit(), then the window
     LogDone();
     g_started = false;
 }
@@ -582,6 +569,7 @@ void Emulator::PowerCycle()
     PinPowerOnRandomness();
     g_nAppMode = MODE_RUNNING;
     g_cyclesAtPowerOn = g_nCumulativeCycles;
+    Capture().Clear();   // the timeline restarts at cycle 0 (D14)
     ResetJoystick();
 }
 
@@ -591,7 +579,7 @@ bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
     g_realtime.reset();
     if (frames == 0)
         return true;
-    Stepper stepper(pacing);   // Realtime: sound unmuted for this scope
+    Stepper stepper(pacing);
     const uint64_t target = g_nCumulativeCycles + uint64_t(frames) * NTSC_GetCyclesPerFrame();
     while (g_nCumulativeCycles < target) {
         if (stepper.Step(target - g_nCumulativeCycles))
@@ -607,7 +595,7 @@ bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
     using clock = std::chrono::steady_clock;
     // The pacer catches up short stalls and drops time after long ones, so stop on elapsed wall-clock time (not a tick
     // count) to keep the run length honest.
-    Stepper stepper(Pacing::Realtime);   // sound unmuted for this scope
+    Stepper stepper(Pacing::Realtime);
     const auto start = clock::now();
     while (clock::now() - start < wallTime) {
         if (stepper.Step(UINT64_MAX))
@@ -620,7 +608,7 @@ bool Emulator::RunRealtimeStep()
 {
     RequireStarted();
     if (!g_realtime)
-        g_realtime = std::make_unique<Stepper>(Pacing::Realtime);   // fresh pacing; sound unmuted until it ends
+        g_realtime = std::make_unique<Stepper>(Pacing::Realtime);   // fresh pacing
     if (g_realtime->Step(UINT64_MAX)) {
         g_realtime.reset();
         return false;
@@ -665,7 +653,7 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
     // M2's behaviour on the input queue: queue the text with no delay and run until its last key has been applied. A key
     // that is not applied within 600 frames of emulated time of the previous one (the strobe never clears) is a timeout.
     const uint64_t id = QueueText(text, 0);
-    Stepper stepper(pacing);   // Realtime: sound unmuted for this scope
+    Stepper stepper(pacing);
     const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
     uint64_t seen = g_input.keysApplied;
     uint64_t progressAt = g_nCumulativeCycles;
@@ -822,19 +810,19 @@ const std::vector<std::string>& Emulator::Messages() const
 const AudioCapture& Emulator::Audio() const
 {
     RequireStarted();
-    static const AudioCapture capture;   // stub (M3B Task 1); Task 2 makes the Emulator own and feed one
-    return capture;
+    return Capture();
 }
 
+// Windowed playback is AudioOutput's (D14), which M3B Task 5 adds; until then there is none (ruling B1).
 uint64_t Emulator::SoundUnderruns() const
 {
     RequireStarted();
-    return HostFrame().SoundUnderruns();
+    return 0;
 }
 
 bool Emulator::SoundActive() const
 {
-    return g_started && g_soundActive;
+    return false;
 }
 
 }  // namespace harness

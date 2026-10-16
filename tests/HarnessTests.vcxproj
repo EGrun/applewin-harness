@@ -35,7 +35,6 @@
     <ClCompile Include="harness_frame_test.cpp" />
     <ClCompile Include="cli_test.cpp" />
     <ClCompile Include="dos_test.cpp" />
-    <ClCompile Include="monitored_sound_buffer_test.cpp" />
     <ClCompile Include="window_test.cpp" />
     <ClCompile Include="working_copy_test.cpp" />
     <ClCompile Include="input_queue_test.cpp" />

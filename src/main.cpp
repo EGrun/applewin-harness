@@ -59,13 +59,13 @@ bool ParseArgs(int argc, wchar_t** argv, Args& a)
 int Run(const Args& a)
 {
     namespace fs = std::filesystem;
-    fs::path dir = fs::temp_directory_path() / "applewin-harness";
-    fs::create_directories(dir);
-    fs::path ini = fs::absolute(dir / (std::to_string(GetCurrentProcessId()) + ".ini"));
-
     auto& emu = harness::Emulator::Instance();
+    fs::path ini;
     int rc = kExitOk;
     try {
+        fs::path dir = fs::temp_directory_path() / "applewin-harness";
+        fs::create_directories(dir);
+        ini = fs::absolute(dir / (std::to_string(GetCurrentProcessId()) + ".ini"));
         harness::EmulatorConfig cfg;
         cfg.configIni = ini;
         emu.Start(cfg);
@@ -83,7 +83,7 @@ int Run(const Args& a)
     }
     try { emu.Shutdown(); } catch (...) {}
     std::error_code ec;
-    fs::remove(ini, ec);
+    if (!ini.empty()) fs::remove(ini, ec);
     return rc;
 }
 

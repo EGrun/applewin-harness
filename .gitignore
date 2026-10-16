@@ -12,3 +12,6 @@ AppleWinHarness/x64/
 # Local scratch notes (may contain secrets — never commit)
 notes.txt
 .env
+
+# Python
+__pycache__/

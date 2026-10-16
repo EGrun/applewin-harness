@@ -386,6 +386,38 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
     return true;
 }
 
+// ---- Input queue: Task 2 stubs, implemented in Task 3.
+
+uint64_t Emulator::QueueText(std::string_view, uint32_t)
+{
+    RequireStarted();
+    throw std::logic_error("Emulator::QueueText: not implemented");
+}
+
+uint64_t Emulator::QueueKey(KeySpec, uint32_t)
+{
+    RequireStarted();
+    throw std::logic_error("Emulator::QueueKey: not implemented");
+}
+
+uint64_t Emulator::QueueJoystick(JoystickChange, uint32_t)
+{
+    RequireStarted();
+    throw std::logic_error("Emulator::QueueJoystick: not implemented");
+}
+
+std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t) const
+{
+    RequireStarted();
+    throw std::logic_error("Emulator::ScheduledCycle: not implemented");
+}
+
+std::vector<InputApplied> Emulator::TakeAppliedInputs()
+{
+    RequireStarted();
+    throw std::logic_error("Emulator::TakeAppliedInputs: not implemented");
+}
+
 void Emulator::InsertDisk(int drive, const std::filesystem::path& image)
 {
     RequireStarted();

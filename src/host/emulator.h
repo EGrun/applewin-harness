@@ -3,8 +3,10 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace harness {
@@ -20,6 +22,26 @@ struct EmulatorConfig {
 
 // AppleWin's state is global, so there is exactly one emulator per process.
 // Every method except Instance, Start and Shutdown throws std::logic_error before Start.
+// Input queue (spec: docs/specs/m3.md, Part A "Input queue"; D10).
+enum class ArrowKey { Left, Right, Up, Down };   // KeybQueueKeypress(VK_LEFT..VK_DOWN, NOT_ASCII)
+struct ResetKey {};                               // CTRL-RESET: AppleWin's CtrlReset(); does not wait for the strobe
+// An ASCII code 0..127 (sent with KeybQueueKeypress(code, ASCII)), an arrow key, or RESET.
+using KeySpec = std::variant<uint8_t, ArrowKey, ResetKey>;
+
+// Joystick 0 through AppleWin's mouse-as-joystick seam (J0C_MOUSE). Fields left out keep their values; positions
+// start at 127 (centre).
+struct JoystickChange {
+    std::optional<uint8_t> x, y;
+    std::optional<bool> button0, button1;
+};
+
+// An input that has fully taken effect. type_text: the cycles at which the first and the last key were applied.
+// press_key and set_joystick: the press (or change) and the release (or restore); equal when there is no hold or
+// duration. Cycles are EmulatedCycles() values.
+struct InputApplied {
+    uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
+};
+
 class Emulator {
 public:
     static Emulator& Instance();
@@ -43,6 +65,27 @@ public:
     // otherwise). Waits for the strobe to clear before each byte; throws std::runtime_error("TypeText: keyboard not
     // read") after 600 frames of emulated time. Returns right after queueing the last byte; false if the window closed.
     bool TypeText(std::string_view text, Pacing pacing = Pacing::Stepped);
+
+    // ---- Input queue. Every run (RunFrames, RunRealtime, TypeText) applies the events that are due at each step
+    // boundary, so input queued between runs takes effect at the start of the next step (D10). Each Queue* call
+    // returns a new input id (unique, increasing, never 0). PowerCycle discards queued input (and releases held keys).
+    // Keys are first in, first out, and each key also waits until the keyboard strobe is clear. Text: bytes 0x0D and
+    // 0x20-0x7E (std::invalid_argument before queueing anything otherwise). Key i of the text is due at the later of
+    // the previous key's applied cycle plus interKeyDelayMs (converted at the base clock, CLK_6502_NTSC) and the
+    // moment the strobe clears; with 0 this is TypeText's behaviour.
+    uint64_t QueueText(std::string_view text, uint32_t interKeyDelayMs);
+    // One key. While it is held the //e any-key-down flag ($C010 bit 7) is set: KeybAnyKeyDown(WM_KEYDOWN, vk) when
+    // applied and WM_KEYUP holdMs later (vk: the key's own VK where one exists, VK_SPACE otherwise). An ASCII code
+    // above 127 throws std::invalid_argument.
+    uint64_t QueueKey(KeySpec key, uint32_t holdMs);
+    // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
+    uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);
+    // The cycle at which the input takes effect when that is already known: once applied, its first cycle; before
+    // that, EmulatedCycles() when nothing is queued ahead of it and, for a key, the strobe is clear (it then applies
+    // at the start of the next step). Otherwise, or for an unknown id, nullopt.
+    std::optional<uint64_t> ScheduledCycle(uint64_t inputId) const;
+    // The inputs that have fully taken effect since the last call, in the order they completed.
+    std::vector<InputApplied> TakeAppliedInputs();
     // Slot 6, drive 0 or 1 (std::out_of_range otherwise). Insert errors throw std::runtime_error with AppleWin's message.
     void InsertDisk(int drive, const std::filesystem::path& image);
     void EjectDisk(int drive);

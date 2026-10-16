@@ -27,6 +27,7 @@ struct Step {
 };
 
 struct Args {
+    bool serve = false;
     bool headless = false;
     bool realtime = false;
     std::optional<std::filesystem::path> disk1;
@@ -37,6 +38,7 @@ struct Args {
 int Usage()
 {
     std::cerr << "usage: AppleWinHarness.exe [--headless] [--realtime] [--disk1 <image>] [--png <path>] [step ...]\n"
+                 "       AppleWinHarness.exe --serve [--headless]\n"
                  "step: --frames <n> | --type <text>\n"
                  "  --type escapes: \\r and \\n = Return, \\\\ = backslash; text is 0x20-0x7E.\n"
                  "  --headless needs at least one step; without steps a window runs until closed.\n";
@@ -81,7 +83,9 @@ bool ParseArgs(int argc, wchar_t** argv, Args& a)
     for (int i = 1; i < argc; ++i) {
         std::wstring k = argv[i];
         const bool hasValue = i + 1 < argc;
-        if (k == L"--headless" && !haveHeadless) {
+        if (k == L"--serve" && !a.serve) {
+            a.serve = true;
+        } else if (k == L"--headless" && !haveHeadless) {
             haveHeadless = a.headless = true;
         } else if (k == L"--realtime" && !haveRealtime) {
             haveRealtime = a.realtime = true;
@@ -103,6 +107,8 @@ bool ParseArgs(int argc, wchar_t** argv, Args& a)
             return false;
         }
     }
+    if (a.serve)   // --serve [--headless] only (spec: docs/specs/m3.md, Part A "Launch")
+        return !a.realtime && !a.disk1 && !a.png && a.steps.empty();
     return !(a.headless && a.steps.empty());
 }
 
@@ -189,11 +195,18 @@ int Run(const Args& a)
     return rc;
 }
 
+// The JSON-RPC server (Task 2 stub; implemented in Task 5).
+int Serve(const Args&)
+{
+    std::cerr << "error: not implemented\n";
+    return kExitFailure;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv)
 {
     Args a;
     if (!ParseArgs(argc, argv, a)) return Usage();
-    return Run(a);
+    return a.serve ? Serve(a) : Run(a);
 }

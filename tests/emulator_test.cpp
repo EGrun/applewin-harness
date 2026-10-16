@@ -167,3 +167,15 @@ TEST_CASE("emulator: RunFrames returns true when no window was closed")
     auto& e = StartedEmulator();
     CHECK(e.RunFrames(5) == true);
 }
+
+TEST_CASE("emulator: Frame is the presented snapshot, not the live buffer")
+{
+    auto& e = StartedEmulator();
+    e.RunFrames(2);
+    const uint8_t* live = GetVideo().GetFrameBuffer();
+    const size_t liveBytes = size_t(GetVideo().GetFrameBufferWidth()) * GetVideo().GetFrameBufferHeight() * 4;
+    for (bool borders : {false, true}) {
+        const uint8_t* top = e.Frame(borders).topRow;
+        CHECK((top < live || top >= live + liveBytes));
+    }
+}

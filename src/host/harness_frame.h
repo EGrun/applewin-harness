@@ -16,7 +16,7 @@ class MonitoredSoundBuffer;
 // AppleWin's FrameBase for both display modes (D8). Owns no window and never shows a message box.
 class HarnessFrame final : public FrameBase {
 public:
-    HarnessFrame() = default;
+    HarnessFrame();
     ~HarnessFrame() override = default;
 
     // Observers

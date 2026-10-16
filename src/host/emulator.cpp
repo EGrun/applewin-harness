@@ -33,6 +33,7 @@ namespace harness {
 namespace {
 
 bool g_started = false;
+uint64_t g_cyclesAtPowerOn = 0;   // g_nCumulativeCycles at the last power-on (D10)
 
 HarnessFrame& HostFrame()
 {
@@ -134,6 +135,7 @@ void Emulator::Start(const EmulatorConfig& config)
 
     // 4. Boot.
     Boot();
+    g_cyclesAtPowerOn = g_nCumulativeCycles;
 }
 
 void Emulator::Shutdown()
@@ -152,6 +154,7 @@ void Emulator::PowerCycle()
     // ResetMachineState() already boots the Disk II card (Utilities.cpp); a second Boot() would load a disk image twice.
     ResetMachineState();
     g_nAppMode = MODE_RUNNING;
+    g_cyclesAtPowerOn = g_nCumulativeCycles;
 }
 
 bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
@@ -192,7 +195,7 @@ bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
 uint64_t Emulator::EmulatedCycles() const
 {
     RequireStarted();
-    return g_nCumulativeCycles;
+    return g_nCumulativeCycles - g_cyclesAtPowerOn;
 }
 
 // Task 2 stubs: the interface is final, the behaviour arrives in a later task.
@@ -220,18 +223,7 @@ uint64_t Emulator::PresentedFrames() const
 FrameView Emulator::Frame(bool borders) const
 {
     RequireStarted();
-    Video& video = GetVideo();
-    const uint32_t fullW = video.GetFrameBufferWidth();
-    const uint32_t fullH = video.GetFrameBufferHeight();
-    const int32_t stride = -int32_t(fullW * 4);
-    const uint8_t* base = video.GetFrameBuffer();   // bottom-up: row 0 is the bottom row
-    if (borders)
-        return FrameView{base + size_t(fullH - 1) * fullW * 4, fullW, fullH, stride};
-
-    const uint32_t bw = video.GetFrameBufferBorderWidth();
-    const uint32_t bh = video.GetFrameBufferBorderHeight();
-    const uint8_t* top = base + (size_t(fullH - 1 - bh) * fullW + bw) * 4;
-    return FrameView{top, video.GetFrameBufferBorderlessWidth(), video.GetFrameBufferBorderlessHeight(), stride};
+    return HostFrame().PresentedFrame(borders);
 }
 
 std::string Emulator::ReadTextRow(int row) const

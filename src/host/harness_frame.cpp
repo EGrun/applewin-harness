@@ -10,6 +10,12 @@
 
 namespace harness {
 
+// Video's full framebuffer (GetFrameBufferWidth/Height are constants: 560+2*20 by 384+2*18, BGRA32). Allocated up front so
+// PresentedFrame is valid, and zero, before the first present.
+static constexpr size_t kFullWidth = 600, kFullHeight = 420;
+
+HarnessFrame::HarnessFrame() : snapshot_(kFullWidth * kFullHeight * 4, 0) {}
+
 void HarnessFrame::Initialize(bool resetVideoState)
 {
     Video& video = GetVideo();
@@ -27,7 +33,38 @@ void HarnessFrame::Destroy()
 
 void HarnessFrame::VideoPresentScreen()
 {
+    Video& video = GetVideo();
+    const uint8_t* live = video.GetFrameBuffer();
+    if (live) {
+        const size_t bytes = size_t(video.GetFrameBufferWidth()) * video.GetFrameBufferHeight() * 4;
+        snapshot_.resize(bytes);   // no-op unless Video's dimensions ever differ from kFullWidth x kFullHeight
+        std::memcpy(snapshot_.data(), live, bytes);
+    }
     ++presentedFrames_;
+    if (presentHook_)
+        presentHook_();
+}
+
+// Same layout as the live buffer: bottom-up, row 0 of snapshot_ is the bottom row.
+FrameView HarnessFrame::PresentedFrame(bool borders) const
+{
+    Video& video = GetVideo();
+    const uint32_t fullW = video.GetFrameBufferWidth();
+    const uint32_t fullH = video.GetFrameBufferHeight();
+    const int32_t stride = -int32_t(fullW * 4);
+    const uint8_t* base = snapshot_.data();
+    if (borders)
+        return FrameView{base + size_t(fullH - 1) * fullW * 4, fullW, fullH, stride};
+
+    const uint32_t bw = video.GetFrameBufferBorderWidth();
+    const uint32_t bh = video.GetFrameBufferBorderHeight();
+    const uint8_t* top = base + (size_t(fullH - 1 - bh) * fullW + bw) * 4;
+    return FrameView{top, video.GetFrameBufferBorderlessWidth(), video.GetFrameBufferBorderlessHeight(), stride};
+}
+
+void HarnessFrame::SetPresentHook(std::function<void()> hook)
+{
+    presentHook_ = std::move(hook);
 }
 
 int HarnessFrame::FrameMessageBox(LPCSTR lpText, LPCSTR lpCaption, UINT)
@@ -72,10 +109,6 @@ void HarnessFrame::Restart()
 }
 
 // Task 2 stubs: the interface is final, the behaviour arrives in a later task.
-FrameView HarnessFrame::PresentedFrame(bool) const { throw std::logic_error("not implemented"); }
-
-void HarnessFrame::SetPresentHook(std::function<void()>) { throw std::logic_error("not implemented"); }
-
 void HarnessFrame::EnableSound(bool) { throw std::logic_error("not implemented"); }
 
 void HarnessFrame::SetSoundMuted(bool) { throw std::logic_error("not implemented"); }

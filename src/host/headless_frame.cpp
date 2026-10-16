@@ -1,17 +1,73 @@
-// Stub: not yet part of any vcxproj (Task 5 adds it together with the host code it links against).
 #include "host/headless_frame.h"
-#include <stdexcept>
+
+#pragma warning(push, 3)
+#include "Interface.h"
+#pragma warning(pop)
+
+#include <cstdio>
+#include <cstring>
 
 namespace harness {
 
-void HeadlessFrame::Initialize(bool) { throw std::runtime_error("not implemented"); }
-void HeadlessFrame::Destroy() { throw std::runtime_error("not implemented"); }
-void HeadlessFrame::VideoPresentScreen() { throw std::runtime_error("not implemented"); }
-int HeadlessFrame::FrameMessageBox(LPCSTR, LPCSTR, UINT) { throw std::runtime_error("not implemented"); }
-void HeadlessFrame::GetBitmap(WORD, LONG, LPVOID) { throw std::runtime_error("not implemented"); }
+void HeadlessFrame::Initialize(bool resetVideoState)
+{
+    Video& video = GetVideo();
+    const size_t bytes = size_t(video.GetFrameBufferWidth()) * video.GetFrameBufferHeight() * 4;
+    buffer_.assign(bytes, 0);
+    video.Initialize(buffer_.data(), resetVideoState);
+}
+
+void HeadlessFrame::Destroy()
+{
+    GetVideo().Destroy();
+    buffer_.clear();
+    buffer_.shrink_to_fit();
+}
+
+void HeadlessFrame::VideoPresentScreen()
+{
+    ++presentedFrames_;
+}
+
+int HeadlessFrame::FrameMessageBox(LPCSTR lpText, LPCSTR lpCaption, UINT)
+{
+    std::string msg = std::string(lpCaption ? lpCaption : "") + ": " + (lpText ? lpText : "");
+    std::fprintf(stderr, "%s\n", msg.c_str());
+    messages_.push_back(std::move(msg));
+    return IDOK;
+}
+
+void HeadlessFrame::GetBitmap(WORD, LONG cb, LPVOID lpvBits)
+{
+    if (lpvBits && cb > 0)
+        std::memset(lpvBits, 0, size_t(cb));
+}
+
 std::shared_ptr<NetworkBackend> HeadlessFrame::CreateNetworkBackend(const std::string&) { return nullptr; }
+
 std::shared_ptr<SoundBuffer> HeadlessFrame::CreateSoundBuffer(uint32_t, uint32_t, int, const char*) { return nullptr; }
-BYTE* HeadlessFrame::GetResource(WORD, LPCSTR, uint32_t) { throw std::runtime_error("not implemented"); }
-void HeadlessFrame::Restart() { throw std::runtime_error("not implemented"); }
+
+// Same logic as Win32Frame::GetResource (external/AppleWin/source/Windows/Win32Frame.cpp).
+BYTE* HeadlessFrame::GetResource(WORD id, LPCSTR lpType, uint32_t expectedSize)
+{
+    HRSRC hResInfo = FindResourceA(nullptr, MAKEINTRESOURCEA(id), lpType);
+    if (hResInfo == nullptr)
+        return nullptr;
+
+    const uint32_t resSize = SizeofResource(nullptr, hResInfo);
+    if (resSize != expectedSize)
+        return nullptr;
+
+    HGLOBAL hResData = LoadResource(nullptr, hResInfo);
+    if (hResData == nullptr)
+        return nullptr;
+
+    return static_cast<BYTE*>(LockResource(hResData));   // no unlock needed
+}
+
+void HeadlessFrame::Restart()
+{
+    restartRequested_ = true;
+}
 
 }  // namespace harness

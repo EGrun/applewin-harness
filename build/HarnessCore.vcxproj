@@ -34,7 +34,7 @@
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\src;$(MSBuildThisFileDirectory)..\third_party;$(MSBuildThisFileDirectory)..\external\AppleWin\source;$(MSBuildThisFileDirectory)..\external\AppleWin\source\cpu;$(MSBuildThisFileDirectory)..\external\AppleWin\source\debugger;$(MSBuildThisFileDirectory)..\external\AppleWin\zlib;$(MSBuildThisFileDirectory)..\external\AppleWin\libyaml\include;$(MSBuildThisFileDirectory)..\external\AppleWin\resource;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\src;$(MSBuildThisFileDirectory)..\third_party;$(MSBuildThisFileDirectory)..\external\AppleWin\source;$(MSBuildThisFileDirectory)..\external\AppleWin\source\cpu;$(MSBuildThisFileDirectory)..\external\AppleWin\source\debugger;$(MSBuildThisFileDirectory)..\external\AppleWin\zlib;$(MSBuildThisFileDirectory)..\external\AppleWin\;$(MSBuildThisFileDirectory)..\external\AppleWin\libyaml\include;$(MSBuildThisFileDirectory)..\external\AppleWin\resource;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_WINDOWS;_CRT_SECURE_NO_DEPRECATE;NO_DSHOW_STRSAFE;YAML_DECLARE_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
@@ -64,6 +64,8 @@
     <ClCompile Include="..\src\core\sha256.cpp" />
     <ClCompile Include="..\src\core\pacing.cpp" />
     <ClCompile Include="..\src\host\emulator.cpp" />
+    <ClCompile Include="..\src\host\headless_frame.cpp" />
+    <ClCompile Include="..\src\host\applewin_host.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\core\frame_view.h" />

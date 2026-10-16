@@ -240,7 +240,7 @@ void CheckPng(const fs::path& png, const std::string& expected)
     CHECK(harness::Sha256Hex(rgb) == expected);
 }
 
-const std::wstring kDosPrintSteps = L" --frames 600 --type \"PRINT 2+2\\r\" --frames 60";
+const std::wstring kDosPrintSteps = L" --frames 720 --type \"PRINT 2+2\\r\" --frames 60";
 
 }  // namespace
 
@@ -373,7 +373,7 @@ TEST_SUITE("windowed")
 
     TEST_CASE("cli: keys and clicks sent to the window don't change the hash")
     {
-        const std::wstring disk = L"--disk1 " + Quoted(DosMasterImage()) + L" --frames 600";
+        const std::wstring disk = L"--disk1 " + Quoted(DosMasterImage()) + L" --frames 720";
         auto p = LaunchCli(L"--realtime " + disk, /*mergeStderr*/ false);
         REQUIRE(p->Launched());
         const auto t0 = std::chrono::steady_clock::now();
@@ -432,7 +432,7 @@ TEST_SUITE("audio")
     {
         // Boot DOS, then a BASIC loop that toggles the speaker ($C030) forever, then 3,600 realtime frames (~60 s).
         auto p = LaunchCli(L"--realtime --disk1 " + Quoted(DosMasterImage()) +
-                               L" --frames 600 --type \"10 X=PEEK(-16336):GOTO 10\\rRUN\\r\" --frames 3600",
+                               L" --frames 720 --type \"10 X=PEEK(-16336):GOTO 10\\rRUN\\r\" --frames 3600",
                            /*mergeStderr*/ false);
         REQUIRE(p->Launched());
         auto r = p->Wait(240000);

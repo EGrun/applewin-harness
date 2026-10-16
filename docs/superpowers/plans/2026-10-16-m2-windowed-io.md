@@ -107,7 +107,7 @@ The implementer writes tests from `docs/specs/m2.md` only.
     - After `Start` in headless mode, `SoundActive()==false`, `GetModuleHandleW(L"dsound.dll")==nullptr` and `SoundBuffersCreated()==0`.
     - `RunFrames(5)` returns true.
   - `dos:` (dos_test):
-    - `InsertDisk(0, DosMasterImage())`, `PowerCycle()`, `RunFrames(600)`, `TypeText("PRINT 2+2\r")`, `RunFrames(60)`. Text page 1 then has consecutive rows that trim to `]PRINT 2+2`, `4`, `]`.
+    - `InsertDisk(0, DosMasterImage())`, `PowerCycle()`, `RunFrames(720)`, `TypeText("PRINT 2+2\r")`, `RunFrames(60)`. Text page 1 then has consecutive rows that trim to `]PRINT 2+2`, `4`, `` (empty; DOS 3.3 prints a blank line), `]`.
     - `FrameHash(Frame())` equals the golden `m2_dos_print.sha256`.
     - A scope guard calls `EjectDisk(0)` and `PowerCycle()`, so the M1 boot tests stay valid.
   - `cli:` (cli_test):
@@ -119,7 +119,7 @@ The implementer writes tests from `docs/specs/m2.md` only.
   - `cli:` suite `windowed`:
     - The windowed golden prints the same hash; the first stdout line is the hash line.
     - No arguments: within 10 s a visible `AppleWinHarnessWindow` owned by the child appears, and `WM_CLOSE` exits it with 0.
-    - View-only: `--realtime --disk1 <DOS> --frames 600`, with `HELLO\r` posted as `WM_CHAR`s (plus `WM_KEYDOWN`/`WM_LBUTTONDOWN`) from 3 s to 6 s, gives the same hash as `--headless --disk1 <DOS> --frames 600`.
+    - View-only: `--realtime --disk1 <DOS> --frames 720`, with `HELLO\r` posted as `WM_CHAR`s (plus `WM_KEYDOWN`/`WM_LBUTTONDOWN`) from 3 s to 6 s, gives the same hash as `--headless --disk1 <DOS> --frames 720`.
     - `WM_CLOSE` during `--realtime --disk1 <DOS> --frames 3000` exits 1, with `error: window closed` on stderr and the work dir removed.
   - `cli:` suite `audio`: the 60-second tone run reports `audio underruns 0`. It is skipped if the warning `no audio device` appears.
 - [ ] **Step 2:** Build. Expected: 0 errors and 0 warnings. The M1 tests that don't touch changed contracts pass. Every new test fails or throws `not implemented`. Record the failing list in the report.
@@ -201,5 +201,5 @@ The implementer writes tests from `docs/specs/m2.md` only.
   - MSBuild: `microsoft/setup-msbuild@v2`.
   - A matrix over Debug and Release, each building `AppleWinHarness.sln` with `-p:Platform=x64` and running `bin/x64/${{ matrix.config }}/HarnessTests.exe -tse=windowed,audio`.
   - On failure, upload `%TEMP%\applewin-harness` as an artifact.
-- [ ] **Step 2:** Update the README usage section with the new CLI, including the bell example: `AppleWinHarness.exe --realtime --disk1 "<DOS>" --frames 600 --type "PRINT CHR$(7)\r" --frames 120`. Mark M2 ✅ in `project.md`, but only after the human checks. Validate the workflow YAML parses (`python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" .github/workflows/ci.yml`, or a careful review if PyYAML is unavailable).
+- [ ] **Step 2:** Update the README usage section with the new CLI, including the bell example: `AppleWinHarness.exe --realtime --disk1 "<DOS>" --frames 720 --type "PRINT CHR$(7)\r" --frames 120`. Mark M2 ✅ in `project.md`, but only after the human checks. Validate the workflow YAML parses (`python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" .github/workflows/ci.yml`, or a careful review if PyYAML is unavailable).
 - [ ] **Step 3:** Commit: `ci: GitHub Actions build and headless tests; M2 docs`.

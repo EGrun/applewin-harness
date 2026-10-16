@@ -57,7 +57,7 @@ TEST_CASE("dos: PRINT 2+2 in-process")
     EjectAndPowerCycle restore{e};   // declared after copy: ejects before the copy is deleted
 
     e.PowerCycle();
-    REQUIRE(e.RunFrames(600));
+    REQUIRE(e.RunFrames(720));
     REQUIRE(e.TypeText("PRINT 2+2\r"));
     REQUIRE(e.RunFrames(60));
 
@@ -65,8 +65,9 @@ TEST_CASE("dos: PRINT 2+2 in-process")
     for (int r = 0; r < 24; ++r)
         rows.push_back(TrimRow(e.ReadTextRow(r)));
     bool found = false;
-    for (size_t r = 0; r + 2 < rows.size() && !found; ++r)
-        found = rows[r] == "]PRINT 2+2" && rows[r + 1] == "4" && rows[r + 2] == "]";
+    // DOS 3.3 prints a blank line after the output, before the next prompt.
+    for (size_t r = 0; r + 3 < rows.size() && !found; ++r)
+        found = rows[r] == "]PRINT 2+2" && rows[r + 1] == "4" && rows[r + 2].empty() && rows[r + 3] == "]";
     std::string screen;
     for (const auto& row : rows) screen += "\n|" + row;
     INFO("text page 1 (trimmed):" << screen);

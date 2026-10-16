@@ -25,6 +25,9 @@
 #pragma warning(pop)
 
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -76,6 +79,63 @@ void Boot()
     if (GetCardMgr().QuerySlot(SLOT6) == CT_Disk2)
         dynamic_cast<Disk2InterfaceCard&>(GetCardMgr().GetRef(SLOT6)).Boot();
     g_nAppMode = MODE_RUNNING;
+}
+
+constexpr uint32_t kTypeTimeoutFrames = 600;   // spec: TypeText gives up after 600 frames of emulated time
+
+// The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time.
+// Stepped: period-sized steps, no pacing. Realtime (D9): a BurstBudget burst corrected by the speaker's cycle
+// feedback, then wait for the 1 ms tick.
+class Stepper {
+public:
+    explicit Stepper(Pacing pacing)
+        : realtime_(pacing == Pacing::Realtime), period_(uint32_t(g_fCurrentCLK6502 * 1.0e-3))
+    {
+        if (realtime_) {
+            budget_.emplace(g_fCurrentCLK6502, std::chrono::milliseconds(1));
+            pacer_.emplace();
+            pacer_->Start();
+        }
+    }
+
+    // Runs one step of at most `remaining` cycles. Returns true if the run must stop (window closed).
+    bool Step(uint64_t remaining)
+    {
+        uint64_t cycles;
+        if (realtime_) {
+            const int64_t withFeedback = int64_t(budget_->Next()) + g_nCpuCyclesFeedback;
+            cycles = withFeedback > 0 ? uint64_t(withFeedback) : 0;
+        } else {
+            cycles = period_;
+        }
+        if (cycles > remaining)
+            cycles = remaining;
+        ExecuteStep(uint32_t(cycles));
+        if (realtime_)
+            pacer_->WaitForTick();
+        return ShouldStop();
+    }
+
+private:
+    // Task 9: true once the window has been closed. There is no window yet.
+    static bool ShouldStop() { return false; }
+
+    bool realtime_;
+    uint32_t period_;
+    std::optional<BurstBudget> budget_;
+    std::optional<RealtimePacer> pacer_;
+};
+
+// AppleWin seeds zero-page $4E/$4F (RNDL/RNDH) from rand() ^ timeGetTime() on every power-on (Memory.cpp
+// getRandomTime, a Pooyan work-around), whatever the power-on memory pattern. The monitor's key-wait loop increments
+// them, so the cycle count of every wait for a key (and so the frame hash) would differ between runs. Pin them, and
+// restart the C runtime's rand() sequence (the Disk II uses it for unreadable bits), at every power-on.
+void PinPowerOnRandomness()
+{
+    std::srand(1);
+    BYTE* rnd = MemGetMainPtr(0x4E);
+    rnd[0] = 0;
+    rnd[1] = 0;
 }
 
 }  // namespace
@@ -131,6 +191,7 @@ void Emulator::Start(const EmulatorConfig& config)
     // debugger-UI state that the M1 run path does not use.
     MemInitialize();
     GetCardMgr().Reset(true);
+    PinPowerOnRandomness();
 
     g_started = true;
 
@@ -167,6 +228,7 @@ void Emulator::PowerCycle()
     RequireStarted();
     // ResetMachineState() already boots the Disk II card (Utilities.cpp); a second Boot() would load a disk image twice.
     ResetMachineState();
+    PinPowerOnRandomness();
     g_nAppMode = MODE_RUNNING;
     g_cyclesAtPowerOn = g_nCumulativeCycles;
 }
@@ -174,17 +236,13 @@ void Emulator::PowerCycle()
 bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
 {
     RequireStarted();
-    if (pacing != Pacing::Stepped)
-        throw std::logic_error("not implemented");   // Task 2 stub
     if (frames == 0)
         return true;
+    Stepper stepper(pacing);   // Task 9: the sound unmute/mute rule for Realtime goes with this scope
     const uint64_t target = g_nCumulativeCycles + uint64_t(frames) * NTSC_GetCyclesPerFrame();
-    // Steps are capped at ContinueExecution's 1 ms execution period (~1020 cycles). One huge CpuExecute call would
-    // present at most one frame and breaks per-period card updates (Mockingboard asserts on >= 0x10000 cycles).
-    const uint32_t period = uint32_t(g_fCurrentCLK6502 * 1.0e-3);
     while (g_nCumulativeCycles < target) {
-        const uint64_t remaining = target - g_nCumulativeCycles;
-        ExecuteStep(remaining < period ? uint32_t(remaining) : period);
+        if (stepper.Step(target - g_nCumulativeCycles))
+            return false;
     }
     return true;
 }
@@ -193,15 +251,13 @@ bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
 {
     RequireStarted();
     using clock = std::chrono::steady_clock;
-    // 1 ms bursts. The pacer catches up short stalls and drops time after long ones, so stop on elapsed wall-clock time
-    // (not a tick count) to keep the run length honest.
-    BurstBudget budget(g_fCurrentCLK6502, std::chrono::milliseconds(1));
-    RealtimePacer pacer;
-    pacer.Start();
+    // The pacer catches up short stalls and drops time after long ones, so stop on elapsed wall-clock time (not a tick
+    // count) to keep the run length honest.
+    Stepper stepper(Pacing::Realtime);   // Task 9: the sound unmute/mute rule goes with this scope
     const auto start = clock::now();
     while (clock::now() - start < wallTime) {
-        ExecuteStep(budget.Next());
-        pacer.WaitForTick();
+        if (stepper.Step(UINT64_MAX))
+            return false;
     }
     return true;
 }
@@ -212,10 +268,27 @@ uint64_t Emulator::EmulatedCycles() const
     return g_nCumulativeCycles - g_cyclesAtPowerOn;
 }
 
-// Task 2 stubs: the interface is final, the behaviour arrives in a later task.
-bool Emulator::TypeText(std::string_view, Pacing)
+bool Emulator::TypeText(std::string_view text, Pacing pacing)
 {
-    throw std::logic_error("not implemented");
+    RequireStarted();
+    for (const char c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u != 0x0D && (u < 0x20 || u > 0x7E))
+            throw std::invalid_argument("TypeText: only 0x0D and 0x20-0x7E can be typed");
+    }
+    Stepper stepper(pacing);   // Task 9: the sound unmute/mute rule for Realtime goes with this scope
+    const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
+    for (const char c : text) {
+        const uint64_t giveUp = g_nCumulativeCycles + timeout;
+        while (KeybReadData() & 0x80) {
+            if (g_nCumulativeCycles >= giveUp)
+                throw std::runtime_error("TypeText: keyboard not read");
+            if (stepper.Step(UINT64_MAX))
+                return false;
+        }
+        KeybQueueKeypress(WPARAM(static_cast<unsigned char>(c)), ASCII);
+    }
+    return true;
 }
 
 void Emulator::InsertDisk(int drive, const std::filesystem::path& image)

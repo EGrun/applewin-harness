@@ -59,7 +59,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\src\core\placeholder.cpp" />
+    <ClCompile Include="..\src\core\frame_view.cpp" />
+    <ClCompile Include="..\src\core\png_writer.cpp" />
+    <ClCompile Include="..\src\core\sha256.cpp" />
+    <ClCompile Include="..\src\core\pacing.cpp" />
+    <ClCompile Include="..\src\host\emulator.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\src\core\frame_view.h" />
+    <ClInclude Include="..\src\core\png_writer.h" />
+    <ClInclude Include="..\src\core\sha256.h" />
+    <ClInclude Include="..\src\core\pacing.h" />
+    <ClInclude Include="..\src\host\emulator.h" />
+    <ClInclude Include="..\src\host\headless_frame.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

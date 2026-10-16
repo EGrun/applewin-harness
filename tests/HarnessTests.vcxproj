@@ -68,7 +68,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="smoke_test.cpp" />
+    <ClCompile Include="png_writer_test.cpp" />
+    <ClCompile Include="sha256_test.cpp" />
+    <ClCompile Include="pacing_test.cpp" />
+    <ClCompile Include="emulator_test.cpp" />
+    <ClCompile Include="cli_test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\external\AppleWin\resource\Applewin.rc" />

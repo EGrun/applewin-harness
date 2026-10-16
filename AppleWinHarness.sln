@@ -5,6 +5,18 @@ VisualStudioVersion = 17.9.31905.244
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AppleWinHarness", "AppleWinHarness.vcxproj", "{C0A1B2C3-D4E5-4789-ABCD-1234567890AB}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AppleWinCore", "build\AppleWinCore.vcxproj", "{A1B2C3D4-0001-4000-8000-000000000001}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "HarnessCore", "build\HarnessCore.vcxproj", "{A1B2C3D4-0002-4000-8000-000000000002}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "HarnessTests", "tests\HarnessTests.vcxproj", "{A1B2C3D4-0003-4000-8000-000000000003}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "zlib", "external\AppleWin\zlib\zlib-VS2022.vcxproj", "{9B32A6E7-1237-4F36-8903-A3FD51DF9C4E}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "minizip", "external\AppleWin\minizip\zip_VS2022.vcxproj", "{509739E7-0AF3-4C09-A1A9-F0B1BC31B39D}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "yaml", "external\AppleWin\libyaml\win32\yaml-VS2022.vcxproj", "{0212E0DF-06DA-4080-BD1D-F3B01599F70F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -15,6 +27,30 @@ Global
 		{C0A1B2C3-D4E5-4789-ABCD-1234567890AB}.Debug|x64.Build.0 = Debug|x64
 		{C0A1B2C3-D4E5-4789-ABCD-1234567890AB}.Release|x64.ActiveCfg = Release|x64
 		{C0A1B2C3-D4E5-4789-ABCD-1234567890AB}.Release|x64.Build.0 = Release|x64
+		{A1B2C3D4-0001-4000-8000-000000000001}.Debug|x64.ActiveCfg = Debug|x64
+		{A1B2C3D4-0001-4000-8000-000000000001}.Debug|x64.Build.0 = Debug|x64
+		{A1B2C3D4-0001-4000-8000-000000000001}.Release|x64.ActiveCfg = Release|x64
+		{A1B2C3D4-0001-4000-8000-000000000001}.Release|x64.Build.0 = Release|x64
+		{A1B2C3D4-0002-4000-8000-000000000002}.Debug|x64.ActiveCfg = Debug|x64
+		{A1B2C3D4-0002-4000-8000-000000000002}.Debug|x64.Build.0 = Debug|x64
+		{A1B2C3D4-0002-4000-8000-000000000002}.Release|x64.ActiveCfg = Release|x64
+		{A1B2C3D4-0002-4000-8000-000000000002}.Release|x64.Build.0 = Release|x64
+		{A1B2C3D4-0003-4000-8000-000000000003}.Debug|x64.ActiveCfg = Debug|x64
+		{A1B2C3D4-0003-4000-8000-000000000003}.Debug|x64.Build.0 = Debug|x64
+		{A1B2C3D4-0003-4000-8000-000000000003}.Release|x64.ActiveCfg = Release|x64
+		{A1B2C3D4-0003-4000-8000-000000000003}.Release|x64.Build.0 = Release|x64
+		{9B32A6E7-1237-4F36-8903-A3FD51DF9C4E}.Debug|x64.ActiveCfg = Debug|x64
+		{9B32A6E7-1237-4F36-8903-A3FD51DF9C4E}.Debug|x64.Build.0 = Debug|x64
+		{9B32A6E7-1237-4F36-8903-A3FD51DF9C4E}.Release|x64.ActiveCfg = Release|x64
+		{9B32A6E7-1237-4F36-8903-A3FD51DF9C4E}.Release|x64.Build.0 = Release|x64
+		{509739E7-0AF3-4C09-A1A9-F0B1BC31B39D}.Debug|x64.ActiveCfg = Debug|x64
+		{509739E7-0AF3-4C09-A1A9-F0B1BC31B39D}.Debug|x64.Build.0 = Debug|x64
+		{509739E7-0AF3-4C09-A1A9-F0B1BC31B39D}.Release|x64.ActiveCfg = Release|x64
+		{509739E7-0AF3-4C09-A1A9-F0B1BC31B39D}.Release|x64.Build.0 = Release|x64
+		{0212E0DF-06DA-4080-BD1D-F3B01599F70F}.Debug|x64.ActiveCfg = Debug|x64
+		{0212E0DF-06DA-4080-BD1D-F3B01599F70F}.Debug|x64.Build.0 = Debug|x64
+		{0212E0DF-06DA-4080-BD1D-F3B01599F70F}.Release|x64.ActiveCfg = Release|x64
+		{0212E0DF-06DA-4080-BD1D-F3B01599F70F}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

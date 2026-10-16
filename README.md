@@ -2,7 +2,7 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0 and M1 are done. M2 (window, sound, keyboard, disks) is implemented and awaiting human checks. See [project.md](project.md).
+**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks

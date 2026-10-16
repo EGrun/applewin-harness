@@ -190,6 +190,13 @@ public:
 
     HANDLE Handle() const { return h_; }
 
+    // The process id of the pipe's server end (0 if unknown): clients compare it with the announced pid before hello.
+    DWORD ServerPid() const
+    {
+        ULONG pid = 0;
+        return h_ && GetNamedPipeServerProcessId(h_, &pid) ? DWORD(pid) : 0;
+    }
+
     void Close()
     {
         if (h_) {

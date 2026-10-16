@@ -228,7 +228,9 @@ int Serve(const Args& a)
         line["pid"] = GetCurrentProcessId();
         std::cout << line.dump() << "\n";
         std::cout.flush();
-        for (;;) Sleep(INFINITE);
+        while (server.FatalError().empty()) Sleep(100);
+        std::cerr << "error: " << server.FatalError() << "\n";
+        return kExitFailure;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return kExitFailure;

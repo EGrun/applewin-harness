@@ -5,6 +5,7 @@
 #include <bcrypt.h>
 #include <array>
 #include <atomic>
+#include <deque>
 #include <list>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,7 @@ namespace {
 
 constexpr DWORD kMaxInstances = 8;
 constexpr DWORD kPipeBufferBytes = 64 * 1024;
+constexpr size_t kMaxBacklogBytes = 64u * 1024u * 1024u;   // queued outbound bytes per connection
 
 std::string Win32Message(const char* what, DWORD err)
 {
@@ -94,45 +96,73 @@ std::optional<DWORD> FinishOverlapped(HANDLE file, OVERLAPPED& ov, HANDLE cancel
     return n;
 }
 
-// One accepted pipe instance. Owned jointly by its thread and whoever keeps the ConnectionPtr (the session); the
-// pipe handle is closed by the thread when the connection ends, the events when the last owner lets go.
+// One accepted pipe instance. Owned jointly by its two threads (reader and writer) and whoever keeps the ConnectionPtr
+// (the session). Send never blocks: it queues the encoded message and the writer thread writes it. The pipe handle is
+// closed by the reader thread once the writer has stopped; the events when the last owner lets go.
 class PipeConnection final : public Connection {
 public:
-    PipeConnection(HANDLE pipe, uint64_t id) : pipe_(pipe), id_(id), cancel_(NewEvent()), writeEvent_(NewEvent()) {}
-
-    ~PipeConnection() override { CloseHandleLocked(); }
+    PipeConnection(HANDLE pipe, uint64_t id)
+        : pipe_(pipe), id_(id), cancel_(NewEvent()), writeEvent_(NewEvent()), sendReady_(NewAutoEvent())
+    {
+    }
 
     Role role() const override { return role_.load(); }
     uint64_t id() const override { return id_; }
 
+    // Queues one whole message and returns at once. A backlog over kMaxBacklogBytes closes the connection (the client
+    // is not reading). Throws std::length_error for a message over 16 MiB (EncodeMessage).
     void Send(const nlohmann::json& message) override
     {
-        const std::vector<uint8_t> wire = EncodeMessage(message);
-        std::lock_guard lock(writeMutex_);
-        if (closed_.load() || !pipe_) return;
-        size_t done = 0;
-        while (done < wire.size()) {
-            OVERLAPPED ov{};
-            ov.hEvent = writeEvent_.h;
-            ResetEvent(writeEvent_.h);
-            const DWORD chunk = static_cast<DWORD>(wire.size() - done);   // <= 16 MiB + 4
-            DWORD n = 0;
-            if (WriteFile(pipe_.h, wire.data() + done, chunk, &n, &ov)) {
-                // Completed synchronously; the event and GetOverlappedResult agree with n.
-                if (!GetOverlappedResult(pipe_.h, &ov, &n, TRUE)) return MarkClosed();
-            } else if (GetLastError() == ERROR_IO_PENDING) {
-                const auto r = FinishOverlapped(pipe_.h, ov, cancel_.h);
-                if (!r) return MarkClosed();
-                n = *r;
+        std::vector<uint8_t> wire = EncodeMessage(message);
+        bool overflow = false;
+        {
+            std::lock_guard lock(queueMutex_);
+            if (closed_.load() || closing_) return;
+            if (backlog_ + wire.size() > kMaxBacklogBytes) {
+                overflow = true;
             } else {
-                return MarkClosed();
+                backlog_ += wire.size();
+                queue_.push_back(std::move(wire));
             }
-            if (n == 0) return MarkClosed();
-            done += n;
+        }
+        if (overflow) Cancel();
+        else SetEvent(sendReady_.h);
+    }
+
+    // The writer thread: writes queued messages, whole and in order, until cancelled, a write fails, or the connection
+    // is closing and the queue is empty.
+    void WriterLoop()
+    {
+        for (;;) {
+            std::vector<uint8_t> wire;
+            {
+                std::lock_guard lock(queueMutex_);
+                if (closed_.load()) return;
+                if (!queue_.empty()) {
+                    wire = std::move(queue_.front());
+                    queue_.pop_front();
+                } else if (closing_) {
+                    return;
+                }
+            }
+            if (wire.empty()) {
+                const HANDLE waits[2] = {sendReady_.h, cancel_.h};
+                if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0) return;
+                continue;
+            }
+            const bool ok = WriteAll(wire);
+            {
+                std::lock_guard lock(queueMutex_);
+                backlog_ -= wire.size();
+            }
+            if (!ok) {
+                Cancel();
+                return;
+            }
         }
     }
 
-    // Reads exactly n bytes; false on disconnect, error or cancellation.
+    // Reads exactly n bytes; false on disconnect, error or cancellation. Reader thread only.
     bool ReadExact(uint8_t* p, size_t n, HANDLE readEvent)
     {
         size_t got = 0;
@@ -141,11 +171,9 @@ public:
             OVERLAPPED ov{};
             ov.hEvent = readEvent;
             ResetEvent(readEvent);
+            const DWORD want = static_cast<DWORD>(n - got);   // <= 16 MiB
             DWORD r = 0;
-            const DWORD want = static_cast<DWORD>(n - got);
-            if (ReadFile(pipe_.h, p + got, want, &r, &ov)) {
-                if (!GetOverlappedResult(pipe_.h, &ov, &r, TRUE)) return false;
-            } else if (GetLastError() == ERROR_IO_PENDING) {
+            if (ReadFile(pipe_.h, p + got, want, nullptr, &ov) || GetLastError() == ERROR_IO_PENDING) {
                 const auto res = FinishOverlapped(pipe_.h, ov, cancel_.h);
                 if (!res) return false;
                 r = *res;
@@ -158,30 +186,62 @@ public:
         return true;
     }
 
-    // Any thread: stops pending and future I/O. The handle stays open until Finish.
+    // Any thread: stops pending and future I/O and drops the queue. The handle stays open until Finish.
     void Cancel()
     {
         closed_.store(true);
         SetEvent(cancel_.h);
     }
 
-    // The connection thread, last: waits for an in-flight Send, then closes the handle. Data already written stays
-    // readable by the client (no DisconnectNamedPipe, which would discard it).
+    // Reader thread: no more messages are accepted; the writer drains what is queued, then stops.
+    void BeginClosing()
+    {
+        {
+            std::lock_guard lock(queueMutex_);
+            closing_ = true;
+        }
+        SetEvent(sendReady_.h);
+    }
+
+    // Reader thread, last (after the writer has been joined): closes the handle. Data already written stays readable
+    // by the client (no DisconnectNamedPipe, which would discard it).
     void Finish()
     {
         Cancel();
-        CloseHandleLocked();
+        {
+            std::lock_guard lock(queueMutex_);
+            queue_.clear();
+            backlog_ = 0;
+        }
+        pipe_.reset();
     }
 
     void SetRole(Role r) { role_.store(r); }
 
 private:
-    void MarkClosed() { closed_.store(true); }
-
-    void CloseHandleLocked()
+    static HANDLE NewAutoEvent()
     {
-        std::lock_guard lock(writeMutex_);
-        pipe_.reset();
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!e) throw std::runtime_error(Win32Message("CreateEventW", GetLastError()));
+        return e;
+    }
+
+    // Writer thread only.
+    bool WriteAll(const std::vector<uint8_t>& wire)
+    {
+        size_t done = 0;
+        while (done < wire.size()) {
+            OVERLAPPED ov{};
+            ov.hEvent = writeEvent_.h;
+            ResetEvent(writeEvent_.h);
+            const DWORD chunk = static_cast<DWORD>(wire.size() - done);   // <= 16 MiB + 4
+            if (!WriteFile(pipe_.h, wire.data() + done, chunk, nullptr, &ov) && GetLastError() != ERROR_IO_PENDING)
+                return false;
+            const auto n = FinishOverlapped(pipe_.h, ov, cancel_.h);
+            if (!n || *n == 0) return false;
+            done += *n;
+        }
+        return true;
     }
 
     Handle pipe_;
@@ -189,8 +249,12 @@ private:
     std::atomic<Role> role_{Role::Agent};
     std::atomic<bool> closed_{false};
     Handle cancel_;       // manual-reset; set once, never reset
-    Handle writeEvent_;   // used only under writeMutex_
-    std::mutex writeMutex_;
+    Handle writeEvent_;   // writer thread only
+    Handle sendReady_;    // auto-reset: the queue grew, or closing_ was set
+    std::mutex queueMutex_;
+    std::deque<std::vector<uint8_t>> queue_;   // under queueMutex_
+    size_t backlog_ = 0;                       // queued plus in-flight bytes; under queueMutex_
+    bool closing_ = false;                     // under queueMutex_
 };
 
 std::atomic<uint64_t> g_nextConnectionId{1};
@@ -225,6 +289,10 @@ struct PipeServer::Impl {
     std::list<Record> records;
     std::atomic<DWORD> active{0};
 
+    std::vector<uint8_t> ownerSid;   // the first instance's owner (FILE_FLAG_FIRST_PIPE_INSTANCE: certainly ours)
+    mutable std::mutex fatalMutex;
+    std::string fatalError;
+
     ~Impl()
     {
         if (acl) LocalFree(acl);
@@ -251,6 +319,10 @@ struct PipeServer::Impl {
         ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
         ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
         ea.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+        if (acl) {   // a retry after a failed Start
+            LocalFree(acl);
+            acl = nullptr;
+        }
         const DWORD err = SetEntriesInAclW(1, &ea, nullptr, &acl);
         if (err != ERROR_SUCCESS) throw std::runtime_error(Win32Message("SetEntriesInAclW", err));
         if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION))
@@ -269,6 +341,68 @@ struct PipeServer::Impl {
         return CreateNamedPipeW(name.c_str(), openMode,
                                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                                 kMaxInstances, kPipeBufferBytes, kPipeBufferBytes, 0, &sa);
+    }
+
+    // Checks the instance's owner and DACL: the owner (copied into ownerOut when non-null, else compared with
+    // ownerSid) and a DACL of exactly one allow ACE for the token user. Guards against joining a pipe someone else
+    // created under our name (squatting) when an instance is made without FILE_FLAG_FIRST_PIPE_INSTANCE.
+    bool CheckInstance(HANDLE h, std::vector<uint8_t>* ownerOut)
+    {
+        PSID owner = nullptr;
+        PACL dacl = nullptr;
+        PSECURITY_DESCRIPTOR psd = nullptr;
+        if (GetSecurityInfo(h, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
+                            nullptr, &dacl, nullptr, &psd) != ERROR_SUCCESS)
+            return false;
+        bool ok = owner != nullptr && IsValidSid(owner) && dacl != nullptr && dacl->AceCount == 1;
+        if (ok) {
+            if (ownerOut) {
+                ownerOut->resize(GetLengthSid(owner));
+                ok = CopySid(static_cast<DWORD>(ownerOut->size()), ownerOut->data(), owner) != FALSE;
+            } else {
+                ok = !ownerSid.empty() && EqualSid(owner, ownerSid.data());
+            }
+        }
+        void* ace = nullptr;
+        if (ok) ok = GetAce(dacl, 0, &ace) && static_cast<ACE_HEADER*>(ace)->AceType == ACCESS_ALLOWED_ACE_TYPE;
+        if (ok) {
+            PSID user = reinterpret_cast<TOKEN_USER*>(tokenUser.data())->User.Sid;
+            ok = EqualSid(&static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart, user) != FALSE;
+        }
+        LocalFree(psd);
+        return ok;
+    }
+
+    // Stops serving for good: no more connections, every open connection is closed. FatalError() reports it.
+    void Fatal(std::string message)
+    {
+        {
+            std::lock_guard lock(fatalMutex);
+            if (fatalError.empty()) fatalError = std::move(message);
+        }
+        SetEvent(stopEvent.h);
+        std::lock_guard lock(recordsMutex);
+        for (auto& r : records) r.conn->Cancel();
+    }
+
+    // A further, verified instance; nullptr on a transient failure. On a security failure, calls Fatal and returns
+    // INVALID_HANDLE_VALUE.
+    HANDLE NewInstance()
+    {
+        HANDLE h = CreateInstance(false);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_ACCESS_DENIED) {
+                Fatal("pipe instance: access denied (the pipe name was taken over)");
+                return INVALID_HANDLE_VALUE;
+            }
+            return nullptr;
+        }
+        if (!CheckInstance(h, nullptr)) {
+            CloseHandle(h);
+            Fatal("pipe instance: wrong owner or DACL (the pipe name was taken over)");
+            return INVALID_HANDLE_VALUE;
+        }
+        return h;
     }
 
     bool Stopping() const { return WaitForSingleObject(stopEvent.h, 0) == WAIT_OBJECT_0; }
@@ -300,76 +434,100 @@ struct PipeServer::Impl {
         }
         active.fetch_add(1);
         std::lock_guard lock(recordsMutex);
-        Record& rec = records.emplace_back();
-        rec.conn = conn;
         try {
-            rec.thread = std::thread([this, conn, &rec] { Serve(conn, rec.done); });
+            Record& rec = records.emplace_back();
+            rec.conn = conn;
+            try {
+                rec.thread = std::thread([this, conn, &rec] { Serve(conn, rec.done); });
+            } catch (...) {
+                records.pop_back();
+                throw;
+            }
         } catch (...) {
             conn->Finish();
-            records.pop_back();
             active.fetch_sub(1);
         }
     }
 
+    // The pipe name never disappears while serving: a failed connect reuses its instance (DisconnectNamedPipe), and
+    // the next listening instance is created before a connected one is handed to its thread. Only at the 8-instance
+    // cap is there no listener; every instance made without FILE_FLAG_FIRST_PIPE_INSTANCE is verified (CheckInstance).
     void AcceptLoop(HANDLE firstInstance)
     {
         Handle instance(firstInstance);
-        Handle connectEvent;
         try {
-            connectEvent.reset(NewEvent());
-        } catch (...) {
-            return;
-        }
-        for (;;) {
-            if (!instance) {
-                // Wait for a free slot (the listening instance counts as one of the 8).
-                while (active.load() >= kMaxInstances) {
-                    const HANDLE waits[2] = {stopEvent.h, slotEvent.h};
-                    if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) return;
-                    Reap();
-                }
-                if (Stopping()) return;
-                instance.reset(CreateInstance(false));
+            Handle connectEvent(NewEvent());
+            for (;;) {
                 if (!instance) {
-                    instance.release();   // INVALID_HANDLE_VALUE: nothing to close
-                    if (WaitForSingleObject(stopEvent.h, 100) == WAIT_OBJECT_0) return;
+                    while (active.load() >= kMaxInstances) {   // the listening instance counts as one of the 8
+                        const HANDLE waits[2] = {stopEvent.h, slotEvent.h};
+                        if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) return;
+                        Reap();
+                    }
+                    if (Stopping()) return;
+                    HANDLE h = NewInstance();
+                    if (h == INVALID_HANDLE_VALUE) return;   // fatal
+                    if (!h) {
+                        if (WaitForSingleObject(stopEvent.h, 100) == WAIT_OBJECT_0) return;
+                        continue;
+                    }
+                    instance.reset(h);
+                }
+
+                OVERLAPPED ov{};
+                ov.hEvent = connectEvent.h;
+                ResetEvent(connectEvent.h);
+                bool connected = false;
+                bool clientLeft = false;
+                if (ConnectNamedPipe(instance.h, &ov)) {
+                    connected = true;
+                } else {
+                    const DWORD err = GetLastError();
+                    if (err == ERROR_PIPE_CONNECTED) {
+                        connected = true;
+                    } else if (err == ERROR_IO_PENDING) {
+                        connected = FinishOverlapped(instance.h, ov, stopEvent.h).has_value();
+                        if (!connected && Stopping()) return;   // the instance closes with `instance`
+                        clientLeft = true;
+                    } else {
+                        clientLeft = err == ERROR_NO_DATA;   // the client already left
+                    }
+                }
+                if (!connected) {
+                    // Reuse this instance: closing it could remove the pipe name.
+                    DisconnectNamedPipe(instance.h);
+                    if (!clientLeft && WaitForSingleObject(stopEvent.h, 50) == WAIT_OBJECT_0) return;
                     continue;
                 }
-            }
 
-            OVERLAPPED ov{};
-            ov.hEvent = connectEvent.h;
-            ResetEvent(connectEvent.h);
-            bool connected = false;
-            if (ConnectNamedPipe(instance.h, &ov)) {
-                connected = true;
-            } else {
-                const DWORD err = GetLastError();
-                if (err == ERROR_PIPE_CONNECTED) {
-                    connected = true;
-                } else if (err == ERROR_IO_PENDING) {
-                    const auto r = FinishOverlapped(instance.h, ov, stopEvent.h);
-                    connected = r.has_value();
-                    if (!connected && Stopping()) return;   // instance closes with `instance`
+                HANDLE next = nullptr;
+                if (active.load() + 1 < kMaxInstances) {
+                    next = NewInstance();
+                    if (next == INVALID_HANDLE_VALUE) return;   // fatal; the connected instance closes unused
                 }
-                // ERROR_NO_DATA (the client already left) or another error: drop this instance, make another.
-            }
-            if (connected)
                 Spawn(instance.release());
-            else
-                instance.reset();
-            Reap();
-            if (Stopping()) return;
+                instance.reset(next);
+                Reap();
+                if (Stopping()) return;
+            }
+        } catch (const std::exception& e) {
+            Fatal(std::string("pipe acceptor: ") + e.what());
+        } catch (...) {
+            Fatal("pipe acceptor: unknown error");
         }
     }
 
     // ---- Per connection ----
 
+    // The reader thread. It starts the connection's writer thread and, when the connection ends, lets the writer
+    // drain what is queued (for example the error reply before an R10 close) for up to kDrainMs, then closes.
     void Serve(std::shared_ptr<PipeConnection> conn, std::atomic<bool>& done)
     {
-        Handle readEvent;
+        constexpr DWORD kDrainMs = 2000;
+        std::thread writer;
         try {
-            readEvent.reset(NewEvent());
+            writer = std::thread([conn] { conn->WriterLoop(); });
+            Handle readEvent(NewEvent());
             bool authed = false;
             std::string body;
             for (;;) {
@@ -384,8 +542,12 @@ struct PipeServer::Impl {
         } catch (...) {
             // Out of memory or similar: drop just this connection.
         }
+        if (writer.joinable()) {
+            conn->BeginClosing();
+            if (WaitForSingleObject(writer.native_handle(), kDrainMs) != WAIT_OBJECT_0) conn->Cancel();
+            writer.join();
+        }
         conn->Finish();
-        readEvent.reset();
         done.store(true);
         active.fetch_sub(1);
         SetEvent(slotEvent.h);
@@ -506,6 +668,10 @@ void PipeServer::Start()
     d.slotEvent.reset(slot);
     HANDLE first = d.CreateInstance(true);
     if (first == INVALID_HANDLE_VALUE) throw std::runtime_error(Win32Message("CreateNamedPipeW", GetLastError()));
+    if (!d.CheckInstance(first, &d.ownerSid)) {   // records the owner later instances must have
+        CloseHandle(first);
+        throw std::runtime_error("CreateNamedPipeW: the first instance's security descriptor is not ours");
+    }
     try {
         d.acceptor = std::thread([&d, first] { d.AcceptLoop(first); });
     } catch (...) {
@@ -531,6 +697,12 @@ void PipeServer::Stop()
     for (auto& r : all) r.conn->Cancel();
     for (auto& r : all)
         if (r.thread.joinable()) r.thread.join();
+}
+
+std::string PipeServer::FatalError() const
+{
+    std::lock_guard lock(impl_->fatalMutex);
+    return impl_->fatalError;
 }
 
 std::wstring PipeServer::RandomPipeName()

@@ -28,6 +28,9 @@ _PeekNamedPipe = _kernel32.PeekNamedPipe
 _PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
                            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 _PeekNamedPipe.restype = wintypes.BOOL
+_GetNamedPipeServerProcessId = _kernel32.GetNamedPipeServerProcessId
+_GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
+_GetNamedPipeServerProcessId.restype = wintypes.BOOL
 
 
 def exe_path():
@@ -50,7 +53,9 @@ class ConnectionClosed(Exception):
 class Connection:
     """One pipe connection. call() returns the result or raises RpcError; notifications are queued."""
 
-    def __init__(self, pipe_name, open_timeout=5.0):
+    def __init__(self, pipe_name, open_timeout=5.0, server_pid=None):
+        """server_pid: the announced pid. The pipe's server process must be it, or the connection is refused before
+        anything (a token) is sent: another process may have taken over the pipe name."""
         deadline = time.monotonic() + open_timeout
         while True:
             try:
@@ -61,6 +66,12 @@ class Connection:
                     raise
                 time.sleep(0.05)
         self._handle = msvcrt.get_osfhandle(self._file.fileno())
+        if server_pid is not None:
+            pid = wintypes.ULONG(0)
+            if not _GetNamedPipeServerProcessId(self._handle, ctypes.byref(pid)) or pid.value != server_pid:
+                self._file.close()
+                raise ConnectionError("pipe server process is {}, not the announced pid {}".format(pid.value,
+                                                                                                 server_pid))
         self._write_lock = threading.Lock()
         self._next_id = 1
         self._replies = {}
@@ -253,7 +264,7 @@ class Harness:
 
     def open_raw(self):
         """A connection that has not said hello."""
-        conn = Connection(self.pipe)
+        conn = Connection(self.pipe, server_pid=self.pid)
         self._connections.append(conn)
         return conn
 

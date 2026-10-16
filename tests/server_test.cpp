@@ -115,6 +115,7 @@ TEST_CASE("server: the announcement is one JSON line with the pipe, both tokens 
 
     PipeClient c;
     CHECK(c.Open(s.announcement.pipe));
+    CHECK(c.ServerPid() == s.announcement.pid);   // the pipe is served by the announced process
 }
 
 TEST_CASE("server: --serve with CLI-mode options exits 2")
@@ -296,6 +297,52 @@ TEST_CASE("server: a truncated message closes only that connection")
     CHECK(op->StaysOpen(200ms));
     REQUIRE(op->SendBody("{not json"));
     CHECK(ErrorCode(op->ReadAnyReply()) == -32700);   // the other connection is still served
+    CheckServerStillServes(s);
+}
+
+TEST_CASE("server: a client that never reads does not block the server and is closed at a 64 MiB backlog")
+{
+    Server s = StartServer();
+    auto other = Connect(s, "operator");
+    auto stalled = Connect(s, "agent");
+    // Each invalid request echoes its 1 MiB string id in a -32600 reply, which this client never reads. A server
+    // whose sends block stops reading after the first reply fills the pipe, and these writes then time out.
+    const std::vector<uint8_t> frame =
+        PipeClient::Frame(json{{"jsonrpc", "2.0"}, {"id", std::string(1024 * 1024, 'x')}}.dump());
+    enum class W { Ok, Timeout, Closed };
+    const auto write = [&](std::chrono::milliseconds timeout) {
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        OVERLAPPED ov{};
+        ov.hEvent = ev;
+        W result = W::Ok;
+        DWORD done = 0;
+        if (!WriteFile(stalled->Handle(), frame.data(), DWORD(frame.size()), nullptr, &ov) &&
+            GetLastError() != ERROR_IO_PENDING) {
+            result = W::Closed;
+        } else if (WaitForSingleObject(ev, DWORD(timeout.count())) != WAIT_OBJECT_0) {
+            CancelIoEx(stalled->Handle(), &ov);
+            GetOverlappedResult(stalled->Handle(), &ov, &done, TRUE);
+            result = W::Timeout;
+        } else if (!GetOverlappedResult(stalled->Handle(), &ov, &done, FALSE) || done != frame.size()) {
+            result = W::Closed;
+        }
+        CloseHandle(ev);
+        return result;
+    };
+    W last = W::Ok;
+    int sent = 0;
+    for (; sent < 100 && last == W::Ok; ++sent) {
+        last = write(5s);
+        if (sent == 32) {   // about 32 MiB queued for the stalled client: the other connection is served promptly
+            const auto t0 = std::chrono::steady_clock::now();
+            CHECK(ErrorCode(other->Call("no_such_method", json::object(), 2s)) == -32601);
+            CHECK(std::chrono::steady_clock::now() - t0 < 2s);
+        }
+    }
+    INFO("requests written: " << sent);
+    CHECK(last != W::Timeout);   // the server kept reading
+    CHECK((last == W::Closed || stalled->WaitClosed(10s)));
+    CHECK(sent > 60);   // not closed before the backlog reached 64 MiB
     CheckServerStillServes(s);
 }
 

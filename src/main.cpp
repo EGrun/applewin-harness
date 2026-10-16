@@ -1,7 +1,9 @@
 #include "host/emulator.h"
 #include "core/png_writer.h"
 #include "core/sha256.h"
+#include "core/working_copy.h"
 #include <windows.h>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -9,6 +11,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -16,14 +19,26 @@ constexpr int kExitOk = 0;
 constexpr int kExitFailure = 1;
 constexpr int kExitUsage = 2;
 
+struct Step {
+    enum Kind { Frames, Type } kind = Frames;
+    uint32_t frames = 0;
+    std::string text;
+};
+
 struct Args {
-    uint32_t bootFrames = 0;
+    bool headless = false;
+    bool realtime = false;
+    std::optional<std::filesystem::path> disk1;
     std::optional<std::filesystem::path> png;
+    std::vector<Step> steps;
 };
 
 int Usage()
 {
-    std::cerr << "usage: AppleWinHarness.exe --boot-frames <n> [--png <path>]\n";
+    std::cerr << "usage: AppleWinHarness.exe [--headless] [--realtime] [--disk1 <image>] [--png <path>] [step ...]\n"
+                 "step: --frames <n> | --type <text>\n"
+                 "  --type escapes: \\r and \\n = Return, \\\\ = backslash; text is 0x20-0x7E.\n"
+                 "  --headless needs at least one step; without steps a window runs until closed.\n";
     return kExitUsage;
 }
 
@@ -39,21 +54,73 @@ bool ParseFrames(const std::wstring& s, uint32_t& out)
     return true;
 }
 
-bool ParseArgs(int argc, wchar_t** argv, Args& a)
+// Decodes escapes and narrows to bytes; rejects empty text, bad escapes and characters outside 0x20-0x7E.
+bool ParseTypeText(const std::wstring& s, std::string& out)
 {
-    bool haveFrames = false;
-    for (int i = 1; i < argc; ++i) {
-        std::wstring k = argv[i];
-        if (k == L"--boot-frames" && i + 1 < argc && !haveFrames) {
-            if (!ParseFrames(argv[++i], a.bootFrames)) return false;
-            haveFrames = true;
-        } else if (k == L"--png" && i + 1 < argc && !a.png) {
-            a.png = std::filesystem::path(argv[++i]);
+    out.clear();
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (c == L'\\') {
+            if (++i >= s.size()) return false;
+            if (s[i] == L'r' || s[i] == L'n') out.push_back('\r');
+            else if (s[i] == L'\\') out.push_back('\\');
+            else return false;
+        } else if (c >= 0x20 && c <= 0x7E) {
+            out.push_back(char(c));
         } else {
             return false;
         }
     }
-    return haveFrames;
+    return !out.empty();
+}
+
+bool ParseArgs(int argc, wchar_t** argv, Args& a)
+{
+    bool haveHeadless = false, haveRealtime = false;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring k = argv[i];
+        const bool hasValue = i + 1 < argc;
+        if (k == L"--headless" && !haveHeadless) {
+            haveHeadless = a.headless = true;
+        } else if (k == L"--realtime" && !haveRealtime) {
+            haveRealtime = a.realtime = true;
+        } else if (k == L"--disk1" && hasValue && !a.disk1) {
+            a.disk1 = std::filesystem::path(argv[++i]);
+        } else if (k == L"--png" && hasValue && !a.png) {
+            a.png = std::filesystem::path(argv[++i]);
+        } else if (k == L"--frames" && hasValue) {
+            Step s;
+            s.kind = Step::Frames;
+            if (!ParseFrames(argv[++i], s.frames)) return false;
+            a.steps.push_back(std::move(s));
+        } else if (k == L"--type" && hasValue) {
+            Step s;
+            s.kind = Step::Type;
+            if (!ParseTypeText(argv[++i], s.text)) return false;
+            a.steps.push_back(std::move(s));
+        } else {
+            return false;
+        }
+    }
+    return !(a.headless && a.steps.empty());
+}
+
+// Throws on failure; returns false if the window was closed.
+bool RunSteps(harness::Emulator& emu, const Args& a)
+{
+    const auto pacing = a.realtime ? harness::Pacing::Realtime : harness::Pacing::Stepped;
+    for (const Step& s : a.steps) {
+        bool open = s.kind == Step::Frames ? emu.RunFrames(s.frames, pacing) : emu.TypeText(s.text, pacing);
+        if (!open) return false;
+    }
+    return true;
+}
+
+// Ejects the working-copy disk first so AppleWin closes the file and the copy can be deleted.
+void ReleaseEmulator(harness::Emulator& emu, const Args& a)
+{
+    if (a.disk1) { try { emu.EjectDisk(0); } catch (...) {} }
+    try { emu.Shutdown(); } catch (...) {}
 }
 
 int Run(const Args& a)
@@ -63,21 +130,43 @@ int Run(const Args& a)
     fs::path ini;
     int rc = kExitOk;
     try {
+        const std::string pid = std::to_string(GetCurrentProcessId());
         fs::path dir = fs::temp_directory_path() / "applewin-harness";
         fs::create_directories(dir);
-        ini = fs::absolute(dir / (std::to_string(GetCurrentProcessId()) + ".ini"));
+        ini = fs::absolute(dir / (pid + ".ini"));
+        std::optional<harness::WorkingCopy> copy;   // destroyed after the try block, i.e. on every exit path
         harness::EmulatorConfig cfg;
         cfg.configIni = ini;
-        cfg.display = harness::DisplayMode::Headless;   // M1 command line until the M2 CLI lands
-        emu.Start(cfg);
-        emu.RunFrames(a.bootFrames);
-        harness::FrameView frame = emu.Frame();
-        if (a.png && !harness::WritePngFile(*a.png, frame)) {
-            std::cerr << "error: cannot write " << a.png->string() << "\n";
-            rc = kExitFailure;
-        } else {
-            std::cout << "sha256 " << harness::FrameHash(frame) << "\n";
+        cfg.display = a.headless ? harness::DisplayMode::Headless : harness::DisplayMode::Windowed;
+        if (a.disk1) {
+            copy.emplace(*a.disk1, fs::absolute(dir / pid));
+            cfg.disk1 = copy->Path();
         }
+        try {
+            emu.Start(cfg);
+            if (a.steps.empty()) {
+                // Windowed, no steps: run until the window is closed.
+                while (emu.RunRealtime(std::chrono::milliseconds(100))) {}
+            } else if (!RunSteps(emu, a)) {
+                std::cerr << "error: window closed\n";
+                rc = kExitFailure;
+            } else {
+                harness::FrameView frame = emu.Frame();
+                if (a.png && !harness::WritePngFile(*a.png, frame)) {
+                    std::cerr << "error: cannot write " << a.png->string() << "\n";
+                    rc = kExitFailure;
+                } else {
+                    std::cout << "sha256 " << harness::FrameHash(frame) << "\n";
+                    if (emu.SoundActive())
+                        std::cout << "audio underruns " << emu.SoundUnderruns() << "\n";
+                    std::cout.flush();
+                }
+            }
+        } catch (...) {
+            ReleaseEmulator(emu, a);
+            throw;
+        }
+        ReleaseEmulator(emu, a);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         rc = kExitFailure;
@@ -85,7 +174,6 @@ int Run(const Args& a)
         std::cerr << "error: unknown exception" << std::endl;
         rc = kExitFailure;
     }
-    try { emu.Shutdown(); } catch (...) {}
     std::error_code ec;
     if (!ini.empty()) fs::remove(ini, ec);
     return rc;

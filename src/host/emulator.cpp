@@ -1,6 +1,7 @@
 #include "host/emulator.h"
 #include "host/applewin_host.h"
 #include "host/harness_frame.h"
+#include "host/window.h"
 #include "core/pacing.h"
 
 #pragma warning(push, 3)
@@ -17,16 +18,20 @@
 #include "Keyboard.h"
 #include "Log.h"
 #include "Memory.h"
+#include "MockingboardCardManager.h"
 #include "NTSC.h"
 #include "RGBMonitor.h"
 #include "Speaker.h"
 #include "Utilities.h"
 #include "version.h"
+#include "Windows/DXSoundBuffer.h"
 #pragma warning(pop)
 
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -36,7 +41,8 @@ namespace harness {
 namespace {
 
 bool g_started = false;
-bool g_soundActive = false;   // set by the windowed start (Task 9) once DSInit() succeeded
+bool g_soundActive = false;   // windowed start, DSInit() succeeded: DirectSound is up and must be DSUninit()ed
+std::unique_ptr<Window> g_window;   // windowed mode only
 uint64_t g_cyclesAtPowerOn = 0;   // g_nCumulativeCycles at the last power-on (D10)
 
 HarnessFrame& HostFrame()
@@ -84,7 +90,8 @@ void Boot()
 
 constexpr uint32_t kTypeTimeoutFrames = 600;   // spec: TypeText gives up after 600 frames of emulated time
 
-// The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time.
+// The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
+// holds the sound rule and the window-closed rule for all three.
 // Stepped: period-sized steps, no pacing. Realtime (D9): a BurstBudget burst corrected by the speaker's cycle
 // feedback, then wait for the 1 ms tick.
 class Stepper {
@@ -114,17 +121,46 @@ public:
         ExecuteStep(uint32_t(cycles));
         if (realtime_)
             pacer_->WaitForTick();
-        return ShouldStop();
+        return WindowClosed();
     }
 
 private:
-    // Task 9: true once the window has been closed. There is no window yet.
-    static bool ShouldStop() { return false; }
+    // Window-closed rule (spec): when windowed, pump the window's messages after every step; the run stops once the
+    // window has been closed.
+    static bool WindowClosed()
+    {
+        if (!g_window)
+            return false;
+        g_window->Pump();
+        return g_window->Closed();
+    }
+
+    // Sound rule (D8): playback is unmuted only for the lifetime of a Realtime run, and muted again when the run
+    // returns or throws.
+    class RealtimeUnmute {
+    public:
+        explicit RealtimeUnmute(bool realtime) : active_(realtime && g_soundActive)
+        {
+            if (active_)
+                HostFrame().SetSoundMuted(false);
+        }
+        ~RealtimeUnmute()
+        {
+            if (active_)
+                HostFrame().SetSoundMuted(true);
+        }
+        RealtimeUnmute(const RealtimeUnmute&) = delete;
+        RealtimeUnmute& operator=(const RealtimeUnmute&) = delete;
+
+    private:
+        bool active_;
+    };
 
     bool realtime_;
     uint32_t period_;
     std::optional<BurstBudget> budget_;
     std::optional<RealtimePacer> pacer_;
+    RealtimeUnmute unmute_{realtime_};   // after realtime_; if the constructor body throws, its destructor re-mutes
 };
 
 // AppleWin seeds zero-page $4E/$4F (RNDL/RNDH) from rand() ^ timeGetTime() on every power-on (Memory.cpp
@@ -137,6 +173,53 @@ void PinPowerOnRandomness()
     BYTE* rnd = MemGetMainPtr(0x4E);
     rnd[0] = 0x20;   // AppleWin ORs 0x20 into both (Memory.cpp, "Pooyan" needs them non-zero); pin to that floor
     rnd[1] = 0x20;
+}
+
+// Releases every sound voice, DirectSound and the window: the windowed part of Shutdown (also used when a windowed Start
+// fails). DSUninit() asserts that no voice is left, so the speaker, every Mockingboard card's SSI263 voices and the
+// Mockingboard manager's voice are released first. Harmless in headless mode, and when called again.
+void ReleaseSoundAndWindow()
+{
+    SpkrDestroy();   // speaker voice and buffers (AppleWin calls it from WM_DESTROY); pairs with SpkrInitialize()
+    MockingboardCardManager& mbMgr = GetCardMgr().GetMockingboardCardMgr();
+    for (UINT slot = SLOT0; slot < NUM_SLOTS; ++slot) {
+        // MockingboardCard::Destroy() releases its SSI263 voices. Its cards are replaced by the next Start's
+        // LoadConfiguration() (CardManager::Insert always creates a new card), and its destructor tolerates a second call.
+        if (mbMgr.IsMockingboard(slot))
+            GetCardMgr().GetRef(slot).Destroy();
+    }
+    mbMgr.Destroy();
+    if (g_soundActive) {
+        DSUninit();
+        g_soundActive = false;
+    }
+    HarnessFrame& frame = HostFrame();
+    frame.SetPresentHook({});
+    frame.EnableSound(false);
+    frame.SetSoundMuted(false);
+    g_window.reset();
+    frame.g_hFrameWindow = nullptr;
+}
+
+// Windowed start, before the M1 startup (spec): window, g_hFrameWindow, DSInit(), then the sound decision.
+void StartWindowAndSound()
+{
+    HarnessFrame& frame = HostFrame();
+    g_window = std::make_unique<Window>(L"AppleWin Harness (view only)");
+    frame.g_hFrameWindow = g_window->Handle();
+    frame.SetPresentHook([] {
+        g_window->Show(HostFrame().PresentedFrame(false));
+        g_window->Pump();
+    });
+    if (DSInit()) {
+        g_bDisableDirectSound = false;
+        frame.EnableSound(true);
+        frame.SetSoundMuted(true);   // unmuted only during Realtime runs (D8)
+        g_soundActive = true;
+    } else {
+        std::cerr << "warning: no audio device; running without sound" << std::endl;
+        g_bDisableDirectSound = true;
+    }
 }
 
 }  // namespace
@@ -153,8 +236,6 @@ void Emulator::Start(const EmulatorConfig& config)
         throw std::logic_error("Emulator: already started");
     if (config.configIni.empty() || !config.configIni.is_absolute())
         throw std::invalid_argument("Emulator: configIni must be an absolute path");
-    if (config.display != DisplayMode::Headless)
-        throw std::logic_error("not implemented");   // Task 2 stub: only the M1 headless start exists so far
 
     // 1. Directories, config file (INI-only mode in Registry.cpp) and deterministic power-on memory.
     const std::string exeDir = ExeDirWithSeparator();
@@ -162,9 +243,16 @@ void Emulator::Start(const EmulatorConfig& config)
     g_sProgramDir = exeDir;
     g_sConfigFile = config.configIni.string();
     g_nMemoryClearType = MIP_ZERO;
-    // No sound (as AppleWin's -no-dsound switch). Speaker and Mockingboard skip DirectSound and never show
-    // the "unable to initialize a waveform output device" message box.
+    // Sound. Headless: none (as AppleWin's -no-dsound switch); speaker and Mockingboard skip DirectSound and never show
+    // the "unable to initialize a waveform output device" message box. Windowed: DirectSound if DSInit() succeeds.
     g_bDisableDirectSound = true;
+    // Any exception out of Start leaves the emulator stopped (failures after g_started go through Shutdown()); this
+    // also releases a window and DirectSound set up before the failure.
+    struct ReleaseIfNotStarted {
+        ~ReleaseIfNotStarted() { if (!g_started) ReleaseSoundAndWindow(); }
+    } releaseIfNotStarted;
+    if (config.display == DisplayMode::Windowed)
+        StartWindowAndSound();
 
     // 2. Version (AppleWin reads it from its exe's version resource; the harness uses version.h directly).
     SetAppleWinVersion(APPLEWIN_VERSION);
@@ -183,8 +271,8 @@ void Emulator::Start(const EmulatorConfig& config)
     JoyInitialize();
     VideoSwitchVideocardPalette(RGB_GetVideocard(), GetVideo().GetVideoType());
     GetFrame().Initialize(true);
-    // AppleWin calls SpkrInitialize() from WM_CREATE (window creation, skipped here). Without it the speaker
-    // sample buffer is null and the first SpkrUpdate() crashes.
+    // AppleWin calls SpkrInitialize() from WM_CREATE, after DSInit() (here: after the sound decision above). Without it
+    // the speaker sample buffer is null and the first SpkrUpdate() crashes.
     SpkrInitialize();
     // DebugInitialize() is deliberately NOT called (the spec lists it as skipped): its first statement,
     // GetConsoleFontDC(), calls Win32Frame::GetWin32Frame(), which throws std::bad_cast for a HarnessFrame. Its
@@ -218,8 +306,14 @@ void Emulator::Shutdown()
 {
     if (!g_started)
         return;
+    // Ruling R10: Shutdown owns releasing the disk images; otherwise AppleWin keeps the image files open.
+    if (GetCardMgr().QuerySlot(SLOT6) == CT_Disk2) {
+        Disk2InterfaceCard& card = Disk2Card();
+        card.EjectDisk(DRIVE_1);
+        card.EjectDisk(DRIVE_2);
+    }
     GetFrame().Destroy();
-    SpkrDestroy();   // pairs with SpkrInitialize() in Start (AppleWin calls it from WM_DESTROY)
+    ReleaseSoundAndWindow();   // every sound voice, then DSUninit() (windowed), then the window
     LogDone();
     g_started = false;
 }
@@ -239,7 +333,7 @@ bool Emulator::RunFrames(uint32_t frames, Pacing pacing)
     RequireStarted();
     if (frames == 0)
         return true;
-    Stepper stepper(pacing);   // Task 9: the sound unmute/mute rule for Realtime goes with this scope
+    Stepper stepper(pacing);   // Realtime: sound unmuted for this scope
     const uint64_t target = g_nCumulativeCycles + uint64_t(frames) * NTSC_GetCyclesPerFrame();
     while (g_nCumulativeCycles < target) {
         if (stepper.Step(target - g_nCumulativeCycles))
@@ -254,7 +348,7 @@ bool Emulator::RunRealtime(std::chrono::milliseconds wallTime)
     using clock = std::chrono::steady_clock;
     // The pacer catches up short stalls and drops time after long ones, so stop on elapsed wall-clock time (not a tick
     // count) to keep the run length honest.
-    Stepper stepper(Pacing::Realtime);   // Task 9: the sound unmute/mute rule goes with this scope
+    Stepper stepper(Pacing::Realtime);   // sound unmuted for this scope
     const auto start = clock::now();
     while (clock::now() - start < wallTime) {
         if (stepper.Step(UINT64_MAX))
@@ -277,7 +371,7 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
         if (u != 0x0D && (u < 0x20 || u > 0x7E))
             throw std::invalid_argument("TypeText: only 0x0D and 0x20-0x7E can be typed");
     }
-    Stepper stepper(pacing);   // Task 9: the sound unmute/mute rule for Realtime goes with this scope
+    Stepper stepper(pacing);   // Realtime: sound unmuted for this scope
     const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
     for (const char c : text) {
         const uint64_t giveUp = g_nCumulativeCycles + timeout;

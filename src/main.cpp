@@ -116,10 +116,9 @@ bool RunSteps(harness::Emulator& emu, const Args& a)
     return true;
 }
 
-// Ejects the working-copy disk first so AppleWin closes the file and the copy can be deleted.
-void ReleaseEmulator(harness::Emulator& emu, const Args& a)
+// Shutdown ejects the disks (AppleWin then closes the working copy, so it can be deleted).
+void ReleaseEmulator(harness::Emulator& emu)
 {
-    if (a.disk1) { try { emu.EjectDisk(0); } catch (...) {} }
     try { emu.Shutdown(); } catch (...) {}
 }
 
@@ -163,10 +162,10 @@ int Run(const Args& a)
                 }
             }
         } catch (...) {
-            ReleaseEmulator(emu, a);
+            ReleaseEmulator(emu);
             throw;
         }
-        ReleaseEmulator(emu, a);
+        ReleaseEmulator(emu);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         rc = kExitFailure;

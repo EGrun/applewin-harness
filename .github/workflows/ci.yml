@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        shell: pwsh
+        run: msbuild AppleWinHarness.sln -m -p:Configuration=${{ matrix.config }} -p:Platform=x64
+        # a failing msbuild exits non-zero, which fails the step
+
+      - name: Test (headless suites; windowed and audio need a desktop and sound device)
+        shell: pwsh
+        run: |
+          & "bin\x64\${{ matrix.config }}\HarnessTests.exe" "-tse=windowed,audio"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload harness temp files on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: applewin-harness-temp-${{ matrix.config }}
+          path: ${{ runner.temp }}/applewin-harness
+          if-no-files-found: ignore

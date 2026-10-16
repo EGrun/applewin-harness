@@ -2,7 +2,7 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0 is done (scaffolding). Next is the M1 spike, which hosts the AppleWin core headless. See [project.md](project.md).
+**Status:** M0 and M1 are done. M2 (window, sound, keyboard, disks) is implemented and awaiting human checks. See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
@@ -36,16 +36,39 @@ The executable is written to `bin\x64\<Configuration>\AppleWinHarness.exe`.
 
 ## Run
 ```
-AppleWinHarness.exe --boot-frames <n> [--png <path>]
+AppleWinHarness.exe [--headless] [--realtime] [--disk1 <image>] [--png <path>] [step ...]
+step: --frames <n> | --type <text>
 ```
-Boots an Apple //e Enhanced headless (no window, no sound), runs `n` frames as fast as possible, optionally saves the 560x384 screen to `<path>` as a PNG, and prints `sha256 <hash>` of the frame. Exit codes: 0 success, 2 bad arguments (usage on stderr), 1 any other failure (error on stderr).
+- Steps run in command-line order. `--frames n` runs `n` frames. `--type text` types the text on the emulated keyboard. Both run at authentic speed, paced to real time, with `--realtime`, and as fast as possible otherwise.
+- `--type` escapes: `` and `
+` both mean Return, and `\` means a backslash. Any other backslash sequence, an empty text, or a character outside `0x20`-`0x7E` is a usage error.
+- `--frames` takes 1-9 decimal digits.
+- `--disk1` boots from a working copy of the image in `%TEMP%pplewin-harness\<pid>\`. The original is never written to, and the copy is deleted on exit.
+- After the last step the harness writes the PNG if `--png` was given, prints `sha256 <hash>` of the frame, and, if sound is active, prints `audio underruns <n>`.
+- With no steps, windowed mode runs until you close the window and exits with 0. Headless mode with no steps is a usage error.
+- `--headless`, `--realtime`, `--disk1` and `--png` may each appear once. Closing the window during a run prints `error: window closed` and exits with 1.
+- Exit codes: 0 success, 2 bad arguments (usage on stderr), 1 any other failure.
 
-Display modes become available in M2:
+The default display mode is windowed: a view-only window shows the live Apple screen and plays its sound (keys and mouse clicks in the window do nothing). `--headless` opens no window and no audio device, for CI and batch runs (decision D8).
 
+Examples:
 ```
-AppleWinHarness.exe              # windowed (default): view-only window plus the Apple's sound
-AppleWinHarness.exe --headless   # no window or sound, for CI and batch runs
+:: windowed (default): live view-only window and sound until you close it
+AppleWinHarness.exe
+
+:: headless golden run: boot DOS 3.3 (720 frames), type PRINT 2+2, save the screen
+AppleWinHarness.exe --headless --disk1 "external\AppleWinin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT 2+2" --frames 60 --png out.png
+
+:: windowed, real time: the bell
+AppleWinHarness.exe --realtime --disk1 "external\AppleWinin\DOS 3.3 System Master - 680-0210-A.dsk" --frames 720 --type "PRINT CHR$(7)" --frames 120
 ```
+
+## Tests
+```
+bind\Debug\HarnessTests.exe                      :: everything
+bind\Debug\HarnessTests.exe -tse=windowed,audio  :: what CI runs
+```
+Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64 and runs `HarnessTests.exe -tse=windowed,audio`.
 
 ## License
 Not decided yet. The harness links AppleWin (GPL-2.0), so its license must be GPL-2.0-compatible (decision D6).

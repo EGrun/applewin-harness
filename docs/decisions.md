@@ -94,9 +94,10 @@ The harness runs in one of two display modes, chosen when it starts:
 - **Headless** (`--headless`): no window and no sound. Use it for CI, batch runs, and machines without a desktop or audio device.
 
 **How it works:**
-- Both modes use the same headless `FrameBase` implementation and the same harness-owned main loop (D2). The only differences are a small *presenter* and the sound output.
-- In windowed mode the presenter draws the latest frame with `StretchDIBits` and pumps window messages on the harness thread. Headless mode simply has no presenter.
-- Sound uses AppleWin's existing seam. AppleWin asks the frontend for each sound buffer through `FrameBase::CreateSoundBuffer`. In windowed mode the harness returns AppleWin's own DirectSound buffer (`Windows/DXSoundBuffer.cpp`), just as `Win32Frame` does. In headless mode it returns `nullptr`, which takes AppleWin's existing no-sound path (`DSGetSoundBuffer` in `SoundCore.cpp`).
+- Both modes use the same `FrameBase` implementation, `HarnessFrame` (renamed from the M1 headless frame), and the same harness-owned main loop (D2). The only differences are a small *presenter* and the sound output.
+- In windowed mode the presenter is the view-only `Window`: it draws the latest presented frame with `StretchDIBits` and pumps window messages on the harness thread. Headless mode simply has no presenter.
+- Sound uses AppleWin's existing seam. AppleWin asks the frontend for each sound buffer through `FrameBase::CreateSoundBuffer`. In windowed mode the harness returns AppleWin's own DirectSound buffer (`Windows/DXSoundBuffer.cpp`), just as `Win32Frame` does, wrapped in a `MonitoredSoundBuffer`. The wrapper mutes the buffer outside realtime runs (D8 rules below) and counts underruns. In headless mode it returns `nullptr`, which takes AppleWin's existing no-sound path (`DSGetSoundBuffer` in `SoundCore.cpp`).
+- **How underruns are measured:** the wrapper counts an underrun per buffer, only after playback has visibly started (the play cursor has moved). It mirrors AppleWin's unsafe-zone check (`SoundCore_ValidateAndAlignWriteOffset`): the end of the last committed write must not lie between the play and write cursors. The startup realignment of a freshly created buffer isn't an underrun.
 - AppleWin's own `Win32Frame` (with its menus, dialogs and message loop) is deliberately not reused. It would take control of the main loop away from the harness.
 
 **Rules:**
@@ -208,3 +209,12 @@ Sound can be an important cue for the agent: a bell on an error, a beep on a pro
 - A `sound_stopped` event fires once it has stayed below the threshold for a minimum time. It carries the duration, the peak level and an estimate of the dominant frequency, which is enough to tell a bell from a click or a tune.
 
 The API details are in `api_spec.md` (Sound section).
+
+## D13 — Pinned power-on randomness
+**Status:** Accepted
+
+At every power-on, AppleWin seeds the zero-page random bytes RNDL/RNDH (`$4E`/`$4F`) from `rand() ^ timeGetTime()` (`Memory.cpp`, ORed with `0x20` as a workaround for "Pooyan"). That made frame hashes alternate between runs of the same script.
+
+After `Start` and after each `PowerCycle`, the harness sets both bytes to `0x20` (AppleWin's floor value, so the Pooyan workaround still holds) and calls `srand(1)`.
+
+**Consequence:** runs are reproducible. Programs that read RNDL/RNDH at power-on see a fixed value rather than a random one. No AppleWin patch is needed.

@@ -80,8 +80,10 @@ Link the AppleWin core into the harness. Implement a minimal headless `FrameBase
 - If the core can't be separated from Win32 with a small patch set, revisit D2 (fallback: plugin inside AppleWin.exe).
 - Resolve D6 (licensing) before publishing.
 
-### M2 — Vertical slice, in-process
+### M2 — Vertical slice, in-process (implemented; awaiting human checks: golden PNG, bell)
 Add keyboard input and frame capture. Add the windowed presenter with sound, which is the default, and the `--headless` option (D8). Mount a DOS 3.3 disk as a working copy. Add a C++ test and CI.
+
+**Patch list:** still empty. M2 needed no AppleWin patches.
 
 **Acceptance:**
 - An automated test boots DOS 3.3 and types `PRINT 2+2⏎`. The captured frame matches a golden checksum.

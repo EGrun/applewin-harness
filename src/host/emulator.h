@@ -49,24 +49,25 @@ class Emulator {
 public:
     static Emulator& Instance();
 
-    // Windowed: creates the view-only Window and initialises DirectSound (muted). Headless: the M1 setup, no sound and
-    // no window. Both: host joysticks disabled; disk1 (if set) inserted writable in slot 6 drive 1 before boot. A
+    // Windowed: creates the view-only Window and opens AudioOutput on it (D14; if there is no audio device, prints
+    // "warning: no audio device; running without sound" to stderr and runs without playback). Headless: no window and
+    // no AudioOutput. Both: virtual sound buffers feed Audio(). Both: host joysticks disabled; disk1 (if set) inserted writable in slot 6 drive 1 before boot. A
     // startup FrameMessageBox (including an insert error) becomes the exception text. Throws std::logic_error if
     // already started.
     void Start(const EmulatorConfig&);
-    // Releases every sound voice before DSUninit(), then destroys the window. Safe to call twice; no-op if not started.
+    // Releases every sound voice before DSUninit(), then AudioOutput, then the window. Safe to call twice; no-op if not started.
     void Shutdown();
     void PowerCycle();                   // ResetMachineState() then boot; EmulatedCycles() counts from 0 again
     uint64_t EmulatedCycles() const;     // cycles since the last power-on (D10)
 
     // Runs exactly frames x NTSC_GetCyclesPerFrame() cycles (more only because of the last instruction), in steps of
-    // 1 ms or less. Realtime: BurstBudget + speaker feedback per step, paced by RealtimePacer (D9). Sound is unmuted
-    // only during a Realtime run. Returns false if the window was closed (checked after every step).
+    // 1 ms or less. Realtime: BurstBudget + AudioOutput feedback per step, paced by RealtimePacer (D9, D14).
+    // AudioOutput plays only during a Realtime run. Returns false if the window was closed (checked after every step).
     bool RunFrames(uint32_t frames, Pacing pacing = Pacing::Stepped);
-    bool RunRealtime(std::chrono::milliseconds wallTime);   // paced bursts; same feedback, unmute and close rules
+    bool RunRealtime(std::chrono::milliseconds wallTime);   // paced bursts; same feedback, playback and close rules
     // One open-ended realtime run, a step at a time (the server's Running state): each call runs one paced step of at
-    // most 1 ms. The pacing state (BurstBudget, RealtimePacer) and the sound unmute persist from one call to the next,
-    // so the long-run rate is exact; StopRealtime ends the run (and mutes), and the next call starts a fresh one. Any
+    // most 1 ms. The pacing state (BurstBudget, RealtimePacer) and playback persist from one call to the next,
+    // so the long-run rate is exact; StopRealtime ends the run (and stops playback), and the next call starts a fresh one. Any
     // other run, PowerCycle and Shutdown also end it. Returns false if the window was closed.
     bool RunRealtimeStep();
     void StopRealtime();   // no-op when no realtime run is open
@@ -114,7 +115,7 @@ public:
     // PowerCycle. Fed by the VirtualSoundBuffers AppleWin creates, in every mode.
     const AudioCapture& Audio() const;
 
-    // Windowed playback (AudioOutput, M3B Task 5). Until Task 5: 0 and false (windowed mode is silent, ruling B1).
+    // Windowed playback (AudioOutput, D14): its underrun count, and whether it exists (windowed with an audio device).
     uint64_t SoundUnderruns() const;
     bool SoundActive() const;
 private:

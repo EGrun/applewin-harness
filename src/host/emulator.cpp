@@ -2,6 +2,7 @@
 #include "host/applewin_host.h"
 #include "host/harness_frame.h"
 #include "host/window.h"
+#include "host/audio_output.h"
 #include "core/pacing.h"
 #include "core/audio_capture.h"
 
@@ -51,6 +52,7 @@ namespace {
 bool g_started = false;
 bool g_dsInitialized = false;   // DSInit() (D14: the harness's own, opens no device) succeeded; DSUninit() pending
 std::unique_ptr<Window> g_window;   // windowed mode only
+std::unique_ptr<AudioOutput> g_audioOutput;   // windowed mode with an audio device only (D14 playback)
 uint64_t g_cyclesAtPowerOn = 0;   // g_nCumulativeCycles at the last power-on (D10)
 std::function<void()> g_presentObserver;   // SetPresentObserver
 
@@ -344,9 +346,9 @@ void ProcessDueInput()
 
 // The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
 // holds the window-closed rule for all three.
-// Stepped: period-sized steps, no pacing. Realtime (D9): a BurstBudget burst corrected by the speaker's cycle
-// feedback, then wait for the 1 ms tick. With virtual sound buffers (D14) that feedback is always 0; M3B Task 5
-// replaces it with AudioOutput's feedback.
+// Stepped: period-sized steps, no pacing. Realtime (D9, D14): a BurstBudget burst corrected by AudioOutput's
+// feedback (none without an AudioOutput), then AudioOutput::Pump, then wait for the 1 ms tick. Playback is on for
+// the Stepper's lifetime when realtime, and off again when it is destroyed (returns, throws, window closed).
 class Stepper {
 public:
     explicit Stepper(Pacing pacing)
@@ -356,6 +358,7 @@ public:
             budget_.emplace(g_fCurrentCLK6502, std::chrono::milliseconds(1));
             pacer_.emplace();
             pacer_->Start();
+            playback_.Start();
         }
     }
 
@@ -365,7 +368,8 @@ public:
         ProcessDueInput();   // input takes effect at the start of the step (D10)
         uint64_t cycles;
         if (realtime_) {
-            const int64_t withFeedback = int64_t(budget_->Next()) + g_nCpuCyclesFeedback;
+            const int64_t feedback = g_audioOutput ? g_audioOutput->FeedbackCycles() : 0;
+            const int64_t withFeedback = int64_t(budget_->Next()) + feedback;
             cycles = withFeedback > 0 ? uint64_t(withFeedback) : 0;
         } else {
             cycles = period_;
@@ -373,8 +377,11 @@ public:
         if (cycles > remaining)
             cycles = remaining;
         ExecuteStep(uint32_t(cycles));
-        if (realtime_)
+        if (realtime_) {
+            if (g_audioOutput)
+                g_audioOutput->Pump(Capture(), CaptureClock());
             pacer_->WaitForTick();
+        }
         return WindowClosed();
     }
 
@@ -389,10 +396,34 @@ private:
         return g_window->Closed();
     }
 
+    // Sound rule (D14): AudioOutput plays only during a realtime run; SetPlaying(false) when the run ends or throws.
+    class Playback {
+    public:
+        Playback() = default;
+        Playback(const Playback&) = delete;
+        Playback& operator=(const Playback&) = delete;
+        void Start()
+        {
+            if (g_audioOutput) {
+                g_audioOutput->SetPlaying(true);
+                active_ = true;
+            }
+        }
+        ~Playback()
+        {
+            if (active_ && g_audioOutput)
+                g_audioOutput->SetPlaying(false);
+        }
+
+    private:
+        bool active_ = false;
+    };
+
     bool realtime_;
     uint32_t period_;
     std::optional<BurstBudget> budget_;
     std::optional<RealtimePacer> pacer_;
+    Playback playback_;   // last: stops playback first when the Stepper is destroyed
 };
 
 // The open-ended realtime run of RunRealtimeStep (null when none is open).
@@ -431,16 +462,20 @@ void ReleaseSoundAndWindow()
     HarnessFrame& frame = HostFrame();
     frame.SetPresentHook({});
     frame.SetAudioCapture(nullptr);
+    g_audioOutput.reset();   // before the window it was opened on
     g_window.reset();
     frame.g_hFrameWindow = nullptr;
 }
 
-// Windowed start, before the M1 startup (spec): the window and g_hFrameWindow. No DirectSound (D14): playback is
-// AudioOutput's (M3B Task 5).
+// Windowed start, before the M1 startup (spec): the window and g_hFrameWindow, then playback (D14): AudioOutput on
+// the window, or the M2 warning and no sound if there is no audio device.
 void StartWindow()
 {
     g_window = std::make_unique<Window>(L"AppleWin Harness (view only)");
     HostFrame().g_hFrameWindow = g_window->Handle();
+    g_audioOutput = AudioOutput::Open(g_window->Handle());
+    if (!g_audioOutput)
+        std::cerr << "warning: no audio device; running without sound" << std::endl;
 }
 
 }  // namespace
@@ -813,16 +848,16 @@ const AudioCapture& Emulator::Audio() const
     return Capture();
 }
 
-// Windowed playback is AudioOutput's (D14), which M3B Task 5 adds; until then there is none (ruling B1).
+// Windowed playback is AudioOutput's (D14).
 uint64_t Emulator::SoundUnderruns() const
 {
     RequireStarted();
-    return 0;
+    return g_audioOutput ? g_audioOutput->Underruns() : 0;
 }
 
 bool Emulator::SoundActive() const
 {
-    return false;
+    return g_started && g_audioOutput != nullptr;
 }
 
 }  // namespace harness

@@ -1,6 +1,7 @@
 #include "host/emulator.h"
 #include "host/applewin_host.h"
 #include "host/headless_frame.h"
+#include "core/pacing.h"
 
 #pragma warning(push, 3)
 #include "Interface.h"
@@ -20,6 +21,7 @@
 #include "version.h"
 #pragma warning(pop)
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 
@@ -161,10 +163,20 @@ void Emulator::RunFrames(uint32_t frames)
     }
 }
 
-void Emulator::RunRealtime(std::chrono::milliseconds)
+void Emulator::RunRealtime(std::chrono::milliseconds wallTime)
 {
     RequireStarted();
-    throw std::runtime_error("Emulator::RunRealtime: not implemented (Task 6)");
+    using clock = std::chrono::steady_clock;
+    // 1 ms bursts. The pacer catches up short stalls and drops time after long ones, so stop on elapsed wall-clock time
+    // (not a tick count) to keep the run length honest.
+    BurstBudget budget(g_fCurrentCLK6502, std::chrono::milliseconds(1));
+    RealtimePacer pacer;
+    pacer.Start();
+    const auto start = clock::now();
+    while (clock::now() - start < wallTime) {
+        ExecuteStep(budget.Next());
+        pacer.WaitForTick();
+    }
 }
 
 uint64_t Emulator::EmulatedCycles() const

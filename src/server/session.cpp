@@ -263,6 +263,8 @@ void Session::Dispatch(const Command& command)
         else if (m == "type_text") result = TypeText(conn, params);
         else if (m == "press_key") result = PressKey(conn, params);
         else if (m == "set_joystick") result = SetJoystick(conn, params);
+        else if (m == "get_audio") result = GetAudio(params);
+        else if (m == "subscribe_audio") result = SubscribeAudio(conn, params);
         else throw RpcError{kMethodNotFound, "method not found: " + m};
         reply = MakeResult(command.id, std::move(result));
     } catch (const RpcError& e) {
@@ -555,6 +557,18 @@ json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
     const uint64_t id = emulator_.QueueJoystick(change, uint32_t(duration));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
+}
+
+// ---- Agent audio (M3 Part B). Stubs until Tasks 3 and 4: -32603 "not implemented". ----
+
+json Session::GetAudio(const json&)
+{
+    throw std::logic_error("get_audio: not implemented");
+}
+
+json Session::SubscribeAudio(const ConnectionPtr&, const json&)
+{
+    throw std::logic_error("subscribe_audio: not implemented");
 }
 
 }  // namespace harness

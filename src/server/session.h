@@ -86,6 +86,8 @@ private:
     nlohmann::json TypeText(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json PressKey(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json SetJoystick(const ConnectionPtr& connection, const nlohmann::json& params);
+    nlohmann::json GetAudio(const nlohmann::json& params);                                         // M3B: stub
+    nlohmann::json SubscribeAudio(const ConnectionPtr& connection, const nlohmann::json& params);  // M3B: stub
 
     DisplayMode display_;
     Emulator& emulator_;

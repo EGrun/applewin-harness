@@ -1,12 +1,15 @@
-"""AppleWinHarness.exe --serve over its named pipe (spec: docs/specs/m3.md, Part A; pass conditions 1-5).
+"""AppleWinHarness.exe --serve over its named pipe (spec: docs/specs/m3.md, Parts A and B; pass conditions 1-5,
+7 and 8).
 
 Run: python -m unittest discover -s tests/python -v   (HARNESS_EXE selects the exe; default bin/x64/Debug).
 Windowed tests are skipped unless HARNESS_WINDOWED=1.
 """
 
+import array
 import base64
 import hashlib
 import json
+import math
 import os
 import struct
 import threading
@@ -442,6 +445,183 @@ class AgentMethodsTest(PipeTestCase):
                 result = agent.call("press_key", key=key, hold_ms=0)
                 self.assertIn("input_id", result)
         self.assertIn("input_id", agent.call("type_text", text="x" * 4095 + "\n"))
+
+
+# ---- Part B: agent audio (pass conditions 7 and 8; Review Focus 3 and 4) ----
+
+# The //e bell's pitch as captured from PRINT CHR$(7). Placeholder (the ROM BELL routine is ~1 kHz); M3B Task 4
+# measures it and records the value here and in the ledger.
+BELL_HZ = 1000.0
+SOUND_EVENTS = ("sound_started", "sound_stopped")
+
+
+def parse_wav(wav):
+    """(sample_rate, channels, bits, data bytes) of a canonical 44-byte-header PCM WAV."""
+    assert len(wav) >= 44, "WAV shorter than its header"
+    riff, riff_size, wave = struct.unpack("<4sI4s", wav[:12])
+    fmt, fmt_size, audio_format, channels, rate, byte_rate, align, bits = struct.unpack("<4sIHHIIHH", wav[12:36])
+    data_tag, data_size = struct.unpack("<4sI", wav[36:44])
+    assert (riff, wave, fmt, data_tag) == (b"RIFF", b"WAVE", b"fmt ", b"data"), "not a canonical WAV header"
+    assert (fmt_size, audio_format) == (16, 1), "not 16-byte PCM fmt"
+    assert riff_size == 36 + data_size and len(wav) == 44 + data_size, "WAV sizes are inconsistent"
+    assert byte_rate == rate * channels * bits // 8 and align == channels * bits // 8, "bad byte rate or block align"
+    return rate, channels, bits, wav[44:]
+
+
+def mono_ac_rms_db(pcm):
+    """AC RMS (mean subtracted) in dBFS of the mono mix (L + R) / 2 of interleaved stereo int16 bytes."""
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    mono = [(samples[i] + samples[i + 1]) / 2.0 for i in range(0, len(samples) - 1, 2)]
+    if not mono:
+        return float("-inf")
+    mean = sum(mono) / len(mono)
+    rms = math.sqrt(sum((v - mean) ** 2 for v in mono) / len(mono))
+    return 20.0 * math.log10(rms / 32768.0) if rms > 0 else float("-inf")
+
+
+def frames_for(start_cycle, end_cycle):
+    return (end_cycle - start_cycle) * 44100.0 / BASE_CLOCK_HZ
+
+
+class AudioTest(PipeTestCase):
+    def booted(self, harness):
+        """A stepped session that has booted DOS 3.3 (720 frames), and an agent connection."""
+        op = self.stepped_session(harness, disks=dos_disks())
+        op.call("step_frames", frames=720, timeout=60.0)
+        return op, harness.connect("agent")
+
+    def sound_events(self, agent):
+        return [n for n in agent.drain_notifications(quiet=0.5) if n.get("method") in SOUND_EVENTS]
+
+    def test_bell_headless(self):
+        """Pass condition 7."""
+        h = self.launch()
+        op, agent = self.booted(h)
+        now = op.call("step_frames", frames=1)["emulated_cycles"]
+        self.assertEqual(agent.call("subscribe_audio"), {})
+        agent.call("type_text", text="PRINT CHR$(7)\n", inter_key_delay_ms=0)
+        op.call("step_frames", frames=120)
+
+        events = self.sound_events(agent)
+        self.assertEqual([e["method"] for e in events], ["sound_started", "sound_stopped"], events)
+        started, stopped = events[0]["params"], events[1]["params"]
+        self.assertEqual(sorted(started), ["emulated_ms", "start_cycle"])
+        self.assertGreaterEqual(started["start_cycle"], now)
+        self.assertAlmostEqual(started["emulated_ms"], started["start_cycle"] * 1000.0 / BASE_CLOCK_HZ, delta=1.0)
+        self.assertEqual(sorted(stopped), ["dominant_hz", "duration_ms", "end_cycle", "peak_db", "start_cycle"])
+        self.assertEqual(stopped["start_cycle"], started["start_cycle"])
+        self.assertGreater(stopped["end_cycle"], stopped["start_cycle"])
+        self.assertAlmostEqual(stopped["duration_ms"],
+                               (stopped["end_cycle"] - stopped["start_cycle"]) * 1000.0 / BASE_CLOCK_HZ, delta=1.0)
+        self.assertGreaterEqual(stopped["duration_ms"], 50)
+        self.assertLessEqual(stopped["duration_ms"], 200)
+        self.assertAlmostEqual(stopped["dominant_hz"], BELL_HZ, delta=0.1 * BELL_HZ)
+        self.assertGreater(stopped["peak_db"], -50.0)
+
+        audio = agent.call("get_audio", from_cycle=started["start_cycle"], duration_ms=200)
+        self.assertEqual(audio["start_cycle"], started["start_cycle"])
+        self.assertEqual((audio["sample_rate"], audio["channels"], audio["format"]), (44100, 2, "WAV"))
+        self.assertAlmostEqual(audio["end_cycle"] - audio["start_cycle"], ms_to_cycles(200), delta=ms_to_cycles(1))
+        rate, channels, bits, pcm = parse_wav(base64.b64decode(audio["data"]))
+        self.assertEqual((rate, channels, bits), (44100, 2, 16))
+        self.assertAlmostEqual(len(pcm) // 4, frames_for(audio["start_cycle"], audio["end_cycle"]), delta=1.0)
+        self.assertGreater(mono_ac_rms_db(pcm), -30.0)
+
+    def test_audio_older_than_the_ring_gets_32009(self):
+        """Pass condition 7 (-32009) and Review Focus 4: the ring holds exactly the newest 30 s."""
+        h = self.launch()
+        op, agent = self.booted(h)
+        op.call("step_frames", frames=1200, timeout=60.0)   # ~32 s of emulated time in all
+        whole = agent.call("get_audio", duration_ms=30000, format="PCM16")   # the most recent 30 s: the whole ring
+        self.assertAlmostEqual(whole["end_cycle"] - whole["start_cycle"], ms_to_cycles(30000), delta=ms_to_cycles(1))
+        self.assertAlmostEqual(len(base64.b64decode(whole["data"])) // 4,
+                               frames_for(whole["start_cycle"], whole["end_cycle"]), delta=1.0)
+        self.assertRpcError(-32009, agent, "get_audio", from_cycle=0, duration_ms=10)
+        just_older = whole["end_cycle"] - ms_to_cycles(30000) - ms_to_cycles(10)
+        self.assertRpcError(-32009, agent, "get_audio", from_cycle=just_older, duration_ms=100)
+        oldest = agent.call("get_audio", from_cycle=whole["start_cycle"], duration_ms=100, format="PCM16")
+        self.assertEqual(oldest["start_cycle"], whole["start_cycle"])
+
+    def test_get_audio_edges(self):
+        """Review Focus 4, plus defaults, formats and parameter checks."""
+        h = self.launch()
+        agent0 = h.connect("agent")
+        self.assertRpcError(-32002, agent0, "get_audio")
+        self.assertRpcError(-32002, agent0, "subscribe_audio")
+        op = self.stepped_session(h)
+        now = op.call("step_frames", frames=120)["emulated_cycles"]
+        agent = h.connect("agent")
+
+        # A range past the newest sample is cut short.
+        start = now - ms_to_cycles(100)
+        cut = agent.call("get_audio", from_cycle=start, duration_ms=1000, format="PCM16")
+        self.assertEqual(cut["start_cycle"], start)
+        self.assertLessEqual(cut["end_cycle"], now)
+        self.assertGreater(cut["end_cycle"], now - ms_to_cycles(50))
+        self.assertEqual((cut["sample_rate"], cut["channels"], cut["format"]), (44100, 2, "PCM16"))
+        self.assertAlmostEqual(len(base64.b64decode(cut["data"])) // 4, frames_for(cut["start_cycle"], cut["end_cycle"]),
+                               delta=1.0)
+
+        # Defaults: the most recent 1000 ms, as WAV.
+        recent = agent.call("get_audio")
+        self.assertEqual(recent["format"], "WAV")
+        self.assertGreater(recent["end_cycle"], now - ms_to_cycles(50))
+        self.assertLessEqual(recent["end_cycle"], now)
+        self.assertAlmostEqual(recent["end_cycle"] - recent["start_cycle"], ms_to_cycles(1000), delta=ms_to_cycles(1))
+        rate, channels, bits, pcm = parse_wav(base64.b64decode(recent["data"]))
+        self.assertEqual((rate, channels, bits), (44100, 2, 16))
+        self.assertAlmostEqual(len(pcm) // 4, frames_for(recent["start_cycle"], recent["end_cycle"]), delta=1.0)
+
+        # WAV and PCM16 carry the same samples.
+        at = now - ms_to_cycles(1500)
+        wav = agent.call("get_audio", from_cycle=at, duration_ms=500, format="WAV")
+        raw = agent.call("get_audio", from_cycle=at, duration_ms=500, format="PCM16")
+        self.assertEqual((wav["start_cycle"], wav["end_cycle"]), (raw["start_cycle"], raw["end_cycle"]))
+        self.assertEqual(parse_wav(base64.b64decode(wav["data"]))[3], base64.b64decode(raw["data"]))
+
+        for bad in ({"duration_ms": 30001}, {"duration_ms": 0}, {"duration_ms": -1}, {"duration_ms": "1000"},
+                    {"format": "MP3"}, {"from_cycle": -1}):
+            with self.subTest(**{k: json.dumps(v) for k, v in bad.items()}):
+                self.assertRpcError(-32602, agent, "get_audio", **bad)
+        self.assertEqual(agent.call("get_audio", duration_ms=30000, format="PCM16")["format"], "PCM16")   # the limit
+
+        self.assertEqual(agent.call("subscribe_audio", threshold_db=-40.5, min_silence_ms=50), {})
+        self.assertRpcError(-32602, agent, "subscribe_audio", threshold_db="loud")
+        self.assertRpcError(-32602, agent, "subscribe_audio", min_silence_ms=-1)
+
+    def test_idle_dos_gives_no_sound_events(self):
+        """Review Focus 3: the speaker's idle DC level is not sound."""
+        h = self.launch()
+        op, agent = self.booted(h)
+        self.assertEqual(agent.call("subscribe_audio"), {})
+        op.call("step_frames", frames=300)   # 5 s
+        self.assertEqual(self.sound_events(agent), [])
+
+    def capture_bell(self, headless):
+        """The pass condition 8 script: boot DOS, PRINT CHR$(7), 120 frames; get_audio over a fixed cycle range."""
+        h = self.launch(headless=headless)
+        op, agent = self.booted(h)
+        agent.call("type_text", text="PRINT CHR$(7)\n", inter_key_delay_ms=0)
+        op.call("step_frames", frames=120)
+        audio = agent.call("get_audio", from_cycle=720 * CYCLES_PER_FRAME, duration_ms=1900, format="PCM16")
+        h.close()
+        return audio
+
+    def assertSameAudio(self, a, b):
+        self.assertEqual((a["start_cycle"], a["end_cycle"]), (b["start_cycle"], b["end_cycle"]))
+        pcm = base64.b64decode(a["data"])
+        self.assertGreater(mono_ac_rms_db(pcm), -40.0)   # the bell is in the range: not trivially equal silence
+        self.assertTrue(pcm == base64.b64decode(b["data"]), "captured audio differs between the runs")
+
+    def test_deterministic_audio(self):
+        """Pass condition 8 (headless): two processes, byte-identical audio over the same cycles."""
+        self.assertSameAudio(self.capture_bell(headless=True), self.capture_bell(headless=True))
+
+    @unittest.skipUnless(WINDOWED, "set HARNESS_WINDOWED=1 to run windowed tests")
+    def test_deterministic_audio_windowed(self):
+        """Pass condition 8: headless and windowed give the same audio."""
+        self.assertSameAudio(self.capture_bell(headless=True), self.capture_bell(headless=False))
 
 
 LAUNCHER = r'''

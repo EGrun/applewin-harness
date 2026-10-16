@@ -40,6 +40,12 @@
     <ClCompile Include="..\src\server\pipe_server.cpp" />
     <ClCompile Include="..\src\server\protocol.cpp" />
     <ClCompile Include="..\src\server\session.cpp" />
+    <ClCompile Include="..\src\core\audio_capture.cpp" />
+    <ClCompile Include="..\src\core\level_detector.cpp" />
+    <ClCompile Include="..\src\core\wav.cpp" />
+    <ClCompile Include="..\src\core\fft.cpp" />
+    <ClCompile Include="..\src\host\virtual_sound.cpp" />
+    <ClCompile Include="..\src\host\audio_output.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\core\frame_view.h" />
@@ -55,6 +61,12 @@
     <ClInclude Include="..\src\server\pipe_server.h" />
     <ClInclude Include="..\src\server\protocol.h" />
     <ClInclude Include="..\src\server\session.h" />
+    <ClInclude Include="..\src\core\audio_capture.h" />
+    <ClInclude Include="..\src\core\level_detector.h" />
+    <ClInclude Include="..\src\core\wav.h" />
+    <ClInclude Include="..\src\core\fft.h" />
+    <ClInclude Include="..\src\host\virtual_sound.h" />
+    <ClInclude Include="..\src\host\audio_output.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

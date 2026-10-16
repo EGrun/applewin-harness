@@ -12,6 +12,8 @@
 
 namespace harness {
 
+class AudioCapture;
+
 enum class DisplayMode { Windowed, Headless };
 enum class Pacing { Stepped, Realtime };
 
@@ -107,6 +109,10 @@ public:
     FrameView Frame(bool borders = false) const;   // the last presented frame (HarnessFrame::PresentedFrame)
     std::string ReadTextRow(int row) const;  // 40-column text page 1 row 0..23, each byte & 0x7F, as ASCII
     const std::vector<std::string>& Messages() const;  // FrameMessageBox calls so far
+
+    // The agent-audio timeline (D14): every sound voice, mixed, by emulated cycle since power-on; cleared by Start and
+    // PowerCycle. M3B Task 2 wires it (until then it is an empty stub capture).
+    const AudioCapture& Audio() const;
 
     uint64_t SoundUnderruns() const;
     bool SoundActive() const;            // true when windowed and DSInit() succeeded

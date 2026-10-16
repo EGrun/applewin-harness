@@ -3,6 +3,7 @@
 #include "host/harness_frame.h"
 #include "host/window.h"
 #include "core/pacing.h"
+#include "core/audio_capture.h"
 
 #pragma warning(push, 3)
 #include "StdAfx.h"
@@ -816,6 +817,13 @@ const std::vector<std::string>& Emulator::Messages() const
 {
     RequireStarted();
     return HostFrame().messages();
+}
+
+const AudioCapture& Emulator::Audio() const
+{
+    RequireStarted();
+    static const AudioCapture capture;   // stub (M3B Task 1); Task 2 makes the Emulator own and feed one
+    return capture;
 }
 
 uint64_t Emulator::SoundUnderruns() const

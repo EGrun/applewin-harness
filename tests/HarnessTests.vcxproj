@@ -41,6 +41,10 @@
     <ClCompile Include="input_queue_test.cpp" />
     <ClCompile Include="protocol_test.cpp" />
     <ClCompile Include="server_test.cpp" />
+    <ClCompile Include="audio_capture_test.cpp" />
+    <ClCompile Include="level_detector_test.cpp" />
+    <ClCompile Include="virtual_sound_test.cpp" />
+    <ClCompile Include="fft_test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\external\AppleWin\resource\Applewin.rc" />

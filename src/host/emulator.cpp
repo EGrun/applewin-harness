@@ -56,6 +56,13 @@ std::string ExeDirWithSeparator()
     return dir;
 }
 
+Disk2InterfaceCard& Disk2Card()
+{
+    if (GetCardMgr().QuerySlot(SLOT6) != CT_Disk2)
+        throw std::runtime_error("Emulator: no Disk II controller in slot 6");
+    return dynamic_cast<Disk2InterfaceCard&>(GetCardMgr().GetRef(SLOT6));
+}
+
 // Copy of the static ResetToLogoMode() in Windows/AppleWin.cpp.
 void ResetToLogoMode()
 {
@@ -85,7 +92,7 @@ void Emulator::Start(const EmulatorConfig& config)
         throw std::logic_error("Emulator: already started");
     if (config.configIni.empty() || !config.configIni.is_absolute())
         throw std::invalid_argument("Emulator: configIni must be an absolute path");
-    if (config.display != DisplayMode::Headless || !config.disk1.empty())
+    if (config.display != DisplayMode::Headless)
         throw std::logic_error("not implemented");   // Task 2 stub: only the M1 headless start exists so far
 
     // 1. Directories, config file (INI-only mode in Registry.cpp) and deterministic power-on memory.
@@ -109,6 +116,9 @@ void Emulator::Start(const EmulatorConfig& config)
     ResetToLogoMode();
     LoadConfiguration(true);
     SetApple2Type(A2TYPE_APPLE2EENHANCED);
+    // Host joysticks are never read (determinism): both ports disabled before JoyInitialize().
+    JoySetJoyType(JN_JOYSTICK0, J0C_DISABLED);
+    JoySetJoyType(JN_JOYSTICK1, J1C_DISABLED);
     JoyInitialize();
     VideoSwitchVideocardPalette(RGB_GetVideocard(), GetVideo().GetVideoType());
     GetFrame().Initialize(true);
@@ -133,7 +143,11 @@ void Emulator::Start(const EmulatorConfig& config)
         throw std::runtime_error(what);
     }
 
-    // 4. Boot.
+    // 4. Disk, then boot.
+    if (!config.disk1.empty()) {
+        try { InsertDisk(0, config.disk1); }
+        catch (...) { Shutdown(); throw; }
+    }
     Boot();
     g_cyclesAtPowerOn = g_nCumulativeCycles;
 }
@@ -204,14 +218,29 @@ bool Emulator::TypeText(std::string_view, Pacing)
     throw std::logic_error("not implemented");
 }
 
-void Emulator::InsertDisk(int, const std::filesystem::path&)
+void Emulator::InsertDisk(int drive, const std::filesystem::path& image)
 {
-    throw std::logic_error("not implemented");
+    RequireStarted();
+    if (drive < 0 || drive > 1)
+        throw std::out_of_range("Emulator: drive must be 0 or 1");
+    Disk2InterfaceCard& card = Disk2Card();
+    const size_t before = HostFrame().messages().size();
+    const ImageError_e err = card.InsertDisk(drive, image.string(), false, false);
+    if (err != eIMAGE_ERROR_NONE) {
+        std::string what = "Emulator: cannot insert " + image.string() + " (image error " + std::to_string(int(err)) + ")";
+        const auto& msgs = HostFrame().messages();
+        for (size_t i = before; i < msgs.size(); ++i)
+            what += "\n  " + msgs[i];
+        throw std::runtime_error(what);
+    }
 }
 
-void Emulator::EjectDisk(int)
+void Emulator::EjectDisk(int drive)
 {
-    throw std::logic_error("not implemented");
+    RequireStarted();
+    if (drive < 0 || drive > 1)
+        throw std::out_of_range("Emulator: drive must be 0 or 1");
+    Disk2Card().EjectDisk(drive);
 }
 
 uint64_t Emulator::PresentedFrames() const

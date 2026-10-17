@@ -117,7 +117,8 @@ Add `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `list_disks`, `exp
 - The checksums are also identical when the script runs at `machine_speed` 10 and at 40.
 - `get_audio` over the same cycle range returns byte-identical audio across those runs, and in both windowed and headless mode.
 - The original disk image's hash is unchanged.
-- SSI263 speech (Mockingboard) is covered by a determinism test, or pinned off for deterministic runs (D8 exception).
+- SSI263 speech (Mockingboard) is covered by an end-to-end determinism test that runs an MB/SSI263 program in both display modes (D14 removed the old D8 exception).
+- Audio capture is split-independent if checkpoint replay steps in different chunks: today the same step partition is required (ruling B13); anchoring each voice by its own cumulative sample count is the planned fix.
 
 ### M5 — Agent adapter
 Build an MCP server that wraps the agent API, and an example agent task (for example, write and run a short BASIC program).
@@ -135,7 +136,6 @@ Session record/replay, batch experiment orchestration, sector-level disk access.
 - **Maintaining a patch set against AppleWin upstream.** Mitigation: keep patches minimal and apply them on top of the pinned submodule commit (D7).
 - **GPL-2.0 obligations** (D6).
 - **Hidden sources of non-determinism**, such as the real-time clock, the no-slot clock, random memory initialisation, and AppleWin's speaker feedback (which changes how many cycles each burst runs, depending on the host audio buffer). Mitigation: speaker feedback only runs in windowed realtime mode, stepped mode has no feedback and pins or disables the rest (D9), and M4 tests for it.
-- **SSI263 speech is display-mode dependent.** Headless, the phoneme-complete IRQ never fires (no DirectSound). Windowed, it is partly driven by the DirectSound play position, so it depends on host timing (D8). Mitigation: M4 includes a determinism test for SSI263 speech, or pins speech off for deterministic runs.
 - **The replacement DXSoundBuffer TU must track AppleWin's interface** on submodule updates (D14). Mitigation: it is one small file, and the audio tests fail loudly if the interface drifts.
 - **Realtime input timing depends on when clients send input.** Mitigation: every input reports `applied_at_cycle` (D10). Use stepped mode when a run must be reproducible.
 - **Frame timing:** whole-frame capture at vsync may miss mid-frame effects. Accepted for now; per-scanline capture isn't planned.

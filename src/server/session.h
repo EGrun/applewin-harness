@@ -3,6 +3,7 @@
 // loop", "Agent methods", "Operator methods"). One session per process (P6).
 #include "core/level_detector.h"
 #include "host/emulator.h"
+#include "server/checkpoint_store.h"
 #include "server/pipe_server.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -72,6 +73,8 @@ private:
     struct AudioSubscription {
         ConnectionPtr connection;
         LevelDetector detector;
+        double thresholdDb = -50.0;      // kept so a restore can reset the detector
+        uint32_t minSilenceMs = 100;
     };
 
     // Main thread.
@@ -114,6 +117,8 @@ private:
     nlohmann::json ListDisks(const nlohmann::json& params);
     nlohmann::json ExportDisk(const nlohmann::json& params);
 
+    void RequireUsable() const;   // -32008 once a restore has failed in or after the load
+
     DisplayMode display_;
     Emulator& emulator_;
 
@@ -129,6 +134,10 @@ private:
     std::filesystem::path workDir_;   // %TEMP%\applewin-harness\<pid>
     std::filesystem::path ini_;       // %TEMP%\applewin-harness\<pid>.ini
     std::vector<std::unique_ptr<WorkingCopy>> copies_;
+    std::filesystem::path originals_[2];   // the user's images, by drive (0 or 1); empty when the drive had none
+    std::unique_ptr<CheckpointStore> checkpoints_;
+    uint64_t audioFloor_ = 0;   // get_audio refuses cycles before this: the restored checkpoint's cycle
+    bool unusable_ = false;   // a restore failed in or after Snapshot_LoadState: run commands reply -32008
     std::map<uint64_t, ConnectionPtr> inputOwners_;   // input_id -> the connection that receives input_applied
     std::map<uint64_t, FrameSubscription> frameSubscriptions_;   // by connection id
     std::map<uint64_t, AudioSubscription> audioSubscriptions_;   // by connection id

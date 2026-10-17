@@ -306,9 +306,16 @@ void Session::SendInputApplied()
         const ConnectionPtr conn = it->second;
         inputOwners_.erase(it);
         try {
-            conn->Send(MakeNotification("input_applied", json{{"input_id", a.inputId},
-                                                              {"first_cycle", a.firstCycle},
-                                                              {"last_cycle", a.lastCycle}}));
+            json params{{"input_id", a.inputId}};
+            if (a.discarded) {   // ruling D1
+                params["first_cycle"] = nullptr;
+                params["last_cycle"] = nullptr;
+                params["discarded"] = true;
+            } else {
+                params["first_cycle"] = a.firstCycle;
+                params["last_cycle"] = a.lastCycle;
+            }
+            conn->Send(MakeNotification("input_applied", params));
         } catch (...) {
         }
     }
@@ -365,6 +372,7 @@ void Session::Cleanup() noexcept
         state_ = State::NoSession;
     }
     copies_.clear();   // each WorkingCopy deletes its file
+    checkpoints_.reset();
     std::error_code ec;
     if (!workDir_.empty()) fs::remove_all(workDir_, ec);
     if (!ini_.empty()) fs::remove(ini_, ec);
@@ -451,6 +459,11 @@ json Session::CreateSession(const json& params)
         throw RpcError{kInternalError, what};
     }
 
+    originals_[0] = images[0];
+    originals_[1] = images[1];
+    checkpoints_ = std::make_unique<CheckpointStore>(workDir_);
+    unusable_ = false;
+    audioFloor_ = 0;
     realtime_ = runMode == "realtime";
     state_ = realtime_ ? State::Running : State::Paused;
     return json{{"session_id", "1"}};   // one session per process (P6)
@@ -475,6 +488,7 @@ json Session::Pause(const json&)
 json Session::Resume(const json&)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     if (!realtime_) throw RpcError{kInvalidState, "resume is only valid in a realtime session"};
     if (state_ == State::Paused) {
         emulator_.StopRealtime();   // the next step starts a fresh paced run
@@ -486,6 +500,7 @@ json Session::Resume(const json&)
 json Session::StepFrames(const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     const uint64_t frames = GetUint(params, "frames", 1, kMaxStepFrames, std::nullopt);
     bool open = PauseRunning();
     if (open) open = emulator_.RunFrames(uint32_t(frames), Pacing::Stepped);
@@ -614,6 +629,7 @@ json Session::SubscribeFrames(const ConnectionPtr& connection, const json& param
 json Session::TypeText(const ConnectionPtr& connection, const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     std::string text = GetString(params, "text", std::nullopt);
     for (char& c : text) {
         const unsigned char u = static_cast<unsigned char>(c);
@@ -631,6 +647,7 @@ json Session::TypeText(const ConnectionPtr& connection, const json& params)
 json Session::PressKey(const ConnectionPtr& connection, const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     const KeySpec key = ParseKey(params);
     const uint64_t hold = GetUint(params, "hold_ms", 0, kMaxMs, kDefaultHoldMs);
     const uint64_t id = emulator_.QueueKey(key, uint32_t(hold));
@@ -641,6 +658,7 @@ json Session::PressKey(const ConnectionPtr& connection, const json& params)
 json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     const uint64_t joystick = GetUint(params, "joystick", 0, 1, 0);
     if (joystick == 1) throw RpcError{kNotSupported, "joystick 1 is not supported"};
     JoystickChange change;
@@ -679,7 +697,7 @@ json Session::GetAudio(const json& params)
 
     const AudioCapture& audio = emulator_.Audio();
     const uint64_t span = uint64_t(double(durationMs) * kAudioBaseClockHz / 1000.0);
-    const uint64_t newest = audio.NewestCycle(), oldest = audio.OldestCycle();
+    const uint64_t newest = audio.NewestCycle(), oldest = (std::max)(audio.OldestCycle(), audioFloor_);
     uint64_t start, end;
     if (fc) {
         start = fromCycle;
@@ -724,8 +742,10 @@ json Session::SubscribeAudio(const ConnectionPtr& connection, const json& params
     // Only sound from now on is reported; re-subscribing replaces the old subscription.
     audioSubscriptions_.erase(connection->id());
     audioSubscriptions_.emplace(connection->id(),
-                                AudioSubscription{connection, LevelDetector(thresholdDb, uint32_t(minSilenceMs),
-                                                                            emulator_.EmulatedCycles())});
+                                AudioSubscription{connection,
+                                                  LevelDetector(thresholdDb, uint32_t(minSilenceMs),
+                                                                emulator_.EmulatedCycles()),
+                                                  thresholdDb, uint32_t(minSilenceMs)});
     return json::object();
 }
 
@@ -766,22 +786,220 @@ void Session::SendSoundEvents()
     }
 }
 
-// ---- M4: checkpoints, state checksum, step_cycles, disks (docs/specs/m4.md). Stubs until M4 Task 3: -32603. ----
+// ---- M4: checkpoints, state checksum, step_cycles, disks (docs/specs/m4.md). ----
 
 namespace {
-[[noreturn]] void NotImplementedYet(const char* method)
+
+constexpr uint64_t kMaxStepCycles = 17030000;
+constexpr size_t kMaxCheckpointNameChars = CheckpointStore::kMaxNameChars;
+
+// The checkpoint name: a string of up to 64 printable characters (UTF-8 code points; no control characters).
+std::string ParseCheckpointName(const json& params)
 {
-    throw RpcError{kInternalError, std::string(method) + ": not implemented yet (M4 Task 3)"};
+    const json* f = Field(params, "name");
+    if (!f) return {};
+    if (!f->is_string()) InvalidParams("name must be a string");
+    const std::string s = f->get<std::string>();
+    size_t chars = 0;
+    for (const char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7F) InvalidParams("name must be printable characters");
+        if ((u & 0xC0) != 0x80) ++chars;   // not a UTF-8 continuation byte
+    }
+    if (chars > kMaxCheckpointNameChars) InvalidParams("name is limited to 64 characters");
+    return s;
 }
+
+// Lower-cased, absolute, normal form for path comparison on Windows (case-insensitive).
+std::wstring Canonical(const fs::path& p)
+{
+    std::error_code ec;
+    fs::path c = fs::weakly_canonical(p, ec);
+    if (ec) c = p.lexically_normal();
+    std::wstring w = c.wstring();
+    for (wchar_t& ch : w) ch = wchar_t(towlower(ch));
+    return w;
+}
+
+bool IsInside(const fs::path& child, const fs::path& dir)
+{
+    const std::wstring c = Canonical(child);
+    std::wstring d = Canonical(dir);
+    while (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+    return c.size() > d.size() && c.compare(0, d.size(), d) == 0 && (c[d.size()] == L'\\' || c[d.size()] == L'/');
+}
+
 }  // namespace
 
-json Session::Checkpoint(const json&) { NotImplementedYet("checkpoint"); }
-json Session::RestoreCheckpoint(const json&) { NotImplementedYet("restore_checkpoint"); }
-json Session::ListCheckpoints(const json&) { NotImplementedYet("list_checkpoints"); }
-json Session::DeleteCheckpoint(const json&) { NotImplementedYet("delete_checkpoint"); }
-json Session::GetStateChecksum(const json&) { NotImplementedYet("get_state_checksum"); }
-json Session::StepCycles(const json&) { NotImplementedYet("step_cycles"); }
-json Session::ListDisks(const json&) { NotImplementedYet("list_disks"); }
-json Session::ExportDisk(const json&) { NotImplementedYet("export_disk"); }
+void Session::RequireUsable() const
+{
+    if (unusable_)
+        throw RpcError{kInvalidState, "the session is unusable after a failed restore_checkpoint; close_session"};
+}
+
+json Session::Checkpoint(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    const std::string name = ParseCheckpointName(params);
+    if (checkpoints_->List().size() >= CheckpointStore::kMaxCheckpoints)
+        throw RpcError{kCheckpointFailed, "checkpoint limit reached (256)"};
+    if (!PauseRunning()) {   // M4-7: pause at the next present first
+        exitRequested_ = true;
+        throw RpcError{kInvalidState, "the window was closed"};
+    }
+    try {
+        const SnapshotMeta meta = emulator_.SaveSnapshot(checkpoints_->PendingStateFile());
+        emulator_.FlushDisks();
+        const CheckpointStore::Entry e = checkpoints_->Create(name, meta, emulator_.Disks());
+        state_ = State::Paused;   // SaveSnapshot ended the realtime run
+        return json{{"checkpoint_id", e.id}, {"emulated_cycles", meta.emulatedCycles}};
+    } catch (const std::exception& e) {
+        std::error_code ec;
+        fs::remove(checkpoints_->PendingStateFile(), ec);
+        throw RpcError{kCheckpointFailed, e.what()};
+    }
+}
+
+json Session::RestoreCheckpoint(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    const std::string id = GetString(params, "checkpoint_id", std::nullopt);
+    CheckpointStore::Entry entry;
+    try {
+        entry = checkpoints_->Get(id);
+    } catch (const std::out_of_range&) {
+        InvalidParams("unknown checkpoint: " + id);
+    }
+    if (!PauseRunning()) {
+        exitRequested_ = true;
+        throw RpcError{kInvalidState, "the window was closed"};
+    }
+
+    // Before the load (ruling D7): a failure leaves the session usable with its machine state unchanged.
+    const std::vector<DiskInfo> current = emulator_.Disks();
+    emulator_.EjectAll();
+    try {
+        checkpoints_->RestoreDisks(entry, current);
+    } catch (const std::exception& e) {
+        try { emulator_.ReinsertAll(); } catch (...) {}
+        throw RpcError{kCheckpointFailed, e.what()};
+    }
+    try {
+        emulator_.LoadSnapshot(entry.StateFile(), entry.meta);
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        // LoadSnapshot's own checks before the load throw "LoadSnapshot: ..." and change nothing; a failure in or after
+        // the load throws "Emulator::LoadSnapshot: ...".
+        if (what.rfind("LoadSnapshot:", 0) == 0) {
+            try { emulator_.ReinsertAll(); } catch (...) {}
+        } else {
+            unusable_ = true;
+            state_ = State::Paused;
+            SendInputApplied();   // the discarded inputs
+        }
+        throw RpcError{kCheckpointFailed, what};
+    }
+
+    // Restore purity owned by the session: discarded inputs reported (D1), detectors reset to the restored cycle.
+    SendInputApplied();
+    const uint64_t at = emulator_.EmulatedCycles();
+    audioFloor_ = at;   // audio from before the restore is gone (get_audio: -32009)
+    for (auto& [cid, sub] : audioSubscriptions_)
+        sub.detector = LevelDetector(sub.thresholdDb, sub.minSilenceMs, at);
+    state_ = State::Paused;   // both run modes; resume starts a fresh paced run
+    return json{{"emulated_cycles", at}};
+}
+
+json Session::ListCheckpoints(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    json list = json::array();
+    for (const CheckpointStore::Entry& e : checkpoints_->List())
+        list.push_back(json{{"checkpoint_id", e.id},
+                            {"name", e.name.empty() ? json(nullptr) : json(e.name)},
+                            {"created_at", e.createdAt},
+                            {"emulated_cycles", e.meta.emulatedCycles}});
+    return list;
+}
+
+json Session::DeleteCheckpoint(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const std::string id = GetString(params, "checkpoint_id", std::nullopt);
+    try {
+        checkpoints_->Delete(id);
+    } catch (const std::out_of_range&) {
+        InvalidParams("unknown checkpoint: " + id);
+    }
+    return json::object();
+}
+
+json Session::GetStateChecksum(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    return json{{"sha256", emulator_.StateChecksum()}, {"emulated_cycles", emulator_.EmulatedCycles()}};
+}
+
+json Session::StepCycles(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    const uint64_t cycles = GetUint(params, "cycles", 1, kMaxStepCycles, std::nullopt);
+    bool open = PauseRunning();
+    if (open) open = emulator_.RunCycles(cycles);
+    SendInputApplied();
+    SendSoundEvents();
+    if (!open) {
+        exitRequested_ = true;
+        throw RpcError{kInvalidState, "the window was closed"};
+    }
+    return json{{"emulated_cycles", emulator_.EmulatedCycles()}};
+}
+
+json Session::ListDisks(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    json list = json::array();
+    for (const DiskInfo& d : emulator_.Disks())
+        list.push_back(json{{"slot", 6},
+                            {"drive", d.drive + 1},
+                            {"original_path", PathUtf8(originals_[d.drive & 1])},
+                            {"working_path", PathUtf8(d.workingPath)},
+                            {"write_protected", d.writeProtected},
+                            {"format", d.format}});
+    return list;
+}
+
+json Session::ExportDisk(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const uint64_t slot = GetUint(params, "slot", 0, 7, std::nullopt);
+    if (slot != 6) InvalidParams("slot must be 6");
+    const uint64_t drive = GetUint(params, "drive", 1, 2, std::nullopt);
+    const fs::path dest = Utf8Path(GetString(params, "dest_path", std::nullopt));
+    if (!dest.is_absolute()) InvalidParams("dest_path must be absolute");
+    std::error_code ec;
+    if (fs::exists(fs::symlink_status(dest, ec))) InvalidParams("dest_path already exists");
+    for (const fs::path& original : originals_)
+        if (!original.empty() && Canonical(original) == Canonical(dest))
+            InvalidParams("dest_path is a session's original image");
+    const fs::path harnessDir = workDir_.parent_path();   // %TEMP%\applewin-harness
+    if (IsInside(dest, harnessDir)) InvalidParams("dest_path is inside the harness work directory");
+    if (!fs::is_directory(dest.parent_path(), ec)) InvalidParams("the directory of dest_path does not exist");
+
+    const std::vector<DiskInfo> disks = emulator_.Disks();
+    const DiskInfo* found = nullptr;
+    for (const DiskInfo& d : disks)
+        if (d.drive == int(drive) - 1) found = &d;
+    if (!found) throw RpcError{kDiskNotFound, "drive " + std::to_string(drive) + " is empty"};
+
+    emulator_.FlushDisks();
+    fs::copy_file(found->workingPath, dest, fs::copy_options::none, ec);
+    if (ec) throw RpcError{kInternalError, "cannot write " + PathUtf8(dest) + ": " + ec.message()};
+    return json::object();
+}
 
 }  // namespace harness

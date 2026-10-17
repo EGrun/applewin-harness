@@ -13,20 +13,20 @@ jobs:
       matrix:
         config: [Debug, Release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           submodules: recursive
 
-      - uses: microsoft/setup-msbuild@v2
+      - uses: microsoft/setup-msbuild@v3
 
       - name: Build
         shell: pwsh
         run: msbuild AppleWinHarness.sln -m -p:Configuration=${{ matrix.config }} -p:Platform=x64
         # a failing msbuild exits non-zero, which fails the step
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.0.0
         with:
-          python-version: '3.12'
+          python-version: '3.13'
 
       - name: Record harness temp path
         shell: pwsh
@@ -48,7 +48,7 @@ jobs:
 
       - name: Upload harness temp files on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: applewin-harness-temp-${{ matrix.config }}
           path: ${{ env.HARNESS_TMP }}

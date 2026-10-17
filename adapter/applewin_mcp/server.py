@@ -1,16 +1,37 @@
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
-TASK 1 STUB: the command line is parsed for real and the seven tools are registered with their final names and
-parameters, but every tool raises NotImplementedError (an MCP tool error). Task 3 implements them.
+The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
+and as agent (to type, look, listen), and serves seven tools over MCP stdio.
 
-Contract the tests rely on: stdout carries MCP frames only; the adapter writes the line "harness pid <N>" to stderr
-once the harness is running.
+stdout carries MCP frames only: the harness child's stdout is a pipe that harness_client drains, and all logging goes
+to stderr. The adapter writes the line "harness pid <N>" to stderr once the harness is running.
 """
 
 import argparse
+import asyncio
+import base64
+import logging
+import math
+import os
 import sys
+import threading
+import time
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+from .harness_client import ConnectionClosed, Harness, RpcError
+
+FRAMES_PER_SECOND = 60
+INPUT_FRAME_CAP = 600      # frames type_text / press_key wait for the keyboard to be read
+SETTLE_FRAMES = 3          # frames after the last key so the program can echo it
+CALL_TIMEOUT = 600.0
+WAIT_RANGE = (1, 60000)
+LISTEN_RANGE = (0, 60000)
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
 
 
 def parse_args(argv=None):
@@ -23,50 +44,225 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def build_server(args):
+def _check_range(name, value, low, high):
+    if not low <= value <= high:
+        raise ToolError("{} must be between {} and {} (got {})".format(name, low, high, value))
+
+
+class Machine:
+    """The running harness and its two connections. Methods block; the tools call them through a worker thread,
+    and self.lock keeps one tool call at a time on the emulator."""
+
+    def __init__(self, args):
+        self.stepped = not args.realtime
+        self.lock = threading.Lock()
+        self.events = []        # sound events not yet reported by listen (buffered from launch)
+        self.applied = set()    # input ids whose input_applied has arrived
+        os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
+        self.harness = Harness.launch(headless=args.headless)
+        log("harness pid {}".format(self.harness.pid))
+        try:
+            self.operator = self.harness.connect("operator")
+            params = {"run_mode": "stepped" if self.stepped else "realtime",
+                      "allow_text_screen": bool(args.text_screen)}
+            if args.disk:
+                params["disks"] = [{"slot": 6, "drive": 1, "path": os.path.abspath(args.disk)}]
+            self.operator.call("create_session", timeout=CALL_TIMEOUT, **params)
+            self.agent = self.harness.connect("agent")
+            self.agent.call("subscribe_audio", timeout=CALL_TIMEOUT)
+        except BaseException:
+            self.shutdown()
+            raise
+
+    # ---- helpers (call with self.lock held) ----
+
+    def rpc(self, conn, method, **params):
+        try:
+            return conn.call(method, timeout=CALL_TIMEOUT, **params)
+        except RpcError as e:
+            raise ToolError(e.message) from None
+        except (ConnectionClosed, TimeoutError, OSError) as e:
+            raise ToolError("the emulator is not responding ({!r})".format(e)) from None
+
+    def pump(self, timeout=0.0):
+        """Moves queued notifications into self.events / self.applied."""
+        wait = timeout
+        while True:
+            try:
+                note = self.agent.next_notification(timeout=wait)
+            except TimeoutError:
+                return
+            wait = 0.0
+            method, params = note.get("method"), note.get("params") or {}
+            if method == "input_applied":
+                self.applied.add(params.get("input_id"))
+            elif method in ("sound_started", "sound_stopped"):
+                self.events.append((method, params))
+
+    def advance(self, frames):
+        """Lets `frames` video frames of emulated time pass (stepped: step_frames; realtime: sleeps)."""
+        if self.stepped:
+            self.rpc(self.operator, "step_frames", frames=frames)
+        else:
+            time.sleep(frames / FRAMES_PER_SECOND)
+
+    def advance_ms(self, ms):
+        if self.stepped:
+            self.advance(math.ceil(ms * FRAMES_PER_SECOND / 1000))
+        else:
+            time.sleep(ms / 1000.0)
+
+    def await_input(self, input_id):
+        """Lets time pass, a frame at a time, until input_applied arrives for input_id."""
+        frames = 0
+        while True:
+            self.pump(0.02 if self.stepped else 0.0)
+            if input_id in self.applied:
+                self.applied.discard(input_id)
+                self.advance(SETTLE_FRAMES)   # let the program echo the last key
+                return
+            if frames >= INPUT_FRAME_CAP:
+                raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
+                                "(it may be busy). Call wait to let time pass, then look.".format(INPUT_FRAME_CAP))
+            self.advance(1)
+            frames += 1
+
+    # ---- tools ----
+
+    def type_text(self, text, inter_key_delay_ms):
+        with self.lock:
+            reply = self.rpc(self.agent, "type_text", text=text, inter_key_delay_ms=inter_key_delay_ms)
+            self.await_input(reply["input_id"])
+        return "typed {} characters".format(len(text))
+
+    def press_key(self, key, hold_ms):
+        params = {"key": key}
+        if hold_ms > 0:
+            params["hold_ms"] = hold_ms
+        with self.lock:
+            reply = self.rpc(self.agent, "press_key", **params)
+            self.await_input(reply["input_id"])
+        return "pressed {}".format(key)
+
+    def set_joystick(self, x, y, button0, button1, duration_ms):
+        params = {}
+        if x is not None:
+            params["x"] = x
+        if y is not None:
+            params["y"] = y
+        buttons = {}
+        if button0 is not None:
+            buttons["0"] = button0
+        if button1 is not None:
+            buttons["1"] = button1
+        if buttons:
+            params["buttons"] = buttons
+        if duration_ms > 0:
+            params["duration_ms"] = duration_ms
+        with self.lock:
+            self.rpc(self.agent, "set_joystick", **params)
+        return "joystick set; call wait to let time pass"
+
+    def wait(self, ms):
+        with self.lock:
+            self.advance_ms(ms)
+        return "waited {} ms".format(ms)
+
+    def look(self):
+        with self.lock:
+            frame = self.rpc(self.agent, "get_frame", format="PNG", borders=False)
+        return base64.b64decode(frame["data"])
+
+    def read_screen(self):
+        with self.lock:
+            screen = self.rpc(self.agent, "get_text_screen")
+        return "\n".join([screen["mode"]] + screen["lines"])
+
+    def listen(self, ms):
+        with self.lock:
+            if ms > 0:
+                self.advance_ms(ms)
+            self.pump(0.0)
+            events, self.events = self.events, []
+        if not events:
+            return "no sound events since the last listen"
+        lines = []
+        for method, p in events:
+            if method == "sound_started":
+                lines.append("sound_started emulated_ms={}".format(p.get("emulated_ms")))
+            else:
+                lines.append("sound_stopped duration_ms={} peak_db={} dominant_hz={}".format(
+                    p.get("duration_ms"), p.get("peak_db"), p.get("dominant_hz")))
+        return "\n".join(lines)
+
+    def shutdown(self):
+        """close_session, then wait for the process to exit (Harness.close waits 5 s, then kills it)."""
+        try:
+            self.harness.close()
+        except Exception as e:   # never let cleanup hide the reason we are stopping
+            log("shutdown error: {!r}".format(e))
+            self.harness.kill()
+
+
+def build_server(args, machine):
     mcp = MCPServer("applewin")
 
     @mcp.tool()
-    def type_text(text: str, inter_key_delay_ms: int = 0) -> str:
-        """Type text on the Apple II keyboard (\n is RETURN). Returns once the keys have been typed."""
-        raise NotImplementedError("type_text")
+    async def type_text(text: str, inter_key_delay_ms: int = 0) -> str:
+        """Type text on the Apple II keyboard (\\n is RETURN; printable ASCII only, at most 4096 characters).
+        Blocks until the keyboard has read the keys, so you can look at the screen straight away. If the program
+        is not reading the keyboard this fails with an error. To let time pass (for a program to run), call wait."""
+        return await asyncio.to_thread(machine.type_text, text, inter_key_delay_ms)
 
     @mcp.tool()
-    def press_key(key: str, hold_ms: int = 0) -> str:
-        """Press one key: a character, an ASCII code, or a name such as RETURN, ESC, LEFT."""
-        raise NotImplementedError("press_key")
+    async def press_key(key: str, hold_ms: int = 0) -> str:
+        """Press one key: a character, an ASCII code, or a name such as RETURN, ESC, TAB, DELETE, LEFT, RIGHT, UP,
+        DOWN, CTRL-A to CTRL-Z, or RESET. Blocks until the keyboard has read it. If the program is not reading the
+        keyboard this fails with an error. To let time pass, call wait."""
+        return await asyncio.to_thread(machine.press_key, key, hold_ms)
 
     @mcp.tool()
-    def set_joystick(x: int | None = None, y: int | None = None, button0: bool | None = None,
-                     button1: bool | None = None, duration_ms: int = 0) -> str:
-        """Move joystick 0 (x, y 0-255; 127 is centre) and/or press its buttons."""
-        raise NotImplementedError("set_joystick")
+    async def set_joystick(x: int | None = None, y: int | None = None, button0: bool | None = None,
+                           button1: bool | None = None, duration_ms: int = 0) -> str:
+        """Move joystick 0 (x, y 0-255; 127 is centre) and/or press its buttons (button0 is Open-Apple, button1
+        Solid-Apple). Fields left out keep their value. With duration_ms the joystick then returns to its previous
+        state. Returns at once; call wait to let time pass."""
+        return await asyncio.to_thread(machine.set_joystick, x, y, button0, button1, duration_ms)
 
     @mcp.tool()
-    def wait(ms: int) -> str:
-        """Let emulated time pass (1-60000 ms). Typing and other input only take effect as time passes."""
-        raise NotImplementedError("wait")
+    async def wait(ms: int) -> str:
+        """Let emulated time pass (1-60000 ms). Typing and other input only take effect as time passes, and
+        programs only run while time passes."""
+        _check_range("ms", ms, *WAIT_RANGE)
+        return await asyncio.to_thread(machine.wait, ms)
 
     @mcp.tool()
-    def look():
+    async def look() -> Image:
         """Look at the screen: a 560x384 PNG."""
-        raise NotImplementedError("look")
+        return Image(data=await asyncio.to_thread(machine.look), format="png")
 
     if args.text_screen:
         @mcp.tool()
-        def read_screen() -> str:
-            """Read the text on the screen: the video mode, then 24 lines."""
-            raise NotImplementedError("read_screen")
+        async def read_screen() -> str:
+            """Read the text on the screen: the video mode (40col, 80col or graphics), then 24 lines."""
+            return await asyncio.to_thread(machine.read_screen)
 
     @mcp.tool()
-    def listen(ms: int = 0) -> str:
-        """Listen for sound (optionally waiting ms first): sound start/stop events since the last listen."""
-        raise NotImplementedError("listen")
+    async def listen(ms: int = 0) -> str:
+        """Listen for sound, optionally letting ms (0-60000) of time pass first. Returns the sound_started and
+        sound_stopped events (with duration_ms and dominant_hz) since the last listen."""
+        _check_range("ms", ms, *LISTEN_RANGE)
+        return await asyncio.to_thread(machine.listen, ms)
 
     return mcp
 
 
 def main(argv=None):
     args = parse_args(argv)
-    build_server(args).run("stdio")
+    logging.basicConfig(stream=sys.stderr)
+    machine = Machine(args)
+    try:
+        build_server(args, machine).run("stdio")
+    finally:
+        machine.shutdown()
     return 0

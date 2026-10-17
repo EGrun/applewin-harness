@@ -10,6 +10,7 @@
 #include "core/base64.h"
 #include "core/sha256.h"
 #include "core/working_copy.h"
+#include "support/audio_signals.h"
 #include "support/emulator_fixture.h"
 #include "support/golden.h"
 #include "support/paths.h"
@@ -142,6 +143,61 @@ void UnrelatedWork(Emulator& e)
     e.RunCycles(4321);
 }
 
+// Pass condition 5's speech program (tests/programs/ssi263_speech.bas, shared with the Python tests), in type_text's form
+// (RETURN as "\n"). AppleWin's default slot-4 card is a Mockingboard C; its socket-1 SSI263 (SSI263AP) is the primary
+// speech chip at $C440-$C444: reg 0 duration/phoneme, 1 inflection, 2 rate/inflection, 3 control/articulation/
+// amplitude, 4 filter frequency. The program powers the chip down, sets rate, inflection and filter, writes a phoneme
+// (duration-mode bits 00: A/!R interrupt disabled), clears CTL with amplitude 15 ("POKE S+3,127"), which plays it, then
+// writes five more phonemes ~0.1 s apart and powers down: ~0.7 s of speech from ~1.1 s after typing starts.
+std::string SpeechProgram()
+{
+    const std::vector<uint8_t> bytes = ReadAll(RepoRoot() / "tests" / "programs" / "ssi263_speech.bas");
+    std::string s(bytes.begin(), bytes.end());
+    std::erase(s, '\r');   // a CRLF checkout (core.autocrlf)
+    REQUIRE_MESSAGE(s.find("POKE S+3,127") != std::string::npos, "tests/programs/ssi263_speech.bas is missing or changed");
+    return s;
+}
+
+// The negative control: amplitude 0 when CTL is cleared, every other write the same. Silence there shows the speech
+// run's sound is the SSI263's, not a side effect of the $C44x writes on the first 6522 or its AY-3-8910.
+std::string MutedSpeechProgram()
+{
+    std::string s = SpeechProgram();
+    s.replace(s.find("POKE S+3,127"), 12, "POKE S+3,112");
+    return s;
+}
+
+// The in-process form of a type_text text: RETURN is "\r".
+std::string InProcessText(std::string s)
+{
+    std::replace(s.begin(), s.end(), '\n', '\r');
+    return s;
+}
+
+// Pass condition 5's script: the program typed and run, whole-frame and cycle-exact steps splitting the speech.
+ScriptRun RunSpeech(Emulator& e, uint64_t fromCycle, const std::string& program)
+{
+    ScriptRun r;
+    auto record = [&] { r.steps.push_back(Step{e.StateChecksum(), e.EmulatedCycles(), RawFrameHash(e.Frame())}); };
+    record();
+    e.QueueText(InProcessText(program), 0);
+    REQUIRE(e.RunFrames(70));
+    record();
+    e.RunCycles(12345);
+    record();
+    REQUIRE(e.RunFrames(20));
+    record();
+    e.RunCycles(5 * kCyclesPerFrame + 777);
+    record();
+    REQUIRE(e.RunFrames(40));
+    record();
+    e.RunCycles(1);
+    record();
+    r.audio = e.Audio().Read(fromCycle, e.EmulatedCycles());
+    e.TakeAppliedInputs();
+    return r;
+}
+
 // A restore as the session does it: eject, put the checkpoint's disk copy back, load.
 void Restore(Emulator& e, const fs::path& state, const SnapshotMeta& meta, const fs::path& diskCopy, const fs::path& working)
 {
@@ -216,6 +272,7 @@ std::string PipeText(std::string s)
 struct PipeRun {
     std::vector<std::string> records;   // "checksum @cycles frame-hash" after every step
     std::string audioHash;              // SHA-256 of get_audio's base64 PCM16 over the script's range
+    bool audioSilent = false;           // every sample of that range is zero
     bool operator==(const PipeRun&) const = default;
 };
 
@@ -291,6 +348,69 @@ std::pair<PipeRun, PipeRun> CheckpointReplayOverPipe(const std::wstring& args)
     return {a, b};
 }
 
+// Pass condition 5's script over the pipe, as RunSpeech in-process.
+PipeRun RunPipeSpeech(PipeClient& op, PipeClient& agent, uint64_t fromCycle, const std::string& program)
+{
+    PipeRun r;
+    auto record = [&] {
+        const json cs = Result(op, "get_state_checksum");
+        const json frame = Result(agent, "get_frame", {{"format", "BGRA32"}});
+        r.records.push_back(cs["sha256"].get<std::string>() + " @" + std::to_string(cs["emulated_cycles"].get<uint64_t>()) +
+                            " " + DataHash(frame));
+    };
+    record();
+    Result(agent, "type_text", {{"text", program}, {"inter_key_delay_ms", 0}});
+    Result(op, "step_frames", {{"frames", 70}});
+    record();
+    Result(op, "step_cycles", {{"cycles", 12345}});
+    record();
+    Result(op, "step_frames", {{"frames", 20}});
+    record();
+    Result(op, "step_cycles", {{"cycles", 5 * kCyclesPerFrame + 777}});
+    record();
+    Result(op, "step_frames", {{"frames", 40}});
+    record();
+    const uint64_t end = Result(op, "step_cycles", {{"cycles", 1}})["emulated_cycles"].get<uint64_t>();
+    record();
+    const uint64_t ms = uint64_t(std::ceil(double(end - fromCycle) * 1000.0 / kBaseClockHz)) + 1;
+    const json audio = Result(agent, "get_audio", {{"from_cycle", fromCycle}, {"duration_ms", ms}, {"format", "PCM16"}});
+    // Base64 of all-zero PCM is only 'A's (and '=' padding): any other character is a non-zero sample.
+    r.audioSilent = audio["data"].get<std::string>().find_first_not_of("A=") == std::string::npos;
+    r.audioHash = DataHash(audio);
+    return r;
+}
+
+struct SpeechRuns {
+    PipeRun first, second, muted;
+};
+
+// In a fresh server (display mode from args): DOS booted stepped, a checkpoint, some frames, a restore, the speech; the
+// speech started again and still playing at the second restore, the speech; a third restore and the muted program.
+SpeechRuns SpeechOverPipe(const std::wstring& args)
+{
+    Server s = StartServer(args);
+    auto op = Connect(s, "operator");
+    Result(*op, "create_session", {{"run_mode", "stepped"}, {"disks", json::array({{{"slot", 6}, {"drive", 1},
+                                                                                   {"path", DosMasterImage().string()}}})}});
+    Result(*op, "step_frames", {{"frames", 720}});
+    auto agent = Connect(s, "agent");
+    const json cp = Result(*op, "checkpoint", {{"name", "pc5"}});
+    const uint64_t at = cp["emulated_cycles"].get<uint64_t>();
+    Result(*op, "step_frames", {{"frames", 30}});
+    Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
+    SpeechRuns r;
+    r.first = RunPipeSpeech(*op, *agent, at, SpeechProgram());
+    Result(*agent, "type_text", {{"text", "RUN\n"}, {"inter_key_delay_ms", 0}});
+    Result(*op, "step_frames", {{"frames", 20}});
+    Result(*op, "step_cycles", {{"cycles", 999}});
+    Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
+    r.second = RunPipeSpeech(*op, *agent, at, SpeechProgram());
+    Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
+    r.muted = RunPipeSpeech(*op, *agent, at, MutedSpeechProgram());
+    Result(*op, "close_session");
+    return r;
+}
+
 }  // namespace
 
 // ---- Pass condition 1 (the restore-purity core) ----
@@ -334,6 +454,47 @@ TEST_CASE("ckpt: two restored runs replay the script exactly, whatever ran befor
     }
     CHECK(second.audio.size() == first.audio.size());
     CHECK_MESSAGE(second.audio == first.audio, "audio over the script's range differs between the runs");
+}
+
+// ---- Pass condition 5 in-process ----
+
+TEST_CASE("ckpt: SSI263 speech replays identically across two restores; the muted program is silent")
+{
+    auto& e = StartedEmulator();
+    DosBoot boot(e, "speech");
+    const fs::path state = boot.dir.path / "state.yaml";
+    const fs::path diskCopy = boot.dir.path / "disk-copy.dsk";
+    const uint64_t at = e.EmulatedCycles();
+    const std::string checksumAt = e.StateChecksum();
+    const SnapshotMeta meta = e.SaveSnapshot(state);
+    e.FlushDisks();
+    fs::copy_file(boot.copy.Path(), diskCopy);
+
+    REQUIRE(e.RunFrames(30));
+    Restore(e, state, meta, diskCopy, boot.copy.Path());
+    const ScriptRun first = RunSpeech(e, at, SpeechProgram());
+    const double db = AcRmsDb(MonoMix(first.audio));
+    INFO("speech AC RMS " << db << " dBFS");
+    CHECK_MESSAGE(db > -40.0, "the speech program left no audio");
+
+    // The speech started again and still playing at the restore: the SSI263 mid-phoneme with its amplitude up.
+    e.QueueText("RUN\r", 0);
+    REQUIRE(e.RunFrames(20));
+    e.RunCycles(999);
+    Restore(e, state, meta, diskCopy, boot.copy.Path());
+    CHECK(e.StateChecksum() == checksumAt);
+    const ScriptRun second = RunSpeech(e, at, SpeechProgram());
+    REQUIRE(second.steps.size() == first.steps.size());
+    for (size_t i = 0; i < first.steps.size(); ++i) {
+        INFO("step " << i);
+        CHECK(second.steps[i] == first.steps[i]);
+    }
+    CHECK_MESSAGE(second.audio == first.audio, "speech audio differs between the restored runs");
+
+    Restore(e, state, meta, diskCopy, boot.copy.Path());
+    const ScriptRun muted = RunSpeech(e, at, MutedSpeechProgram());
+    CHECK(muted.audio.size() == first.audio.size());
+    CHECK_MESSAGE(AllZero(muted.audio), "the muted program is not silent: the speech run's audio may not be the SSI263's");
 }
 
 TEST_CASE("ckpt: LoadSnapshot discards pending input and reports each id as discarded (D1)")
@@ -621,6 +782,18 @@ TEST_SUITE("windowed")
 
     TEST_CASE("ckpt: SSI263 speech replays identically in both display modes")
     {
-        FAIL("SSI263 program not yet written (Task 4)");
+        const SpeechRuns headless = SpeechOverPipe(L"--serve --headless");
+        const SpeechRuns windowed = SpeechOverPipe(L"--serve");
+        for (const SpeechRuns* r : {&headless, &windowed}) {
+            CHECK_MESSAGE(!r->first.audioSilent, "the speech program left no audio");
+            CHECK(r->second == r->first);
+            CHECK_MESSAGE(r->muted.audioSilent, "the muted program is not silent");
+        }
+        REQUIRE(windowed.first.records.size() == headless.first.records.size());
+        for (size_t i = 0; i < headless.first.records.size(); ++i) {
+            INFO("step " << i);
+            CHECK(windowed.first.records[i] == headless.first.records[i]);
+        }
+        CHECK(windowed.first.audioHash == headless.first.audioHash);
     }
 }

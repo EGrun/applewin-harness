@@ -15,16 +15,26 @@ import threading
 import time
 import unittest
 
-from harness_client import Harness
+from harness_client import REPO_ROOT, Harness
 from test_pipe import (CYCLES_PER_FRAME, BASE_CLOCK_HZ, DOS_IMAGE, WINDOWED, PipeTestCase, dos_disks, ms_to_cycles,
                        mono_ac_rms_db, text_row_band)
 
 MAX_STEP_CYCLES = 17030000
 ISO_UTC = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$")
-# The SSI263 speech program of pass condition 5 is written in M4 Task 4 (it depends on what AppleWin's default slot-4
-# card provides). Until then the speech tests fail with this message.
-SSI263_PROGRAM = None
-SSI263_MISSING = "SSI263 program not yet written (Task 4)"
+# Pass condition 5's speech program, shared with the C++ tests (tests/programs/ssi263_speech.bas). AppleWin's default
+# slot-4 card is a Mockingboard C whose socket-1 SSI263 (type SSI263AP) is the primary speech chip, at $C440-$C444
+# (50240-50244): reg 0 duration/phoneme, 1 inflection, 2 rate/inflection, 3 control/articulation/amplitude, 4 filter
+# frequency. The program powers the chip down (CTL=1), sets rate, inflection and filter, writes a phoneme with the
+# duration-mode bits 00 (A/!R interrupt disabled) and then clears CTL with amplitude 15 ("POKE S+3,127"), which plays
+# it; it then writes five more phonemes ~0.1 s apart and powers down. About 0.7 s of speech starts ~1.1 s after typing
+# begins.
+with open(os.path.join(REPO_ROOT, "tests", "programs", "ssi263_speech.bas"), "r", encoding="ascii") as _f:
+    SSI263_PROGRAM = _f.read()   # text mode: a CRLF checkout (core.autocrlf) reads as LF, type_text's RETURN
+# The negative control: the same program with amplitude 0 when CTL is cleared. Its writes to the card are otherwise the
+# same, so silence there shows the sound comes from the SSI263's amplitude, not the 6522 or AY-3-8910 side effects of
+# the $C44x writes.
+SSI263_PROGRAM_MUTED = SSI263_PROGRAM.replace("POKE S+3,127", "POKE S+3,112")
+assert SSI263_PROGRAM_MUTED != SSI263_PROGRAM
 # Ruling D6: prints any-key-down ($C010 bit 7), buttons 0 and 1 ($C061, $C062), PDL(0) and PDL(1), so input state leaked
 # across a restore shows on screen and in RAM.
 PRINT_INPUT_STATE = 'PRINT PEEK(-16368);" ";PEEK(-16287);" ";PEEK(-16286);" ";PDL(0);" ";PDL(1)\n'
@@ -86,6 +96,36 @@ def run_script(op, agent, from_cycle):
     record()
     agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)
     op.call("step_frames", frames=90)
+    record()
+    end = op.call("step_cycles", cycles=1)["emulated_cycles"]
+    record()
+    duration_ms = int((end - from_cycle) * 1000.0 / BASE_CLOCK_HZ) + 2
+    audio = agent.call("get_audio", from_cycle=from_cycle, duration_ms=duration_ms, format="PCM16")
+    return records, (audio["start_cycle"], audio["end_cycle"], audio["data"])
+
+
+def run_speech(op, agent, from_cycle, program=None):
+    """Pass condition 5's script: the speech program typed and run, with whole-frame and cycle-exact steps that split
+    the speech. Records (checksum, checksum cycle, frame cycle, frame hash) after every step, then get_audio over the
+    script's range. Returns (records, (start_cycle, end_cycle, PCM16 base64))."""
+    records = []
+
+    def record():
+        cs = op.call("get_state_checksum")
+        frame = agent.call("get_frame", format="BGRA32")
+        records.append((cs["sha256"], cs["emulated_cycles"], frame["emulated_cycles"], frame_hash(frame)))
+
+    record()
+    agent.call("type_text", text=SSI263_PROGRAM if program is None else program, inter_key_delay_ms=0)
+    op.call("step_frames", frames=70)
+    record()
+    op.call("step_cycles", cycles=12345)
+    record()
+    op.call("step_frames", frames=20)
+    record()
+    op.call("step_cycles", cycles=5 * CYCLES_PER_FRAME + 777)
+    record()
+    op.call("step_frames", frames=40)
     record()
     end = op.call("step_cycles", cycles=1)["emulated_cycles"]
     record()
@@ -160,6 +200,34 @@ class CheckpointTestCase(PipeTestCase):
             op.call("set_speed", machine_speed=speeds[1])
             self.assertEqual(op.call("get_speed")["machine_speed"], speeds[1])
         second = run_script(op, agent, at)
+        return first, second
+
+    def speech_replay(self, headless=True):
+        """Pass condition 5: checkpoint, some frames, restore, speech; the speech started again and still playing at the
+        second restore (the SSI263 mid-phoneme, amplitude up), restore, speech. Then the negative control from a third
+        restore: the muted program leaves the capture silent. Returns both speech runs."""
+        h = self.launch(headless=headless)
+        op, agent = self.booted(h)
+        at = op.call("step_frames", frames=1)["emulated_cycles"]
+        cp = op.call("checkpoint", name="speech")
+        at_checksum = op.call("get_state_checksum")
+        op.call("step_frames", frames=30)
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
+        first = run_speech(op, agent, at)
+        self.assertGreater(mono_ac_rms_db(base64.b64decode(first[1][2])), -40.0, "the speech program left no audio")
+
+        agent.call("type_text", text="RUN\n", inter_key_delay_ms=0)   # speaking again at the restore
+        op.call("step_frames", frames=20)
+        op.call("step_cycles", cycles=999)
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
+        self.assertEqual(op.call("get_state_checksum"), at_checksum)
+        second = run_speech(op, agent, at)
+
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
+        muted = run_speech(op, agent, at, SSI263_PROGRAM_MUTED)
+        self.assertTrue(any(base64.b64decode(first[1][2])))
+        self.assertFalse(any(base64.b64decode(muted[1][2])), "the muted program is not silent: the speech run's audio "
+                         "may not be the SSI263's")
         return first, second
 
     def assertSameRuns(self, a, b):
@@ -587,12 +655,12 @@ class RestoreFailureTest(CheckpointTestCase):
         self.assertUnusable(op)
 
 
-# ---- Pass condition 5 (speech; the program is M4 Task 4's) ----
+# ---- Pass condition 5 (speech) ----
 
 class SpeechTest(CheckpointTestCase):
     def test_speech_replays_identically_across_two_restores(self):
-        if SSI263_PROGRAM is None:
-            self.fail(SSI263_MISSING)
+        first, second = self.speech_replay()
+        self.assertSameRuns(first, second)
 
 
 # ---- Windowed: pass conditions 3 and 5 ----
@@ -609,8 +677,11 @@ class WindowedCheckpointTest(CheckpointTestCase):
 
     def test_speech_is_the_same_in_both_display_modes(self):
         """Pass condition 5."""
-        if SSI263_PROGRAM is None:
-            self.fail(SSI263_MISSING)
+        headless = self.speech_replay(headless=True)
+        windowed = self.speech_replay(headless=False)
+        self.assertSameRuns(headless[0], headless[1])
+        self.assertSameRuns(windowed[0], windowed[1])
+        self.assertSameRuns(headless[0], windowed[0])
 
 
 if __name__ == "__main__":

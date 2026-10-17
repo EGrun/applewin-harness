@@ -202,7 +202,7 @@ Sound can be an important cue for the agent: a bell on an error, a beep on a pro
 
 **Format of the captured audio:**
 - 16-bit PCM, stereo, 44,100 samples per emulated second, measured against the base clock (D10). The speaker is mono and is mixed equally into both channels; Mockingboard is stereo.
-- Part C will make the capture stream independent of the speed setting (so the same program sounds the same at any speed); until then, the stream follows what AppleWin generates.
+- The capture timeline is in emulated time whatever the speed setting: each commit is placed by the emulated cycles it covers, so a program sounds the same at any speed. Part C's speed-change test (`realtime` suite) checks this.
 - The harness keeps the most recent 30 emulated seconds in a ring buffer.
 
 **What this guarantees:** agent audio depends only on emulated state. In stepped mode the same input script produces byte-identical audio in windowed and headless mode, at any speed setting. M4 checks this.

@@ -24,6 +24,7 @@ from .harness_client import ConnectionClosed, Harness, RpcError
 
 FRAMES_PER_SECOND = 60
 INPUT_FRAME_CAP = 600      # frames type_text / press_key wait for the keyboard to be read
+DEFAULT_HOLD_MS = 50       # the harness's press_key default
 SETTLE_FRAMES = 3          # frames after the last key so the program can echo it
 CALL_TIMEOUT = 600.0
 WAIT_RANGE = (1, 60000)
@@ -112,16 +113,18 @@ class Machine:
         else:
             time.sleep(ms / 1000.0)
 
-    def await_input(self, input_id):
-        """Lets time pass, a frame at a time, until input_applied arrives for input_id."""
+    def await_input(self, input_id, expected_ms):
+        """Lets time pass, a frame at a time, until input_applied arrives for input_id. The cap counts frames beyond
+        expected_ms, the time the input itself takes (keys x delay, or the hold)."""
         frames = 0
+        allowed = math.ceil(expected_ms * FRAMES_PER_SECOND / 1000) + INPUT_FRAME_CAP
         while True:
             self.pump(0.02 if self.stepped else 0.0)
             if input_id in self.applied:
                 self.applied.discard(input_id)
                 self.advance(SETTLE_FRAMES)   # let the program echo the last key
                 return
-            if frames >= INPUT_FRAME_CAP:
+            if frames >= allowed:
                 raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
                                 "(it may be busy). Call wait to let time pass, then look.".format(INPUT_FRAME_CAP))
             self.advance(1)
@@ -132,7 +135,7 @@ class Machine:
     def type_text(self, text, inter_key_delay_ms):
         with self.lock:
             reply = self.rpc(self.agent, "type_text", text=text, inter_key_delay_ms=inter_key_delay_ms)
-            self.await_input(reply["input_id"])
+            self.await_input(reply["input_id"], len(text) * inter_key_delay_ms)
         return "typed {} characters".format(len(text))
 
     def press_key(self, key, hold_ms):
@@ -141,7 +144,7 @@ class Machine:
             params["hold_ms"] = hold_ms
         with self.lock:
             reply = self.rpc(self.agent, "press_key", **params)
-            self.await_input(reply["input_id"])
+            self.await_input(reply["input_id"], hold_ms if hold_ms > 0 else DEFAULT_HOLD_MS)
         return "pressed {}".format(key)
 
     def set_joystick(self, x, y, button0, button1, duration_ms):

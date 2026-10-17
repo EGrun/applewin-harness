@@ -166,6 +166,16 @@ class EndToEndTest(AdapterTestCase):
                 self.assertFalse(result.is_error, text_of(result))
         self.run_async(go)
 
+    def test_long_slow_typing_is_not_a_stall(self):
+        """120 keys at 100 ms is 720 frames: longer than the 600-frame stall cap, but the keyboard is being read."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                typed = await call(s, "type_text", text="10 REM " + "A" * 113 + chr(10), inter_key_delay_ms=100)
+                self.assertFalse(typed.is_error, text_of(typed))
+                self.assertIn("AAAAAAAA", text_of(await call(s, "read_screen")))
+        self.run_async(go)
+
     def test_wait_and_listen_ranges(self):
         """wait is 1-60000 ms, listen 0-60000 ms. The stub's NotImplementedError reaches the client only as the opaque
         text 'Error executing tool <name>', so an error alone cannot tell stub from validation: the in-range calls

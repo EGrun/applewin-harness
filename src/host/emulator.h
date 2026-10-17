@@ -40,9 +40,12 @@ struct JoystickChange {
 
 // An input that has fully taken effect. type_text: the cycles at which the first and the last key were applied.
 // press_key and set_joystick: the press (or change) and the release (or restore); equal when there is no hold or
-// duration. Cycles are EmulatedCycles() values.
+// duration. Cycles are EmulatedCycles() values. discarded (ruling D1, docs/specs/m4.md "Restore purity"): the input was
+// still pending when LoadSnapshot ran and never took (full) effect; firstCycle and lastCycle are then 0 and meaningless
+// (the session reports them as null).
 struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
+    bool discarded = false;
 };
 
 // Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is the session speed, applied to AppleWin's g_dwSpeed for realtime steps only (0..40; 10 = authentic,
@@ -51,6 +54,21 @@ struct SpeedSettings {
     uint32_t machineSpeed;
     bool enhanceDisk;
     bool fullSpeedOverride;
+};
+
+// A slot-6 drive with an image inserted (docs/specs/m4.md, list_disks). drive is 0 or 1 (the API's drive 1 or 2).
+struct DiskInfo {
+    int drive = 0;
+    std::filesystem::path workingPath;   // the file AppleWin has open (the session's working copy)
+    bool writeProtected = false;
+    std::string format;                  // AppleWin's image type, e.g. "DO", "PO", "NIB", "WOZ"
+};
+
+// The harness metadata a checkpoint stores beside AppleWin's save state (docs/specs/m4.md, checkpoint).
+struct SnapshotMeta {
+    uint64_t emulatedCycles = 0;   // EmulatedCycles() when the snapshot was taken
+    uint64_t powerOnOrigin = 0;    // the power-on origin (g_nCumulativeCycles at the last power-on)
+    SpeedSettings speed{};         // the session's speed settings when the snapshot was taken
 };
 
 class Emulator {
@@ -153,6 +171,38 @@ public:
     // Windowed playback (AudioOutput, D14): its underrun count, and whether it exists (windowed with an audio device).
     uint64_t SoundUnderruns() const;
     bool SoundActive() const;
+
+    // ---- Checkpoints (docs/specs/m4.md; D5, D13). Each throws std::logic_error before Start.
+    // Ends any realtime run first (as StopRealtime: full speed and the Mockingboard mute are cleared), then writes
+    // AppleWin's save state to stateFile (Snapshot_SetFilename + Snapshot_SaveState). A FrameMessageBox during the save
+    // throws std::runtime_error carrying its text. Disks are not copied here (CheckpointStore does that).
+    SnapshotMeta SaveSnapshot(const std::filesystem::path& stateFile);
+    // Snapshot_LoadState from stateFile, then restore purity in the spec's order: speed settings from meta re-applied
+    // (enhance-disk included), srand(1), speaker internals reset (SpkrReset), video scanner phase from the restored
+    // cycle, pending input discarded (each id reported once by TakeAppliedInputs with discarded = true) and held keys
+    // and buttons released, AudioCapture cleared with every voice reset (audio before meta.emulatedCycles is gone), the
+    // presented frame re-rendered from the restored video memory, and EmulatedCycles() == meta.emulatedCycles.
+    // The disk images the save state names must already be in place (the caller ejects with EjectAll and restores the
+    // copies first); a missing image never opens a dialog. Any FrameMessageBox during the load throws
+    // std::runtime_error carrying its text; the machine state is then undefined until PowerCycle.
+    void LoadSnapshot(const std::filesystem::path& stateFile, const SnapshotMeta& meta);
+    // SHA-256 (64 lowercase hex) over the documented byte layout of docs/specs/m4.md get_state_checksum: CPU
+    // registers, memory mode, main and aux RAM with the language-card banks (shadow pages flushed first, as
+    // MemSaveSnapshot does), keyboard latch and strobe, video mode, Disk II controller state. Never wall-clock, paths or
+    // harness bookkeeping.
+    std::string StateChecksum() const;
+    // A stepped run of exactly cycles cycles (more only because of the last instruction); the input queue is serviced
+    // at each step boundary as in RunFrames. 0 does nothing.
+    void RunCycles(uint64_t cycles);
+    // The slot-6 drives that hold an image, drive 0 first; empty drives are left out.
+    std::vector<DiskInfo> Disks() const;
+    // Writes each drive's current track back to its image (FlushCurrentTrack), so the file holds every write.
+    void FlushDisks();
+    // EjectAll: flushes and ejects both slot-6 drives, so AppleWin releases the files, and remembers what was inserted.
+    // ReinsertAll: inserts the remembered images again (same paths, same write protection), for a restore abandoned
+    // before LoadSnapshot. Insert errors throw std::runtime_error as InsertDisk does.
+    void EjectAll();
+    void ReinsertAll();
 private:
     Emulator() = default;
 };

@@ -47,8 +47,9 @@ public:
     // RunMainLoop; null means no watch.
     void SetParentProcess(void* processHandle);
 
-    // The operator-only methods (create_session, close_session, pause, resume, step_frames); PipeServer's
-    // isOperatorOnly.
+    // The operator-only methods (create_session, close_session, pause, resume, step_frames, set_speed, get_speed, and
+    // M4's checkpoint, restore_checkpoint, list_checkpoints, delete_checkpoint, get_state_checksum, step_cycles,
+    // list_disks, export_disk); PipeServer's isOperatorOnly.
     static bool IsOperatorOnly(std::string_view method);
 
 private:
@@ -102,6 +103,16 @@ private:
     void ApplySpeed(const nlohmann::json& params, bool create);
     nlohmann::json GetAudio(const nlohmann::json& params);
     nlohmann::json SubscribeAudio(const ConnectionPtr& connection, const nlohmann::json& params);
+
+    // M4 operator methods (docs/specs/m4.md, "API").
+    nlohmann::json Checkpoint(const nlohmann::json& params);
+    nlohmann::json RestoreCheckpoint(const nlohmann::json& params);
+    nlohmann::json ListCheckpoints(const nlohmann::json& params);
+    nlohmann::json DeleteCheckpoint(const nlohmann::json& params);
+    nlohmann::json GetStateChecksum(const nlohmann::json& params);
+    nlohmann::json StepCycles(const nlohmann::json& params);
+    nlohmann::json ListDisks(const nlohmann::json& params);
+    nlohmann::json ExportDisk(const nlohmann::json& params);
 
     DisplayMode display_;
     Emulator& emulator_;

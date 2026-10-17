@@ -45,6 +45,7 @@
     <ClCompile Include="virtual_sound_test.cpp" />
     <ClCompile Include="fft_test.cpp" />
     <ClCompile Include="speed_test.cpp" />
+    <ClCompile Include="snapshot_test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\external\AppleWin\resource\Applewin.rc" />

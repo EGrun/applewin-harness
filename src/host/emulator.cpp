@@ -1075,4 +1075,60 @@ bool Emulator::FullSpeedStepping() const
     return g_realtime && g_bFullSpeed;
 }
 
+// ---- Checkpoints (docs/specs/m4.md). Stubs until M4 Task 2: each fails with std::runtime_error.
+namespace {
+[[noreturn]] void NotYet(const char* what)
+{
+    throw std::runtime_error(std::string("Emulator::") + what + ": not implemented yet (M4 Task 2)");
+}
+}  // namespace
+
+SnapshotMeta Emulator::SaveSnapshot(const std::filesystem::path&)
+{
+    RequireStarted();
+    NotYet("SaveSnapshot");
+}
+
+void Emulator::LoadSnapshot(const std::filesystem::path&, const SnapshotMeta&)
+{
+    RequireStarted();
+    NotYet("LoadSnapshot");
+}
+
+std::string Emulator::StateChecksum() const
+{
+    RequireStarted();
+    NotYet("StateChecksum");
+}
+
+void Emulator::RunCycles(uint64_t)
+{
+    RequireStarted();
+    NotYet("RunCycles");
+}
+
+std::vector<DiskInfo> Emulator::Disks() const
+{
+    RequireStarted();
+    NotYet("Disks");
+}
+
+void Emulator::FlushDisks()
+{
+    RequireStarted();
+    NotYet("FlushDisks");
+}
+
+void Emulator::EjectAll()
+{
+    RequireStarted();
+    NotYet("EjectAll");
+}
+
+void Emulator::ReinsertAll()
+{
+    RequireStarted();
+    NotYet("ReinsertAll");
+}
+
 }  // namespace harness

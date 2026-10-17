@@ -39,6 +39,7 @@
     <ClCompile Include="..\src\server\pipe_server.cpp" />
     <ClCompile Include="..\src\server\protocol.cpp" />
     <ClCompile Include="..\src\server\session.cpp" />
+    <ClCompile Include="..\src\server\checkpoint_store.cpp" />
     <ClCompile Include="..\src\core\audio_capture.cpp" />
     <ClCompile Include="..\src\core\level_detector.cpp" />
     <ClCompile Include="..\src\core\wav.cpp" />
@@ -59,6 +60,7 @@
     <ClInclude Include="..\src\server\pipe_server.h" />
     <ClInclude Include="..\src\server\protocol.h" />
     <ClInclude Include="..\src\server\session.h" />
+    <ClInclude Include="..\src\server\checkpoint_store.h" />
     <ClInclude Include="..\src\core\audio_capture.h" />
     <ClInclude Include="..\src\core\level_detector.h" />
     <ClInclude Include="..\src\core\wav.h" />

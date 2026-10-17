@@ -189,7 +189,10 @@ bool Session::IsOperatorOnly(std::string_view method)
 {
     return method == "create_session" || method == "close_session" || method == "pause" || method == "resume" ||
            method == "step_frames" ||
-           method == "set_speed" || method == "get_speed";
+           method == "set_speed" || method == "get_speed" ||
+           method == "checkpoint" || method == "restore_checkpoint" || method == "list_checkpoints" ||
+           method == "delete_checkpoint" || method == "get_state_checksum" || method == "step_cycles" ||
+           method == "list_disks" || method == "export_disk";
 }
 
 int Session::RunMainLoop()
@@ -273,6 +276,14 @@ void Session::Dispatch(const Command& command)
         else if (m == "get_speed") result = GetSpeed(params);
         else if (m == "get_audio") result = GetAudio(params);
         else if (m == "subscribe_audio") result = SubscribeAudio(conn, params);
+        else if (m == "checkpoint") result = Checkpoint(params);
+        else if (m == "restore_checkpoint") result = RestoreCheckpoint(params);
+        else if (m == "list_checkpoints") result = ListCheckpoints(params);
+        else if (m == "delete_checkpoint") result = DeleteCheckpoint(params);
+        else if (m == "get_state_checksum") result = GetStateChecksum(params);
+        else if (m == "step_cycles") result = StepCycles(params);
+        else if (m == "list_disks") result = ListDisks(params);
+        else if (m == "export_disk") result = ExportDisk(params);
         else throw RpcError{kMethodNotFound, "method not found: " + m};
         reply = MakeResult(command.id, std::move(result));
     } catch (const RpcError& e) {
@@ -754,5 +765,23 @@ void Session::SendSoundEvents()
         if (!logged) { logged = true; std::cerr << "warning: sound events: unknown exception" << std::endl; }
     }
 }
+
+// ---- M4: checkpoints, state checksum, step_cycles, disks (docs/specs/m4.md). Stubs until M4 Task 3: -32603. ----
+
+namespace {
+[[noreturn]] void NotImplementedYet(const char* method)
+{
+    throw RpcError{kInternalError, std::string(method) + ": not implemented yet (M4 Task 3)"};
+}
+}  // namespace
+
+json Session::Checkpoint(const json&) { NotImplementedYet("checkpoint"); }
+json Session::RestoreCheckpoint(const json&) { NotImplementedYet("restore_checkpoint"); }
+json Session::ListCheckpoints(const json&) { NotImplementedYet("list_checkpoints"); }
+json Session::DeleteCheckpoint(const json&) { NotImplementedYet("delete_checkpoint"); }
+json Session::GetStateChecksum(const json&) { NotImplementedYet("get_state_checksum"); }
+json Session::StepCycles(const json&) { NotImplementedYet("step_cycles"); }
+json Session::ListDisks(const json&) { NotImplementedYet("list_disks"); }
+json Session::ExportDisk(const json&) { NotImplementedYet("export_disk"); }
 
 }  // namespace harness

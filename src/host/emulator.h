@@ -45,7 +45,7 @@ struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
 };
 
-// Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is AppleWin's g_dwSpeed (0..40; 10 = authentic,
+// Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is the session speed, applied to AppleWin's g_dwSpeed for realtime steps only (0..40; 10 = authentic,
 // 40 = SPEED_MAX, unthrottled).
 struct SpeedSettings {
     uint32_t machineSpeed;

@@ -111,10 +111,15 @@ Returns `{ frame_id, emulated_cycles, width, height, stride, format, data }`.
 - `every_n_frames` is 1 to 600. After this call, the connection receives `frame_ready { frame_id, emulated_cycles, width, height }` after every *n*-th presented frame.
 - Counting starts at the subscribe call. Calling it again replaces the setting and restarts the count. `every_n_frames: 0` unsubscribes.
 
-**`get_text_screen`** *(planned for M5; returns `-32006` for now)*
-Returns `{ mode: "40col" | "80col" | "graphics", lines: string[24] }`.
-- The text is decoded from video memory, which goes beyond strictly reading pixels. That's why it's opt-in (`allow_text_screen`).
-- It returns `mode: "graphics"` with empty `lines` when the screen isn't in a text mode.
+**`get_text_screen`** `{}`
+Returns `{ mode: "40col" | "80col" | "mixed40" | "mixed80" | "graphics", lines: string[24], emulated_cycles }`.
+- Agent method. It needs a session created with `allow_text_screen: true`; otherwise it returns `-32006`. The text is decoded from video memory, which goes beyond strictly reading pixels. That's why it's opt-in.
+- **Mode and page:** decoded from the video soft switches (TEXT, MIXED, PAGE2, 80COL, 80STORE, ALTCHARSET). `mode` is `40col` or `80col` for full-screen text, `mixed40` or `mixed80` for graphics with 4 text lines, and `graphics` for full graphics. With 80STORE on, PAGE2 selects memory banks, not the displayed page, so the display stays on page 1. 80-column lines interleave auxiliary (even columns) and main (odd columns) memory.
+- **Lines:** always 24. Text lines keep their trailing spaces, so each is exactly 40 characters (`40col`, `mixed40`) or 80 (`80col`, `mixed80`). In the mixed modes lines 0-19 are `""` and lines 20-23 are text. In `graphics`, all 24 lines are `""`.
+- **Character mapping:** every character becomes printable ASCII 0x20-0x7E.
+  - Inverse and flashing characters map to their base character, so the same letters come back whether they are inverse, flashing or normal.
+  - Normal-video codes $E0-$FF map to lowercase `a`-`z` (and `{|}~`), as on the //e. Normal $A0-$DF map to themselves.
+  - MouseText (in the alternate character set) and DEL map to a space, as does anything else outside 0x20-0x7E.
 
 ### Sound (D12, D14)
 The agent hears the same sound a person would: the speaker and Mockingboard, mixed together.
@@ -155,7 +160,7 @@ Returns `{ session_id }`.
 - The harness copies each image into a working directory (`%TEMP%\applewin-harness\<pid>\`) and mounts the copies. The original files are never opened for writing (D5).
 - A realtime session starts running. A stepped session starts paused, and emulation only advances in response to `step_frames`.
 - A second `create_session` returns `-32008`: there is one session per process.
-- **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `allow_text_screen: true`, `shared_memory_frames: true`, and `speed.video_refresh: 50` (PAL).
+- **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `shared_memory_frames: true`, and `speed.video_refresh: 50` (PAL).
 - `speed` is `{ video_refresh?: 50 | 60 = 60, ...set_speed params }`. It is validated before anything starts (`-32602`), and applied right after the emulator starts. `video_refresh: 50` returns `-32006`.
 
 **`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and checkpoints and exits the process with code 0. It is also valid when no session exists, and when the session is unusable. Use `export_disk` first to keep any results.

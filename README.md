@@ -2,12 +2,13 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). M4 is done: checkpoints (`checkpoint`, `restore_checkpoint`), `get_state_checksum`, `step_cycles` and disk export (`list_disks`, `export_disk`). See [project.md](project.md).
+**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). M4 is done: checkpoints (`checkpoint`, `restore_checkpoint`), `get_state_checksum`, `step_cycles` and disk export (`list_disks`, `export_disk`). M5 is implemented and awaiting human acceptance: an MCP agent adapter (`adapter/`) and `get_text_screen`. See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
 - [docs/api_spec.md](docs/api_spec.md) — the JSON-RPC API
 - [docs/decisions.md](docs/decisions.md) — design decisions and their status
+- [adapter/README.md](adapter/README.md) — the MCP server for LLM agents
 
 ## Prerequisites
 - Windows 10/11 x64
@@ -117,6 +118,15 @@ set HARNESS_EXE=%CD%\bin\x64\Release\AppleWinHarness.exe
 python -m unittest discover -s tests/python -v
 ```
 
+## MCP agent adapter
+`adapter/applewin_mcp` is an MCP server (stdio) that lets an LLM agent use the emulated Apple II. See [adapter/README.md](adapter/README.md) and the example task [adapter/examples/basic_count.md](adapter/examples/basic_count.md).
+
+```
+pip install -r adapter/requirements.txt
+python -m unittest discover -s tests/adapter -v
+```
+Run the adapter tests from the repository root, with `HARNESS_EXE` set as for the Python pipe tests.
+
 ## Tests
 ```
 REM everything
@@ -124,7 +134,7 @@ bin\x64\Debug\HarnessTests.exe
 REM what CI runs
 bin\x64\Debug\HarnessTests.exe -tse=windowed,audio
 ```
-Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64, runs `HarnessTests.exe -tse=windowed,audio`, and then the Python pipe tests.
+Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64, runs `HarnessTests.exe -tse=windowed,audio`, then the Python pipe tests, and then the adapter tests.
 
 ## License
 Not decided yet. The harness links AppleWin (GPL-2.0), so its license must be GPL-2.0-compatible (decision D6).

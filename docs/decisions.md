@@ -63,6 +63,8 @@ The **operator API** covers sessions, disks, checkpoints, stepping and state che
 
 The role is fixed per connection at `hello`, and the server enforces it.
 
+**MCP adapter (M5):** the MCP adapter (`adapter/applewin_mcp`) is the agent surface. It exposes only agent tools (type, press a key, joystick, wait, look, read the text screen, listen) and no operator method is reachable through it. Operator concerns (the disk, run mode, whether the text screen is allowed) are fixed at launch by command-line flags; the adapter connects as operator itself to create the session and step time, and the agent never sees that connection.
+
 ## D5 — Checkpoints replace separate disk snapshots
 **Status:** Accepted
 

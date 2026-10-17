@@ -46,6 +46,16 @@ jobs:
           python -m unittest discover -s tests/python -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Adapter tests (MCP server, headless)
+        shell: pwsh
+        env:
+          HARNESS_EXE: ${{ github.workspace }}\bin\x64\${{ matrix.config }}\AppleWinHarness.exe
+        run: |
+          python -m pip install -r adapter/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests/adapter -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload harness temp files on failure
         if: failure()
         uses: actions/upload-artifact@v7.0.2

@@ -142,6 +142,8 @@ Build an MCP server that wraps the agent API, and an example agent task (for exa
 
 **Acceptance:** an MCP-capable agent such as Claude completes the example task end to end.
 
+**Status:** implemented (the `adapter/applewin_mcp` MCP server, the harness `get_text_screen`, the example task `adapter/examples/basic_count.md` and CI), awaiting human acceptance: a person points Claude Code or Claude Desktop at the server and checks that the agent completes the example task (spec: `docs/specs/m5.md`).
+
 ### M6 — Hardening and release
 Add input rate limits, request size limits, structured logging, and a portable release bundle. Run the end-to-end scenario in CI.
 

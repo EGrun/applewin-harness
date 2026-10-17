@@ -25,6 +25,16 @@ ISO_UTC = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$")
 # card provides). Until then the speech tests fail with this message.
 SSI263_PROGRAM = None
 SSI263_MISSING = "SSI263 program not yet written (Task 4)"
+# Ruling D6: prints any-key-down ($C010 bit 7), buttons 0 and 1 ($C061, $C062), PDL(0) and PDL(1), so input state leaked
+# across a restore shows on screen and in RAM.
+PRINT_INPUT_STATE = 'PRINT PEEK(-16368);" ";PEEK(-16287);" ";PEEK(-16286);" ";PDL(0);" ";PDL(1)\n'
+# Disk II motor on ($C0E9); 20 x phases 3..0 on/off (head out to track 0); 30000 speaker toggles ($C030), ~30 s of tone.
+BUSY_PROGRAM = ("NEW\n"
+                "10 X=PEEK(49385)\n"
+                "20 FOR T=1 TO 20:FOR P=3 TO 0 STEP -1:X=PEEK(49377+2*P):X=PEEK(49376+2*P):NEXT:NEXT\n"
+                "30 FOR I=1 TO 30000:X=PEEK(49200):NEXT\n"
+                "RUN\n")
+SOUND_EVENTS = ("sound_started", "sound_stopped")
 
 
 def sha256_file(path):
@@ -58,6 +68,9 @@ def run_script(op, agent, from_cycle):
         records.append((cs["sha256"], cs["emulated_cycles"], frame["emulated_cycles"], frame_hash(frame)))
 
     record()
+    agent.call("type_text", text=PRINT_INPUT_STATE, inter_key_delay_ms=0)
+    op.call("step_frames", frames=30)
+    record()
     agent.call("type_text", text='10 PRINT "HI"\n', inter_key_delay_ms=0)
     op.call("step_frames", frames=40)
     record()
@@ -82,15 +95,17 @@ def run_script(op, agent, from_cycle):
 
 
 def unrelated_work(op, agent):
-    """Leaves the machine and the harness far from the checkpoint: disk head moved and motor run, speaker driven, a key
-    and a joystick change still held, text still queued."""
-    agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)
+    """Leaves the machine and the harness busy AT the restore (review I2): BUSY_PROGRAM has the Disk II motor on, the
+    head stepped out to track 0 (run 1's CATALOG leaves it on track 17) and the speaker toggling in a loop that is still
+    running; joystick 0 moved with button 0 down, a key held, text queued behind it, and an audio subscription
+    mid-sound."""
+    agent.call("subscribe_audio")
+    agent.call("type_text", text=BUSY_PROGRAM, inter_key_delay_ms=0)
     op.call("step_frames", frames=240)
-    agent.call("type_text", text="PRINT CHR$(7)\n", inter_key_delay_ms=0)
-    op.call("step_frames", frames=25)
-    agent.call("set_joystick", x=0, buttons={"0": True}, duration_ms=2000)
-    agent.call("press_key", key="Z", hold_ms=2000)
+    agent.call("set_joystick", x=0, y=255, buttons={"0": True}, duration_ms=5000)
+    agent.call("press_key", key="Z", hold_ms=5000)
     agent.call("type_text", text="LIST\n", inter_key_delay_ms=500)
+    op.call("step_frames", frames=20)
     op.call("step_cycles", cycles=4321)
 
 
@@ -320,6 +335,32 @@ class RestorePurityTest(CheckpointTestCase):
         op.call("step_frames", frames=120)
         self.assertEqual([n for n in agent.drain_notifications(quiet=0.3) if n.get("method") == "input_applied"], [])
 
+    def test_sound_detectors_reset_to_the_restored_cycle(self):
+        """Restore purity: a subscription that is mid-sound at the restore reports nothing more about that sound, and
+        its next events describe only audio after the restore."""
+        h = self.launch()
+        op, agent = self.booted(h)
+        op.call("step_frames", frames=30)
+        cp = op.call("checkpoint")
+        at = cp["emulated_cycles"]
+        self.assertEqual(agent.call("subscribe_audio"), {})
+        agent.call("type_text", text=BUSY_PROGRAM, inter_key_delay_ms=0)
+        op.call("step_frames", frames=300)
+        before = [n for n in agent.drain_notifications(quiet=0.5) if n.get("method") in SOUND_EVENTS]
+        self.assertTrue(before and before[-1]["method"] == "sound_started", "the tone is not sounding: {}".format(before))
+        tone_start = before[-1]["params"]["start_cycle"]
+
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
+        agent.call("type_text", text="PRINT CHR$(7)\n", inter_key_delay_ms=0)
+        op.call("step_frames", frames=120)
+        after = [n for n in agent.drain_notifications(quiet=0.5) if n.get("method") in SOUND_EVENTS]
+        self.assertEqual([n["method"] for n in after], ["sound_started", "sound_stopped"], after)
+        started, stopped = after[0]["params"], after[1]["params"]
+        self.assertEqual(stopped["start_cycle"], started["start_cycle"])
+        self.assertGreaterEqual(started["start_cycle"], at)
+        self.assertNotEqual(started["start_cycle"], tone_start, "an event about the pre-restore tone")
+        self.assertLess(stopped["duration_ms"], 300, "the bell's event spans pre-restore audio: {}".format(stopped))
+
     def test_audio_from_before_the_restore_is_gone(self):
         h = self.launch()
         op, agent = self.booted(h)
@@ -467,7 +508,7 @@ class RestoreFailureTest(CheckpointTestCase):
         self.assertRpcError(-32008, op, "step_frames", frames=1)
         self.assertRpcError(-32008, op, "step_cycles", cycles=1)
 
-    def test_restore_with_a_disk_copy_missing_gets_32004_not_a_hang(self):
+    def test_restore_with_a_disk_copy_missing_gets_32004_and_stays_usable(self):
         h = self.launch()
         op, _ = self.booted(h)
         cp = op.call("checkpoint")
@@ -476,8 +517,15 @@ class RestoreFailureTest(CheckpointTestCase):
         self.assertTrue(disk_copies, "no disk copy in {}".format(cp_dir))
         for f in disk_copies:
             os.remove(os.path.join(cp_dir, f))
+        op.call("step_frames", frames=30)
+        before = op.call("get_state_checksum")
+        disks_before = op.call("list_disks")
         self.assertRpcError(-32004, op, "restore_checkpoint", checkpoint_id=cp["checkpoint_id"])
-        self.assertUnusable(op)
+        # Ruling D7: the failure came before Snapshot_LoadState, so the session stays usable and nothing changed.
+        self.assertEqual(op.call("get_state_checksum"), before)
+        self.assertEqual(op.call("list_disks"), disks_before)
+        stepped = op.call("step_frames", frames=1)["emulated_cycles"]
+        self.assertGreater(stepped, before["emulated_cycles"])
 
     def test_restore_of_a_corrupt_state_file_gets_32004_with_the_message(self):
         h = self.launch()

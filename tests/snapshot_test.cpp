@@ -76,13 +76,29 @@ doctest::String toString(const Step& s)
     return (s.checksum + " @" + std::to_string(s.cycles) + " frame " + s.frame).c_str();
 }
 
+// PRINT PEEK(-16368) ($C010: any-key-down in bit 7), PEEK(-16287)/PEEK(-16286) (buttons 0 and 1), PDL(0), PDL(1).
+constexpr const char* kPrintInputState =
+    "PRINT PEEK(-16368);\" \";PEEK(-16287);\" \";PEEK(-16286);\" \";PDL(0);\" \";PDL(1)\r";
+
+// Motor on ($C0E9), 20 x phases 3..0 on/off (head out to track 0), then 30000 speaker toggles ($C030): ~30 s of tone.
+constexpr const char* kBusyProgram =
+    "NEW\r"
+    "10 X=PEEK(49385)\r"
+    "20 FOR T=1 TO 20:FOR P=3 TO 0 STEP -1:X=PEEK(49377+2*P):X=PEEK(49376+2*P):NEXT:NEXT\r"
+    "30 FOR I=1 TO 30000:X=PEEK(49200):NEXT\r"
+    "RUN\r";
+
 // The script of pass condition 1: input mixed with whole-frame and cycle-exact steps, a bell for audio, and a short disk
 // read (CATALOG; ruling D4: both runs start from a restore, which reseeds rand() the same way, D2). Records the
-// checksum, cycle and frame hash after every step.
+// checksum, cycle and frame hash after every step. Its first statement prints the input state (ruling D6: any-key-down,
+// buttons 0 and 1, paddles 0 and 1), so a key or joystick change leaked across the restore shows on screen and in RAM.
 ScriptRun RunScript(Emulator& e, uint64_t fromCycle)
 {
     ScriptRun r;
     auto record = [&] { r.steps.push_back(Step{e.StateChecksum(), e.EmulatedCycles(), RawFrameHash(e.Frame())}); };
+    record();
+    e.QueueText(kPrintInputState, 0);
+    REQUIRE(e.RunFrames(30));
     record();
     e.QueueText("10 PRINT \"HI\"\r", 0);
     REQUIRE(e.RunFrames(40));
@@ -107,20 +123,22 @@ ScriptRun RunScript(Emulator& e, uint64_t fromCycle)
     return r;
 }
 
-// Work between the restores that leaves the machine and the harness in a very different state: the disk head moved and
-// the motor run, the speaker driven, a key and a joystick change still held, text still queued.
+// Work between the restores that leaves the machine and the harness busy AT the restore (review I2): kBusyProgram turns
+// the Disk II motor on, steps the head out to track 0 (run 1's CATALOG leaves it on the catalog track, 17) and then
+// toggles the speaker in a long loop that is still running at the restore. Meanwhile joystick 0 is moved with button 0
+// down, a key is held, and text is still queued behind the unread key.
 void UnrelatedWork(Emulator& e)
 {
-    e.QueueText("CATALOG\r", 0);
+    e.QueueText(kBusyProgram, 0);
     REQUIRE(e.RunFrames(240));
-    e.QueueText("PRINT CHR$(7)\r", 0);
-    REQUIRE(e.RunFrames(25));
     JoystickChange j;
     j.x = uint8_t(0);
+    j.y = uint8_t(255);
     j.button0 = true;
-    e.QueueJoystick(j, 2000);
-    e.QueueKey(uint8_t('Z'), 2000);
+    e.QueueJoystick(j, 5000);
+    e.QueueKey(uint8_t('Z'), 5000);
     e.QueueText("LIST\r", 500);
+    REQUIRE(e.RunFrames(20));
     e.RunCycles(4321);
 }
 
@@ -188,6 +206,13 @@ std::string StringHash(const std::string& s)
 // SHA-256 of a reply's base64 "data" text (equal text, equal bytes).
 std::string DataHash(const json& reply) { return StringHash(reply["data"].get<std::string>()); }
 
+// type_text's form of an in-process text: RETURN is sent as "\n".
+std::string PipeText(std::string s)
+{
+    std::replace(s.begin(), s.end(), '\r', '\n');
+    return s;
+}
+
 struct PipeRun {
     std::vector<std::string> records;   // "checksum @cycles frame-hash" after every step
     std::string audioHash;              // SHA-256 of get_audio's base64 PCM16 over the script's range
@@ -204,6 +229,9 @@ PipeRun RunPipeScript(PipeClient& op, PipeClient& agent, uint64_t fromCycle)
         r.records.push_back(cs["sha256"].get<std::string>() + " @" + std::to_string(cs["emulated_cycles"].get<uint64_t>()) +
                             " " + DataHash(frame));
     };
+    record();
+    Result(agent, "type_text", {{"text", PipeText(kPrintInputState)}, {"inter_key_delay_ms", 0}});
+    Result(op, "step_frames", {{"frames", 30}});
     record();
     Result(agent, "type_text", {{"text", "10 PRINT \"HI\"\n"}, {"inter_key_delay_ms", 0}});
     Result(op, "step_frames", {{"frames", 40}});
@@ -240,16 +268,25 @@ std::pair<PipeRun, PipeRun> CheckpointReplayOverPipe(const std::wstring& args)
     auto agent = Connect(s, "agent");
     const json cp = Result(*op, "checkpoint", {{"name", "pc3"}});
     const uint64_t at = cp["emulated_cycles"].get<uint64_t>();
+    const std::string atChecksum = Result(*op, "get_state_checksum")["sha256"].get<std::string>();
     Result(*op, "step_frames", {{"frames", 30}});
     Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
     PipeRun a = RunPipeScript(*op, *agent, at);
-    // Unrelated work: a disk read, a bell, frames, a held key.
-    Result(*agent, "type_text", {{"text", "CATALOG\nPRINT CHR$(7)\n"}, {"inter_key_delay_ms", 0}});
-    Result(*op, "step_frames", {{"frames", 300}});
-    Result(*agent, "press_key", {{"key", "Z"}, {"hold_ms", 2000}});
+    // Unrelated work as UnrelatedWork in-process, still busy at the restore: motor on, head at track 0, speaker
+    // toggling, joystick moved with button 0 down, a key held, text queued, and an audio subscription mid-sound.
+    Result(*agent, "subscribe_audio");
+    Result(*agent, "type_text", {{"text", PipeText(kBusyProgram)}, {"inter_key_delay_ms", 0}});
+    Result(*op, "step_frames", {{"frames", 240}});
+    Result(*agent, "set_joystick", {{"x", 0}, {"y", 255}, {"buttons", {{"0", true}}}, {"duration_ms", 5000}});
+    Result(*agent, "press_key", {{"key", "Z"}, {"hold_ms", 5000}});
+    Result(*agent, "type_text", {{"text", "LIST\n"}, {"inter_key_delay_ms", 500}});
+    Result(*op, "step_frames", {{"frames", 20}});
     Result(*op, "step_cycles", {{"cycles", 4321}});
     Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
     PipeRun b = RunPipeScript(*op, *agent, at);
+    // Each run's first record was taken straight after a restore: the checkpoint's own checksum.
+    CHECK(a.records[0].rfind(atChecksum, 0) == 0);
+    CHECK(b.records[0].rfind(atChecksum, 0) == 0);
     Result(*op, "close_session");
     return {a, b};
 }
@@ -281,7 +318,7 @@ TEST_CASE("ckpt: two restored runs replay the script exactly, whatever ran befor
     CHECK(e.EmulatedCycles() == at);              // the cycle origin comes from the checkpoint
     CHECK(e.StateChecksum() == checksumAt);
     const ScriptRun first = RunScript(e, at);
-    REQUIRE(first.steps.size() == 8);
+    REQUIRE(first.steps.size() == 9);
     CHECK_MESSAGE(!AllZero(first.audio), "the script's bell left no audio: the audio comparison would prove nothing");
 
     UnrelatedWork(e);
@@ -356,7 +393,11 @@ TEST_CASE("ckpt: frames after PowerCycle equal a fresh process's through the DOS
     WorkingCopy copy(DosMasterImage(), dir.path / "disk");
     e.InsertDisk(0, copy.Path());
     EjectAndPowerCycle guard{e};
-    REQUIRE(e.RunFrames(37));   // leave the machine mid-frame and mid-boot first: PowerCycle must not depend on it
+    // Leave the machine mid-boot and mid-frame first (a realtime run ends at an arbitrary cycle, not on a frame
+    // boundary): PowerCycle must not depend on it. RunFrames alone would keep the video scanner frame-aligned, and the
+    // test would then pass even with a stale scanner phase.
+    REQUIRE(e.RunFrames(37));
+    REQUIRE(e.RunRealtime(std::chrono::milliseconds(30)));
     e.PowerCycle();
     for (int i = 0; i < kSamples; ++i) {
         REQUIRE(e.RunFrames(10));

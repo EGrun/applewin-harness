@@ -188,8 +188,9 @@ public:
     void LoadSnapshot(const std::filesystem::path& stateFile, const SnapshotMeta& meta);
     // SHA-256 (64 lowercase hex) over the documented byte layout of docs/specs/m4.md get_state_checksum: CPU
     // registers, memory mode, main and aux RAM with the language-card banks (shadow pages flushed first, as
-    // MemSaveSnapshot does), keyboard latch and strobe, video mode, Disk II controller state. Never wall-clock, paths or
-    // harness bookkeeping.
+    // MemSaveSnapshot does), keyboard latch and strobe, video mode, Disk II controller state, and (ruling D6) the //e
+    // any-key-down flag, joystick buttons 0 and 1 and paddle positions 0 and 1. Never wall-clock, paths or harness
+    // bookkeeping.
     std::string StateChecksum() const;
     // A stepped run of exactly cycles cycles (more only because of the last instruction); the input queue is serviced
     // at each step boundary as in RunFrames. 0 does nothing.

@@ -50,7 +50,7 @@ public:
 
     // The operator-only methods (create_session, close_session, pause, resume, step_frames, set_speed, get_speed, and
     // M4's checkpoint, restore_checkpoint, list_checkpoints, delete_checkpoint, get_state_checksum, step_cycles,
-    // list_disks, export_disk); PipeServer's isOperatorOnly.
+    // list_disks, export_disk, and M5's insert_disk, eject_disk); PipeServer's isOperatorOnly.
     static bool IsOperatorOnly(std::string_view method);
 
 private:

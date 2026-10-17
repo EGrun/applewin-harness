@@ -9,8 +9,10 @@ the harness is running.
 import asyncio
 import base64
 import contextlib
+import hashlib
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -22,6 +24,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from applewin_mcp.harness_client import REPO_ROOT, exe_path  # noqa: E402
 
+sys.path.insert(0, os.path.join(REPO_ROOT, "tests", "python"))
+from test_disks import UNIQUE_NAME, build_fixture  # noqa: E402  (the disk-swap fixture builder)
+
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
@@ -30,7 +35,8 @@ ADAPTER_DIR = os.path.join(REPO_ROOT, "adapter")
 CALL_TIMEOUT = 120.0
 TEST_TIMEOUT = 300.0
 
-ALL_TOOLS = ["listen", "look", "press_key", "read_screen", "set_joystick", "type_text", "wait"]
+ALL_TOOLS = ["eject_disk", "insert_disk", "listen", "look", "press_key", "read_screen", "set_joystick", "type_text",
+             "wait"]
 NO_TEXT_TOOLS = [t for t in ALL_TOOLS if t != "read_screen"]
 
 
@@ -69,6 +75,30 @@ async def mcp_session(errlog, text_screen=True, extra_args=()):
 
 async def call(session, name, **arguments):
     return await asyncio.wait_for(session.call_tool(name, arguments), CALL_TIMEOUT)
+
+
+FIXTURE_DIR = None   # a tempfile directory for the module, removed in tearDownModule
+FIXTURE_DISK = None  # a DOS 3.3 disk holding the program UNIQUE_NAME (built once, with a pipe session)
+
+
+def setUpModule():
+    global FIXTURE_DIR, FIXTURE_DISK
+    FIXTURE_DIR = tempfile.mkdtemp(prefix="awh-m5-adapter-")
+    FIXTURE_DISK = os.path.join(FIXTURE_DIR, "fixture.dsk")
+    try:
+        build_fixture(FIXTURE_DISK)
+    except BaseException:
+        shutil.rmtree(FIXTURE_DIR, True)
+        raise
+
+
+def tearDownModule():
+    shutil.rmtree(FIXTURE_DIR, True)
+
+
+def sha256_file(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 class AdapterTestCase(unittest.TestCase):
@@ -195,6 +225,48 @@ class EndToEndTest(AdapterTestCase):
                     with self.subTest(name=name, ms=ms, kind="out of range"):
                         result = await call(s, name, ms=ms)
                         self.assertTrue(result.is_error, "{}(ms={}) must be rejected".format(name, ms))
+        self.run_async(go)
+
+
+class DiskSwapTest(AdapterTestCase):
+    def test_swap_disks_while_the_machine_runs(self):
+        """Pass condition 5: eject and insert in drive 1, load and empty drive 2; the originals are never written."""
+        master_before, fixture_before = sha256_file(DOS_IMAGE), sha256_file(FIXTURE_DISK)
+
+        async def catalog(s, command):
+            typed = await call(s, "type_text", text="HOME\n" + command + "\n")
+            self.assertFalse(typed.is_error, text_of(typed))
+            await call(s, "wait", ms=4000)
+            return text_of(await call(s, "read_screen"))
+
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                self.assertNotIn(UNIQUE_NAME, await catalog(s, "CATALOG"))
+                ejected = await call(s, "eject_disk", drive=1)
+                self.assertFalse(ejected.is_error, text_of(ejected))
+                inserted = await call(s, "insert_disk", drive=1, path=FIXTURE_DISK)
+                self.assertFalse(inserted.is_error, text_of(inserted))
+                self.assertIn(UNIQUE_NAME, await catalog(s, "CATALOG"))
+                inserted = await call(s, "insert_disk", drive=2, path=DOS_IMAGE)
+                self.assertFalse(inserted.is_error, text_of(inserted))
+                self.assertIn("HELLO", await catalog(s, "CATALOG,D2"))
+                ejected = await call(s, "eject_disk", drive=2)
+                self.assertFalse(ejected.is_error, text_of(ejected))
+                again = await call(s, "eject_disk", drive=2)   # empty now
+                self.assertTrue(again.is_error)
+        self.run_async(go)
+        self.assertEqual(sha256_file(DOS_IMAGE), master_before)
+        self.assertEqual(sha256_file(FIXTURE_DISK), fixture_before)
+
+    def test_insert_disk_reports_harness_errors_as_tool_errors(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                missing = await call(s, "insert_disk", drive=2, path=os.path.join(FIXTURE_DIR, "missing.dsk"))
+                self.assertTrue(missing.is_error)
+                self.assertNotIn("Error executing tool", text_of(missing))   # the harness's message, not the opaque stub text
+                bad_drive = await call(s, "insert_disk", drive=3, path=FIXTURE_DISK)
+                self.assertTrue(bad_drive.is_error)
         self.run_async(go)
 
 

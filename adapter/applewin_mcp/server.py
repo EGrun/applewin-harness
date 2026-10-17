@@ -257,6 +257,17 @@ def build_server(args, machine):
         _check_range("ms", ms, *LISTEN_RANGE)
         return await asyncio.to_thread(machine.listen, ms)
 
+    @mcp.tool()
+    async def insert_disk(drive: int, path: str, write_protected: bool = False) -> str:
+        """Put a floppy disk image in slot 6, drive 1 or 2, replacing any disk already there. The machine keeps
+        running and is not rebooted."""
+        raise NotImplementedError("insert_disk")
+
+    @mcp.tool()
+    async def eject_disk(drive: int) -> str:
+        """Take the floppy out of slot 6, drive 1 or 2. An empty drive is an error."""
+        raise NotImplementedError("eject_disk")
+
     return mcp
 
 

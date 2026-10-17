@@ -24,6 +24,8 @@ BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC
 TEST_TIMEOUT_S = 60.0
 DOS_IMAGE = os.path.join(REPO_ROOT, "external", "AppleWin", "bin", "DOS 3.3 System Master - 680-0210-A.dsk")
 WINDOWED = os.environ.get("HARNESS_WINDOWED") == "1"
+# Realtime rates measured over the pipe: +/-10% (the C++ realtime suite holds the spec's +/-2%, +/-3% on CI).
+RATE_TOLERANCE = 0.10
 
 
 def ms_to_cycles(ms):
@@ -368,6 +370,40 @@ class SpeedTest(PipeTestCase):
         frame = agent.call("get_frame", format="PNG")
         return png_rgb_sha256(base64.b64decode(frame["data"]))[2]
 
+    def boot_hashes(self, set_speed):
+        """A stepped DOS boot with the given speed settings: the frame hash every 10 frames up to 720 (ruling C7)."""
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", timeout=30.0, run_mode="stepped", disks=dos_disks())
+        if set_speed:
+            op.call("set_speed", **set_speed)
+        agent = h.connect("agent")
+        hashes = []
+        for _ in range(72):
+            op.call("step_frames", frames=10)
+            frame = agent.call("get_frame", format="PNG")
+            hashes.append(png_rgb_sha256(base64.b64decode(frame["data"]))[2])
+        self.assertEqual(op.call("get_speed")["enhance_disk_speed"], set_speed.get("enhance_disk_speed", True))
+        return hashes
+
+    def frames_per_wall_second(self, agent, wall_s):
+        """Emulated cycles per wall second over `wall_s`, from the frame_ready notifications' arrival times."""
+        agent.call("subscribe_frames", every_n_frames=1)
+        first = last = None
+        start = time.monotonic()
+        while time.monotonic() - start < wall_s:
+            try:
+                note = agent.next_notification(timeout=0.2)
+            except TimeoutError:
+                continue
+            if note.get("method") != "frame_ready":
+                continue
+            point = (time.monotonic(), note["params"]["emulated_cycles"])
+            first = first or point
+            last = point
+        self.assertIsNotNone(first, "no frame_ready arrived")
+        return (last[1] - first[1]) / (last[0] - first[0])
+
     def test_defaults(self):
         h = self.launch()
         op = self.stepped_session(h)
@@ -485,30 +521,42 @@ class SpeedTest(PipeTestCase):
             "machine_speed 40": self.scenario_hash(set_speed={"machine_speed": 40}),
             "full_speed_override": self.scenario_hash(set_speed={"full_speed_override": True}),
             "create_session speed 40": self.scenario_hash(speed={"machine_speed": "max"}),
-            "enhance_disk_speed off": self.scenario_hash(set_speed={"enhance_disk_speed": False}),
         }
         for name, digest in runs.items():
             with self.subTest(name):
                 self.assertEqual(digest, expected)
 
+    def test_stepped_boot_frames_are_the_same_at_any_speed_setting(self):
+        """Ruling C7: stepped runs use AppleWin's defaults (speed 10, enhanced disk access), so the frames all through a
+        DOS boot are the same with enhance_disk_speed off (AppleWin's disk timing differs mid-boot when it is off in
+        a run) and at other speeds."""
+        reference = self.boot_hashes({})
+        for set_speed in ({"enhance_disk_speed": False}, {"machine_speed": 20, "enhance_disk_speed": False},
+                          {"machine_speed": 5}):
+            with self.subTest(json.dumps(set_speed)):
+                hashes = self.boot_hashes(set_speed)
+                differing = [10 * (i + 1) for i, (a, b) in enumerate(zip(hashes, reference)) if a != b]
+                self.assertEqual(differing, [], "frames that differ")
+
     def test_set_speed_while_running_changes_the_pace(self):
         h = self.launch()
         op = h.connect("operator")
-        op.call("create_session", run_mode="realtime")
+        # Enhance off: with no disk the boot ROM keeps the motor on, which would otherwise run at full speed.
+        op.call("create_session", run_mode="realtime", speed={"enhance_disk_speed": False})
         agent = h.connect("agent")
-        op.call("set_speed", machine_speed=20)
+        got = op.call("set_speed", machine_speed=20)
+        self.assertEqual(got["full_speed_reasons"], [])
         time.sleep(0.5)
-        start = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
-        time.sleep(1.5)
-        end = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
-        rate = (end - start) / 1.5
-        self.assertGreater(rate, 1.5 * BASE_CLOCK_HZ, "machine_speed 20 did not run faster than authentic")
+        rate = self.frames_per_wall_second(agent, 2.0)
+        self.assertGreaterEqual(rate, 2.0 * BASE_CLOCK_HZ * (1 - RATE_TOLERANCE), "rate {:.0f}".format(rate))
+        self.assertLessEqual(rate, 2.0 * BASE_CLOCK_HZ * (1 + RATE_TOLERANCE), "rate {:.0f}".format(rate))
 
     def test_frame_ready_is_capped_at_60_per_second_at_max(self):
         """Realtime at max: subscribe to every frame for 2 s of wall time; at most 60 per wall second arrive."""
         h = self.launch()
         op = h.connect("operator")
-        op.call("create_session", run_mode="realtime", speed={"machine_speed": "max"})
+        # Enhance off, so max is the only reason (no disk_motor from the empty drive).
+        op.call("create_session", run_mode="realtime", speed={"machine_speed": "max", "enhance_disk_speed": False})
         agent = h.connect("agent")
         agent.call("subscribe_frames", every_n_frames=1)
         first_cycles = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
@@ -530,6 +578,9 @@ class SpeedTest(PipeTestCase):
         rate = (last_cycles - first_cycles) / elapsed
         self.assertGreater(rate, 2 * BASE_CLOCK_HZ, "max ran at {:.0f} cycles/s".format(rate))
         self.assertGreater(count, 20, "frame_ready stopped arriving at max")
+        speed = op.call("get_speed")
+        self.assertEqual(speed["full_speed_reasons"], ["machine_speed_max"])
+        self.assertTrue(speed["full_speed_active"])
 
 
 # ---- Agent methods ----

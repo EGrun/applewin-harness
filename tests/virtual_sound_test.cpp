@@ -389,8 +389,7 @@ TEST_SUITE("realtime")
         struct RestoreSpeed {
             ~RestoreSpeed()
             {
-                g_dwSpeed = SPEED_NORMAL;
-                SetCurrentCLK6502();
+                try { Emulator::Instance().SetMachineSpeed(SPEED_NORMAL); } catch (...) {}
             }
         } restoreSpeed;
 

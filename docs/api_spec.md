@@ -58,7 +58,7 @@ The first message on every connection must be `hello`:
 ## Time (D10)
 - **`emulated_cycles`** is the number of 6502 cycles since power-on.
 - **`emulated_ms`** is `emulated_cycles` divided by the base clock: about 1.0205 MHz (NTSC, 60 Hz) or the PAL clock (50 Hz). It ignores the speed setting.
-- **Every duration in the API is in emulated milliseconds.** This covers `hold_ms`, `inter_key_delay_ms` and `duration_ms`. As a result, a script gives the same results at any speed and in either run mode.
+- **Every duration in the API is in emulated milliseconds.** This covers `hold_ms`, `inter_key_delay_ms` and `duration_ms`. As a result, input timing doesn't depend on the speed, and a stepped script gives the same results at any speed setting: stepped runs always use authentic speed and enhanced disk access, and speed settings affect realtime runs only.
 - **Every input response includes `input_id` and `applied_at_cycle`.** `applied_at_cycle` is the emulated cycle at which the input will take effect, or `null` if that isn't known yet. The exact cycles arrive in an `input_applied` notification (see Input replies).
 
 ## Agent API
@@ -182,7 +182,7 @@ Any field left out keeps its current value. Returns the same result as `get_spee
 |---|---|---|
 | `machine_speed` | Config dialog speed slider | `"authentic"` is the same as 10. `"max"` is the same as 40. 0–9 give a multiplier of `0.5 + 0.05 × value`; 10–39 give `value / 10`; 40 runs unthrottled. |
 | `clock_multiplier` | `-clock-multiplier` | Converted to a slider value: below 0.5 is raised to 0.5; below 1 gives `(int)((x−0.5)×20)`; otherwise `(int)(x×10)`, capped at 39. It can't select unthrottled speed. Sending it together with `machine_speed` is an invalid-params error (`-32602`). |
-| `enhance_disk_speed` | Config ▸ "Enhance disk access speed" (default `true`) | Runs at full speed while a Disk II motor is on, provided the speaker and Mockingboard are silent. An empty drive keeps its motor on, so with this setting a realtime session with no disk runs at full speed (AppleWin's own rule). Set it to `false` to keep authentic pacing. |
+| `enhance_disk_speed` | Config ▸ "Enhance disk access speed" (default `true`) | Runs at full speed while a Disk II motor is on, provided the speaker and Mockingboard are silent. An empty drive keeps its motor on, so with this setting a realtime session with no disk runs at full speed (AppleWin's own rule). Set it to `false` to keep authentic pacing. Realtime runs only: stepped runs always use enhanced disk access. |
 | `full_speed_override` | Holding or toggling Scroll Lock | Forces full speed while it's on. |
 
 **`get_speed`** returns:
@@ -202,7 +202,7 @@ Any field left out keeps its current value. Returns the same result as `get_spee
 ```
 
 **Rules:**
-- **Speed settings only affect realtime pacing (D9).** In stepped mode they are stored and reported but can't change emulated results.
+- **Stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only (D9, ruling C7).** In stepped mode the settings are stored and reported, and they can't change emulated results: frames, CPU state and captured audio are the same at every setting. (In a realtime run, `enhance_disk_speed` also changes AppleWin's disk timing, and the speed changes how many samples AppleWin's sound devices produce per cycle.)
 - **At full speed in realtime mode**, frames are redrawn the way AppleWin does it, and `frame_ready` notifications are limited to one per 16 ms of wall-clock time per subscription (about 62.5 per second). Extra presents are dropped; `frame_id` stays monotonic, so ids can skip. Expect one extra `frame_ready` when leaving full speed.
 - **Windowed playback follows speed.** The window plays sound only at `machine_speed` 10 and not at full speed. Agent audio capture (`get_audio`, `subscribe_audio`) is unaffected, but silent while a run is at full speed.
 - **Speed is a session setting.** `restore_checkpoint` doesn't change it.

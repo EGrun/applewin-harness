@@ -57,6 +57,12 @@ inline RegistryStamp& RegistryStampBeforeStartRef()
 }
 inline const RegistryStamp& RegistryStampBeforeStart() { return RegistryStampBeforeStartRef(); }
 
+// Realtime rate tolerance (ruling C8): the spec's +/-2% locally, +/-3% on CI's shared runners (GitHub sets CI).
+inline double RealtimeRateTolerance()
+{
+    return GetEnvironmentVariableA("CI", nullptr, 0) > 0 ? 0.03 : 0.02;
+}
+
 inline void ShutdownAtExit() { Emulator::Instance().Shutdown(); }
 
 // Lazily starts the shared headless emulator with %TEMP%\applewin-harness\tests.ini; Shutdown is registered with atexit.

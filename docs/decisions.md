@@ -132,7 +132,7 @@ AppleWin times emulation by counting 6502 cycles. The video scanner, Disk II, sp
 **Stepped mode** has no timer:
 - `step_frames(n)` runs exactly `n × NTSC_GetCyclesPerFrame()` cycles. That's 17,030 cycles per frame at 60 Hz (65 × 262).
 - Video is always rendered (`bVideoUpdate = true`), even when a full-speed condition would apply.
-- Speed settings (D11) therefore can't change emulated results in stepped mode.
+- Stepped runs always use authentic speed and enhanced disk access (AppleWin's defaults); speed settings (D11) affect realtime runs only, so they can't change stepped results: frames, CPU state or captured audio (ruling C7). Both matter otherwise: `g_fCurrentCLK6502` sets the speaker's and Mockingboard's samples per cycle, and enhanced disk access changes AppleWin's disk timing.
 - Sound playback is muted (D8), and the speaker feedback isn't used. Agent audio capture (D12) continues.
 
 ## D10 — Emulated time and input timing
@@ -169,6 +169,7 @@ The operator API offers exactly the speed controls AppleWin has, with AppleWin's
 - `frame_ready` is capped at one per 16 ms of wall time per subscription while stepping at full speed, matching AppleWin's full-speed redraw interval.
 - An empty Disk II drive keeps its motor on, so with `enhance_disk_speed` (default true) a realtime or windowed run with no disk spins at full speed. This is AppleWin's rule, not a harness addition.
 - Windowed playback happens only at authentic speed (`machine_speed` 10) and not at full speed (see D14).
+- Ruling C7: stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only. The session's machine speed is held by the harness and applied to AppleWin (`g_dwSpeed`, then `SetCurrentCLK6502()`, as AppleWin's config dialog does) at the start of every realtime step; every stepped step applies speed 10. AppleWin's clock therefore changes only when a step needs another one, because `SetCurrentCLK6502` also re-initializes the speaker (it drops a partial sample) and the Mockingboard clock. `clock_multiplier` uses a copy of `UseClockMultiplier`'s conversion for the same reason, clamped at 4.0 first (AppleWin's `(ULONG)(x × 10)` is undefined for huge values; 3.9 and above give 39 anyway); a test pins it to AppleWin's function. A stepped run turns enhanced disk access on and restores the session's setting when it ends. Cost: a stepped run can't reproduce enhance-off disk timing.
 
 **How the slider value maps to speed** (`SetCurrentCLK6502`):
 - Values 0–9 give a multiplier of `0.5 + 0.05 × value`.

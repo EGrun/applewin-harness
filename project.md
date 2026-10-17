@@ -122,6 +122,14 @@ Add `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `list_disks`, `exp
 - SSI263 speech (Mockingboard) is covered by an end-to-end determinism test that runs an MB/SSI263 program in both display modes (D14 removed the old D8 exception).
 - Audio capture is split-independent if checkpoint replay steps in different chunks: today the same step partition is required (ruling B13); anchoring each voice by its own cumulative sample count is the planned fix.
 
+**Carried from the M3 Part C final review** (M4-1, speed in stepped runs, is resolved by ruling C7: stepped runs always use authentic speed and enhanced disk access):
+- M4-2: `m_enhanceDisk` is in AppleWin's Disk II save-state, so loading one overwrites the session's `enhance_disk_speed`. Re-apply the session's speed settings after a restore.
+- M4-3: the C runtime `rand()` stream (Disk II uses it) is outside AppleWin's save-state. Save and reseed it on restore.
+- M4-4: harness state outside AppleWin must be captured or cleared on restore: the input queue (pending events, held keys, applied map, next id), the `AudioCapture` ring and per-voice positions, the sound-event detector, and `g_cyclesAtPowerOn` (the cycle origin for capture and `input_applied`).
+- M4-5: speaker internals (remainder buffer, `g_nSpkrLastCycle`, quiet counters) aren't in AppleWin's save-state either; expect ±1 LSB audio differences after a restore unless the checksum covers frames and CPU state only. (Related: the video scanner's position in the frame, `g_dwCyclesThisFrame`, survives a power cycle, so frames sampled after a `PowerCycle` in one process are not comparable with a fresh boot's unless it is reset.)
+- M4-6: `frame_id` skips at full speed and gains one on leaving it, so checkpoints and replays should key on `emulated_cycles`.
+- M4-7: a checkpoint taken while Running must end the realtime run first, so `g_bFullSpeed` and the Mockingboard mute are cleared before the snapshot.
+
 ### M5 — Agent adapter
 Build an MCP server that wraps the agent API, and an example agent task (for example, write and run a short BASIC program).
 

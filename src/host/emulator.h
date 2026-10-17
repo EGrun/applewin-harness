@@ -69,7 +69,8 @@ public:
     uint64_t EmulatedCycles() const;     // cycles since the last power-on (D10)
 
     // Runs exactly frames x NTSC_GetCyclesPerFrame() cycles (more only because of the last instruction), in steps of
-    // 1 ms or less (stepped: at the base clock, whatever the speed). Realtime: BurstBudget at EffectiveClockHz() +
+    // 1 ms or less (stepped: at speed 10 with enhanced disk access, whatever the settings; ruling C7).
+    // Realtime: BurstBudget at EffectiveClockHz() +
     // AudioOutput feedback per step, paced by RealtimePacer (D9, D14); while FullSpeedActive(), unpaced steps of the same
     // size with AppleWin's full-speed video redraws (D11). AudioOutput plays only during a Realtime run, at speed 10 and
     // not at full speed. Returns false if the window was closed (checked after every step).
@@ -125,19 +126,22 @@ public:
     // PowerCycle. Fed by the VirtualSoundBuffers AppleWin creates, in every mode.
     const AudioCapture& Audio() const;
 
-    // ---- Speed controls (D11). Session settings: they survive PowerCycle. Only realtime pacing is affected; stepped
-    // runs never change. Each throws std::logic_error before Start.
-    // g_dwSpeed = v (std::out_of_range above 40), then SetCurrentCLK6502().
+    // ---- Speed controls (D11). Session settings: they survive PowerCycle. Stepped runs always use authentic speed and
+    // enhanced disk access; speed settings affect realtime runs only (ruling C7). Each throws std::logic_error before
+    // Start.
+    // The session's machine speed (std::out_of_range above 40). AppleWin's g_dwSpeed is set and SetCurrentCLK6502()
+    // called at the start of each realtime step (each stepped step applies 10), only when it differs.
     void SetMachineSpeed(uint32_t speed);
-    // AppleWin's ::UseClockMultiplier(x): converts to a slider value (never 40). x must be finite and above 0
-    // (std::invalid_argument otherwise).
+    // AppleWin's UseClockMultiplier conversion to a slider value (never 40), after clamping x to at most 4.0. x must be
+    // finite and above 0 (std::invalid_argument otherwise).
     void UseClockMultiplier(double multiplier);
-    // GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(b). Default true.
+    // GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(b). Default true. A stepped run turns it on and restores it.
     void SetEnhanceDiskSpeed(bool enable);
     // Harness stand-in for Scroll Lock: forces full speed in realtime runs. Default false.
     void SetFullSpeedOverride(bool enable);
     SpeedSettings Speed() const;
-    // g_fCurrentCLK6502 (still the clock of speed 40 as AppleWin sets it; callers report null at 40).
+    // SetCurrentCLK6502's clock for the session's speed: g_fCurrentCLK6502 during a realtime run (still the clock of
+    // speed 40 as AppleWin sets it; callers report null at 40).
     double EffectiveClockHz() const;
     // Why a realtime step would run at full speed right now, in this order: "machine_speed_max", "override",
     // "disk_motor" (Disk II motor on, enhance on, speaker and Mockingboard silent).

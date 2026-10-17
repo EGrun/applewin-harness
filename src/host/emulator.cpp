@@ -345,15 +345,58 @@ void ProcessDueInput()
 }
 
 
-// ---- Speed (D11; docs/specs/m3.md Part C). g_dwSpeed, the clock and enhance-disk are AppleWin's own state.
+// ---- Speed (D11; docs/specs/m3.md Part C; Ruling C7).
+// The session's machine speed is the harness's own (g_sessionSpeed). AppleWin's g_dwSpeed and clock are what the
+// current or last step needed: every step first calls ApplyClock, with SPEED_NORMAL in a stepped run and with
+// g_sessionSpeed in a realtime run. So AppleWin's clock only changes at the start of a step, and only when the step
+// needs another one. Changing it eagerly (in set_speed, or back after every stepped run) would not do:
+// SetCurrentCLK6502 re-initializes the speaker (SpkrReinitialize drops its partial sample) and the Mockingboard clock,
+// so stepped audio would depend on the speed setting and on when it was set.
+// Enhanced disk access is AppleWin's card state and is the session's setting outside stepped runs: a stepped run
+// turns it on and restores it when the run ends (SteppedEnhance). It has no side effects.
 bool g_fullSpeedOverride = false;   // SetFullSpeedOverride: the harness's stand-in for Scroll Lock
+uint32_t g_sessionSpeed = SPEED_NORMAL;   // the session's machine speed (Start: the INI's, as LoadConfiguration set it)
+
+// What AppleWin does on a speed change (the config dialog, PageConfig.cpp, and the speed hotkeys, WinFrame.cpp): set
+// g_dwSpeed, then SetCurrentCLK6502(), which recomputes g_fCurrentCLK6502 and re-initializes the speaker's samples per
+// cycle (SpkrReinitialize) and the Mockingboard clock (ReinitializeClock). Only when the speed differs.
+void ApplyClock(uint32_t speed)
+{
+    if (g_dwSpeed == speed)
+        return;
+    g_dwSpeed = speed;
+    SetCurrentCLK6502();
+}
+
+// SetCurrentCLK6502's clock for a speed (Core.cpp), without applying it.
+double ClockForSpeed(uint32_t speed)
+{
+    const double mhz = speed < SPEED_NORMAL ? 0.5 + double(speed) * 0.05 : double(speed) / 10.0;
+    return Get6502BaseClock() * mhz;
+}
+
+// A stepped run's enhanced disk access: on for the run (AppleWin's default, kEnhanceDiskAccessSpeed_Default), then
+// the session's setting again, however the run ends (return, window closed or throw).
+class SteppedEnhance {
+public:
+    SteppedEnhance() : session_(GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk())
+    {
+        GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(true);
+    }
+    SteppedEnhance(const SteppedEnhance&) = delete;
+    SteppedEnhance& operator=(const SteppedEnhance&) = delete;
+    ~SteppedEnhance() { GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(session_); }
+
+private:
+    bool session_;
+};
 
 // ContinueExecution's full-speed condition (Windows/AppleWin.cpp), with the override in place of Scroll Lock.
 // Bit 0: speed 40; bit 1: override; bit 2: disk motor (Disk II motor on with enhance on, speaker and Mockingboard silent).
 unsigned FullSpeedReasonBits()
 {
     unsigned bits = 0;
-    if (g_dwSpeed == SPEED_MAX)
+    if (g_sessionSpeed == SPEED_MAX)
         bits |= 1u;
     if (g_fullSpeedOverride)
         bits |= 2u;
@@ -365,12 +408,14 @@ unsigned FullSpeedReasonBits()
 
 // The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
 // holds the window-closed rule for all three.
-// Stepped: steps of 1 ms at the base clock (CLK_6502_NTSC whatever the speed: stepped runs ignore speed), video on,
-// never full speed, no pacing.
-// Realtime (D9, D11, D14): each step first decides full speed with ContinueExecution's rule (FullSpeedReasonBits).
+// Stepped: stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only
+// (ruling C7). Each step applies speed 10 (ApplyClock) and the run holds enhanced disk access on (SteppedEnhance);
+// steps of 1 ms at the base clock, video on, never full speed, no pacing.
+// Realtime (D9, D11, D14): each step first applies the session's speed (ApplyClock), then decides full speed with
+// ContinueExecution's rule (FullSpeedReasonBits).
 // - Normal: a BurstBudget burst at g_fCurrentCLK6502 (rebuilt whenever that clock changes) corrected by AudioOutput's
 //   feedback, then AudioOutput::Pump, then wait for the 1 ms tick.
-// - Full speed: unpaced bursts of the same size (about 1 ms of emulated time, so input, capture and the window keep
+// - Full speed: unpaced bursts of the same size (g_fCurrentCLK6502 x 1 ms, so input, capture and the window keep
 //   working) with CpuExecute(cycles, false) and no feedback. AppleWin's entry (VideoRedrawScreenDuringFullSpeed(0,
 //   true), Mockingboard MuteControl(true), g_nCpuCyclesFeedback = 0); a redraw from the end-of-frame check at most every
 //   ~16 ms of wall time (ExecuteStep); on exit VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame) and
@@ -385,7 +430,11 @@ public:
     explicit Stepper(Pacing pacing)
         : realtime_(pacing == Pacing::Realtime), period_(uint32_t(CLK_6502_NTSC * 1.0e-3))
     {
-        if (realtime_) {
+        if (!realtime_) {
+            enhance_.emplace();
+            ApplyClock(SPEED_NORMAL);
+        } else {
+            ApplyClock(g_sessionSpeed);
             clock_ = g_fCurrentCLK6502;
             budget_.emplace(clock_, std::chrono::milliseconds(1));
             pacer_.emplace();
@@ -407,10 +456,12 @@ public:
     {
         ProcessDueInput();   // input takes effect at the start of the step (D10)
         if (!realtime_) {
+            ApplyClock(SPEED_NORMAL);   // a no-op after the first step
             ExecuteStep(uint32_t((std::min)(uint64_t(period_), remaining)));
             return WindowClosed();
         }
 
+        ApplyClock(g_sessionSpeed);   // a set_speed during the run takes effect from this step on
         const bool full = FullSpeedReasonBits() != 0;
         if (full && !fullSpeed_)
             EnterFullSpeed();
@@ -507,6 +558,7 @@ private:
     std::optional<BurstBudget> budget_;
     std::optional<RealtimePacer> pacer_;
     Playback playback_;   // stops playback when the Stepper is destroyed
+    std::optional<SteppedEnhance> enhance_;   // stepped runs only
 };
 
 // The open-ended realtime run of RunRealtimeStep (null when none is open).
@@ -623,6 +675,7 @@ void Emulator::Start(const EmulatorConfig& config)
     ClearInput();
     g_input.nextId = 1;
     g_fullSpeedOverride = false;   // a new session; machine speed and enhance-disk come from the INI (LoadConfiguration)
+    g_sessionSpeed = uint32_t(g_dwSpeed);
     g_input.applied.clear();
     g_input.firstCycles.clear();
     ResetJoystick();
@@ -950,8 +1003,7 @@ void Emulator::SetMachineSpeed(uint32_t speed)
     RequireStarted();
     if (speed > SPEED_MAX)
         throw std::out_of_range("SetMachineSpeed: speed must be 0..40");
-    g_dwSpeed = speed;
-    SetCurrentCLK6502();
+    g_sessionSpeed = speed;   // AppleWin's clock follows at the next realtime step (ApplyClock)
 }
 
 void Emulator::UseClockMultiplier(double multiplier)
@@ -959,7 +1011,21 @@ void Emulator::UseClockMultiplier(double multiplier)
     RequireStarted();
     if (!std::isfinite(multiplier) || multiplier <= 0.0)
         throw std::invalid_argument("UseClockMultiplier: the multiplier must be finite and above 0");
-    ::UseClockMultiplier(multiplier);
+    // AppleWin's ::UseClockMultiplier conversion (Core.cpp), copied because the original also applies the clock at
+    // once (see ApplyClock); a test pins the copy to AppleWin's function. Clamped first: (ULONG)(x * 10) is undefined
+    // above about 4.29e8, and every x of 3.9 or more gives 39 anyway.
+    double x = (std::min)(multiplier, 4.0);
+    uint32_t speed;
+    if (x < 1.0) {
+        if (x < 0.5)
+            x = 0.5;
+        speed = uint32_t((x - 0.5) * 20);   // [0.5..0.9] -> [0..9]
+    } else {
+        speed = uint32_t(x * 10);
+        if (speed >= SPEED_MAX)
+            speed = SPEED_MAX - 1;
+    }
+    g_sessionSpeed = speed;
 }
 
 void Emulator::SetEnhanceDiskSpeed(bool enable)
@@ -977,13 +1043,13 @@ void Emulator::SetFullSpeedOverride(bool enable)
 SpeedSettings Emulator::Speed() const
 {
     RequireStarted();
-    return SpeedSettings{uint32_t(g_dwSpeed), GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk(), g_fullSpeedOverride};
+    return SpeedSettings{g_sessionSpeed, GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk(), g_fullSpeedOverride};
 }
 
 double Emulator::EffectiveClockHz() const
 {
     RequireStarted();
-    return g_fCurrentCLK6502;
+    return ClockForSpeed(g_sessionSpeed);
 }
 
 std::vector<std::string> Emulator::FullSpeedReasons() const

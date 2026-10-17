@@ -115,8 +115,8 @@ TEST_SUITE("realtime")
         auto c0 = e.EmulatedCycles();
         e.RunRealtime(2000ms);
         double d = double(e.EmulatedCycles() - c0);
-        CHECK(d >= 2 * 1'020'484 * 0.98);
-        CHECK(d <= 2 * 1'020'484 * 1.02);
+        CHECK(d >= 2 * 1'020'484 * (1 - RealtimeRateTolerance()));
+        CHECK(d <= 2 * 1'020'484 * (1 + RealtimeRateTolerance()));
     }
 }
 

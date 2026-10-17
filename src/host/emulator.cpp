@@ -1003,4 +1003,10 @@ bool Emulator::FullSpeedActive() const
     return FullSpeedReasonBits() != 0;
 }
 
+bool Emulator::FullSpeedStepping() const
+{
+    RequireStarted();
+    return g_realtime && g_bFullSpeed;
+}
+
 }  // namespace harness

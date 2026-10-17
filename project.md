@@ -93,8 +93,8 @@ Add keyboard input and frame capture. Add the windowed presenter with sound, whi
 - In windowed realtime mode, BASIC `PRINT CHR$(7)` plays the bell. A 60-second speaker test at authentic speed produces no buffer underruns.
 - Headless mode opens no audio device.
 
-### M3 — JSON-RPC server
-**Status:** Parts A (server) and B (agent audio) are done. Part C (speed controls) is pending. See `docs/specs/m3.md`.
+### M3 — JSON-RPC server ✅
+**Status:** Done: Parts A (server), B (agent audio) and C (speed controls). See `docs/specs/m3.md`.
 
 Serve the named pipe with an ACL and the `hello` handshake. Implement the agent API (keys, joystick, `get_frame`, `subscribe_frames`) and the operator API for `create_session`, `close_session`, `pause`, `resume` and `step_frames`. `create_session` and `close_session` moved here from M4, because the M2 scenario over the pipe needs them. There is one session per process; multiple sessions need AppleWin re-initialisation work and come later.
 
@@ -107,7 +107,9 @@ This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: vir
 - `"max"` and `full_speed_override` both run well above 2× speed.
 - For a range of `clock_multiplier` inputs, the resulting `machine_speed` matches what AppleWin's `UseClockMultiplier` produces.
 - Agent audio (Part B, done): in headless mode, `PRINT CHR$(7)` produces a `sound_started` event followed by a `sound_stopped` event with a `dominant_hz` close to the bell's pitch (about 935 Hz). `get_audio` returns the bell, and the same stepped script gives byte-identical audio in both display modes.
-- The speed bullets above belong to Part C (pending).
+- Part C (done): `set_speed`/`get_speed`, `create_session.speed`, full speed with AppleWin's redraw cadence and a `frame_ready` cap of one per 16 ms.
+- The M2 human bell check still stands (a person listening to the windowed bell).
+- Parked for M4/M6: resampled windowed playback at non-authentic speeds, and PAL (`video_refresh: 50`).
 
 ### M4 — Checkpoints, determinism
 Add `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `list_disks`, `export_disk` and `step_cycles`. (`create_session`, `close_session` and stepped run mode arrive in M3.)

@@ -5,6 +5,7 @@
 #include "host/emulator.h"
 #include "server/pipe_server.h"
 #include <nlohmann/json.hpp>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -64,6 +65,7 @@ private:
         ConnectionPtr connection;
         uint32_t everyNFrames = 0;
         uint64_t presentsSeen = 0;   // presents since the subscription was (re)set
+        std::chrono::steady_clock::time_point lastFullSpeedSend{};   // frame_ready cap at full speed (C4)
     };
 
     struct AudioSubscription {
@@ -95,6 +97,9 @@ private:
     nlohmann::json SetJoystick(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json SetSpeed(const nlohmann::json& params);
     nlohmann::json GetSpeed(const nlohmann::json& params);
+    // Applies the set_speed fields (shared with create_session.speed); throws RpcError.
+    static void ValidateSpeed(const nlohmann::json& p, bool create);
+    void ApplySpeed(const nlohmann::json& params, bool create);
     nlohmann::json GetAudio(const nlohmann::json& params);
     nlohmann::json SubscribeAudio(const ConnectionPtr& connection, const nlohmann::json& params);
 

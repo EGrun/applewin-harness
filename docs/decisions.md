@@ -163,6 +163,13 @@ The operator API offers exactly the speed controls AppleWin has, with AppleWin's
 | Scroll Lock: hold for full speed, or toggle it with the Scroll Lock toggle option | `g_bScrollLock_FullSpeed` / `GetKeyState(VK_SCROLL)` | `set_speed { full_speed_override }` |
 | Config ▸ "50Hz video" / `-50hz` / `-60hz` (changes the base clock between PAL and NTSC; AppleWin restarts the emulator) | `Get6502BaseClock()` | `create_session { speed: { video_refresh: 50 \| 60 } }` — set once per session |
 
+**Harness rulings (M3 Part C):**
+- `get_speed.clock_multiplier` is `effective_clock_hz / base_clock_hz`, and null at `machine_speed` 40.
+- `full_speed_active` is true only while an open realtime run is stepping at full speed. The condition alone (`full_speed_reasons`) can be non-empty without it.
+- `frame_ready` is capped at one per 16 ms of wall time per subscription while stepping at full speed, matching AppleWin's full-speed redraw interval.
+- An empty Disk II drive keeps its motor on, so with `enhance_disk_speed` (default true) a realtime or windowed run with no disk spins at full speed. This is AppleWin's rule, not a harness addition.
+- Windowed playback happens only at authentic speed (`machine_speed` 10) and not at full speed (see D14).
+
 **How the slider value maps to speed** (`SetCurrentCLK6502`):
 - Values 0–9 give a multiplier of `0.5 + 0.05 × value`.
 - Values 10–39 give `value / 10`. Value 10 is authentic speed.
@@ -243,6 +250,7 @@ AppleWin never gets a real DirectSound buffer. The harness replaces the translat
 - Burst-size feedback keeps that buffer between 1/4 and 1/2 full. `AudioOutput::FeedbackCycles` computes it from the fill before each write, with AppleWin's rule and constants (`SoundCore_GetErrorInc`/`GetErrorMax`) and cycles per sample truncated as AppleWin truncates them. It is read once per realtime burst, and only when `AudioOutput` exists.
 - Underruns are counted only after playback has started, when the play cursor passes the end of the written data. `audio underruns` reports this count. `MonitoredSoundBuffer` is deleted.
 - Outside realtime runs the buffer is stopped, so it is silent (B12). Resuming resynchronises, and that isn't an underrun.
+- Speed (D11, ruling C6): playback runs only at `machine_speed` 10 and not at full speed. The capture timeline is in emulated time, so at other rates it cannot play in step with the wall clock without resampling, and the burst feedback would pull emulation back to authentic speed. At other speeds the buffer is stopped. Agent capture is unaffected. Resampled playback is parked for later.
 
 **Sound events:** the level detector runs up to the smaller of the emulated clock and 110 ms behind the newest committed audio (B9), matching the gap rule, because a voice can commit up to about 64 ms after another. Level is the AC RMS of each 10 ms block after removing the block's mean and linear trend (B8). AppleWin's speaker ramps its DC level back to zero after a sound, and that ramp must not count as sound.
 

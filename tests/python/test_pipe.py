@@ -338,7 +338,7 @@ class SessionTest(PipeTestCase):
 # ---- Speed (D11, M3 Part C) ----
 
 SPEED_KEYS = ["base_clock_hz", "clock_multiplier", "effective_clock_hz", "enhance_disk_speed", "full_speed_active",
-              "full_speed_reasons", "full_speed_override", "machine_speed", "video_refresh"]
+              "full_speed_override", "full_speed_reasons", "machine_speed", "video_refresh"]
 
 
 class SpeedTest(PipeTestCase):

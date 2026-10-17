@@ -1,6 +1,6 @@
 # AppleWin Harness — API & Protocol Specification
 
-**Version:** 0.3 (draft). Parts A and B of M3 (server, sessions, input, frames, execution control, agent audio) are implemented. Sections marked "M3 Part C — pending" describe features that are not built yet. Design reasoning lives in [decisions.md](decisions.md).
+**Version:** 0.3 (draft). M3 (server, sessions, input, frames, execution control, agent audio, speed controls) is implemented. Design reasoning lives in [decisions.md](decisions.md).
 
 ## Overview
 The harness lets clients drive an AppleWin emulator that it hosts in-process. The API is split by role (D4):
@@ -154,7 +154,8 @@ Returns `{ session_id }`.
 - The harness copies each image into a working directory (`%TEMP%\applewin-harness\<pid>\`) and mounts the copies. The original files are never opened for writing (D5).
 - A realtime session starts running. A stepped session starts paused, and emulation only advances in response to `step_frames`.
 - A second `create_session` returns `-32008`: there is one session per process.
-- **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `allow_text_screen: true`, `shared_memory_frames: true`, `speed.video_refresh: 50` (PAL), and any `speed` field until Part C. Planned shape for `speed`: `{ video_refresh?: 50 | 60 = 60, ...set_speed params }` (M3 Part C — pending).
+- **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `allow_text_screen: true`, `shared_memory_frames: true`, and `speed.video_refresh: 50` (PAL).
+- `speed` is `{ video_refresh?: 50 | 60 = 60, ...set_speed params }`. It is validated before anything starts (`-32602`), and applied right after the emulator starts. `video_refresh: 50` returns `-32006`.
 
 **`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and exits the process with code 0. It is also valid when no session exists. Use `export_disk` first to keep any results (M4).
 
@@ -170,18 +171,18 @@ Before a session exists, these return `-32002`.
 - If the window is closed during `pause` or `step_frames`, the reply is `-32008` and the process then exits with 0.
 - **`step_cycles`** `{ cycles: int }` — *(planned for M4)* runs N CPU cycles.
 
-### Speed (D11) — M3 Part C — pending
+### Speed (D11)
 These commands offer exactly the speed controls AppleWin has, with AppleWin's value ranges. The harness implements them by calling AppleWin's own functions (`SetCurrentCLK6502`, `UseClockMultiplier`, `SetEnhanceDisk`), so clamping and rounding match AppleWin exactly.
 
 **`set_speed`** `{ machine_speed?: 0..40 | "authentic" | "max", clock_multiplier?: number, enhance_disk_speed?: bool, full_speed_override?: bool }`
 
-Any field left out keeps its current value. Returns the same result as `get_speed`.
+Any field left out keeps its current value. Returns the same result as `get_speed`. These are operator methods: `-32001` for an agent connection, `-32002` before a session. `video_refresh` is not accepted here (`-32602`); it is set only in `create_session`.
 
 | Field | AppleWin equivalent | Meaning |
 |---|---|---|
 | `machine_speed` | Config dialog speed slider | `"authentic"` is the same as 10. `"max"` is the same as 40. 0–9 give a multiplier of `0.5 + 0.05 × value`; 10–39 give `value / 10`; 40 runs unthrottled. |
 | `clock_multiplier` | `-clock-multiplier` | Converted to a slider value: below 0.5 is raised to 0.5; below 1 gives `(int)((x−0.5)×20)`; otherwise `(int)(x×10)`, capped at 39. It can't select unthrottled speed. Sending it together with `machine_speed` is an invalid-params error (`-32602`). |
-| `enhance_disk_speed` | Config ▸ "Enhance disk access speed" (default `true`) | Runs at full speed while a Disk II motor is on, provided the speaker and Mockingboard are silent. |
+| `enhance_disk_speed` | Config ▸ "Enhance disk access speed" (default `true`) | Runs at full speed while a Disk II motor is on, provided the speaker and Mockingboard are silent. An empty drive keeps its motor on, so with this setting a realtime session with no disk runs at full speed (AppleWin's own rule). Set it to `false` to keep authentic pacing. |
 | `full_speed_override` | Holding or toggling Scroll Lock | Forces full speed while it's on. |
 
 **`get_speed`** returns:
@@ -189,20 +190,21 @@ Any field left out keeps its current value. Returns the same result as `get_spee
 ```
 {
   machine_speed,
-  clock_multiplier,
+  clock_multiplier,            // effective_clock_hz / base_clock_hz; null when machine_speed is 40
   video_refresh,
   base_clock_hz,
   effective_clock_hz,          // null when machine_speed is 40
   enhance_disk_speed,
   full_speed_override,
-  full_speed_active,
+  full_speed_active,           // true only while a realtime run is actually stepping at full speed
   full_speed_reasons           // array of: "machine_speed_max", "override", "disk_motor"
 }
 ```
 
 **Rules:**
 - **Speed settings only affect realtime pacing (D9).** In stepped mode they are stored and reported but can't change emulated results.
-- **At full speed in realtime mode**, frames are redrawn the way AppleWin does it, and `frame_ready` notifications are limited to 60 per wall-clock second.
+- **At full speed in realtime mode**, frames are redrawn the way AppleWin does it, and `frame_ready` notifications are limited to one per 16 ms of wall-clock time per subscription (about 62.5 per second). Extra presents are dropped; `frame_id` stays monotonic, so ids can skip. Expect one extra `frame_ready` when leaving full speed.
+- **Windowed playback follows speed.** The window plays sound only at `machine_speed` 10 and not at full speed. Agent audio capture (`get_audio`, `subscribe_audio`) is unaffected, but silent while a run is at full speed.
 - **Speed is a session setting.** `restore_checkpoint` doesn't change it.
 
 ### Checkpoints (D5) — M4

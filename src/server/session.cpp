@@ -8,6 +8,7 @@
 #include "core/working_copy.h"
 #include <windows.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -309,8 +310,14 @@ void Session::SendFrameReady()
         if (frameSubscriptions_.empty()) return;
         bool haveFrame = false;
         json params;
+        const bool fullSpeed = emulator_.FullSpeedStepping();
+        const auto now = std::chrono::steady_clock::now();
         for (auto& [id, sub] : frameSubscriptions_) {
             if (++sub.presentsSeen % sub.everyNFrames != 0) continue;
+            if (fullSpeed) {   // C4: at most one frame_ready per 16 ms of wall time while stepping at full speed
+                if (now - sub.lastFullSpeedSend < std::chrono::milliseconds(16)) continue;
+                sub.lastFullSpeedSend = now;
+            }
             if (!haveFrame) {
                 const FrameView f = emulator_.Frame(false);
                 params = json{{"frame_id", emulator_.PresentedFrames()},
@@ -362,7 +369,8 @@ json Session::CreateSession(const json& params)
     if (state_ != State::NoSession || exitRequested_) throw RpcError{kInvalidState, "a session already exists"};
 
     // Options deferred to later milestones (R4) and Part C.
-    if (Field(params, "speed")) throw RpcError{kNotSupported, "speed is not supported yet"};
+    const json* speed = Field(params, "speed");
+    if (speed) ValidateSpeed(*speed, true);
     const std::string model = GetString(params, "model", std::string("apple2ee"));
     if (model != "apple2ee") throw RpcError{kNotSupported, "model " + model + " is not supported"};
     if (GetBool(params, "allow_text_screen", false))
@@ -415,6 +423,7 @@ json Session::CreateSession(const json& params)
         emulator_.Start(cfg);
         try {
             if (!copyPaths[1].empty()) emulator_.InsertDisk(1, copyPaths[1]);
+            if (speed) ApplySpeed(*speed, true);
         } catch (...) {
             emulator_.Shutdown();
             throw;
@@ -480,9 +489,78 @@ json Session::StepFrames(const json& params)
 
 // ---- Agent methods ----
 
-// Stubs until M3 Part C Task 3.
-json Session::SetSpeed(const json&) { throw RpcError{kInternalError, "not implemented"}; }
-json Session::GetSpeed(const json&) { throw RpcError{kInternalError, "not implemented"}; }
+// Validates the set_speed fields without touching the emulator. create_session also accepts video_refresh: 60.
+void Session::ValidateSpeed(const json& p, bool create)
+{
+    if (!p.is_object()) InvalidParams("speed must be an object");
+    if (create) {
+        if (const json* v = Field(p, "video_refresh")) {
+            if (!v->is_number_integer()) InvalidParams("video_refresh must be 50 or 60");
+            const int64_t r = v->get<int64_t>();
+            if (r == 50) throw RpcError{kNotSupported, "video_refresh 50 (PAL) is not supported"};
+            if (r != 60) InvalidParams("video_refresh must be 50 or 60");
+        }
+    }
+    else if (Field(p, "video_refresh")) InvalidParams("video_refresh can only be set in create_session");
+    const json* ms = Field(p, "machine_speed");
+    const json* cm = Field(p, "clock_multiplier");
+    if (ms && cm) InvalidParams("machine_speed and clock_multiplier cannot be sent together");
+    if (ms) {
+        if (ms->is_string()) {
+            const std::string v = ms->get<std::string>();
+            if (v != "authentic" && v != "max") InvalidParams("machine_speed must be 0..40, \"authentic\" or \"max\"");
+        } else {
+            GetUint(p, "machine_speed", 0, 40, std::nullopt);
+        }
+    }
+    if (cm) {
+        if (!cm->is_number()) InvalidParams("clock_multiplier must be a number");
+        const double d = cm->get<double>();
+        if (!std::isfinite(d) || d <= 0) InvalidParams("clock_multiplier must be a finite number above 0");
+    }
+    GetBool(p, "enhance_disk_speed", false);
+    GetBool(p, "full_speed_override", false);
+}
+
+void Session::ApplySpeed(const json& p, bool create)
+{
+    ValidateSpeed(p, create);
+    if (const json* ms = Field(p, "machine_speed")) {
+        uint32_t v;
+        if (ms->is_string()) v = ms->get<std::string>() == "max" ? 40 : 10;
+        else v = uint32_t(GetUint(p, "machine_speed", 0, 40, std::nullopt));
+        emulator_.SetMachineSpeed(v);
+    }
+    if (const json* cm = Field(p, "clock_multiplier")) emulator_.UseClockMultiplier(cm->get<double>());
+    if (Field(p, "enhance_disk_speed")) emulator_.SetEnhanceDiskSpeed(GetBool(p, "enhance_disk_speed", true));
+    if (Field(p, "full_speed_override")) emulator_.SetFullSpeedOverride(GetBool(p, "full_speed_override", false));
+}
+
+json Session::SetSpeed(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    ApplySpeed(params, false);
+    return GetSpeed(params);
+}
+
+json Session::GetSpeed(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    const SpeedSettings s = emulator_.Speed();
+    const bool max = s.machineSpeed == 40;
+    const double eff = emulator_.EffectiveClockHz();
+    json reasons = json::array();
+    for (const std::string& r : emulator_.FullSpeedReasons()) reasons.push_back(r);
+    return json{{"machine_speed", s.machineSpeed},
+                {"clock_multiplier", max ? json(nullptr) : json(eff / kAudioBaseClockHz)},
+                {"video_refresh", 60},
+                {"base_clock_hz", kAudioBaseClockHz},
+                {"effective_clock_hz", max ? json(nullptr) : json(eff)},
+                {"enhance_disk_speed", s.enhanceDisk},
+                {"full_speed_override", s.fullSpeedOverride},
+                {"full_speed_active", state_ == State::Running && emulator_.FullSpeedStepping()},
+                {"full_speed_reasons", reasons}};
+}
 
 json Session::GetFrame(const json& params)
 {

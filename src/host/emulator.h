@@ -142,7 +142,9 @@ public:
     // Why a realtime step would run at full speed right now, in this order: "machine_speed_max", "override",
     // "disk_motor" (Disk II motor on, enhance on, speaker and Mockingboard silent).
     std::vector<std::string> FullSpeedReasons() const;
-    bool FullSpeedActive() const;   // !FullSpeedReasons().empty()
+    bool FullSpeedActive() const;   // !FullSpeedReasons().empty(): the condition, whether or not a realtime run is stepping
+    // True only while an open realtime run has entered full speed (its steps are unpaced right now).
+    bool FullSpeedStepping() const;
 
     // Windowed playback (AudioOutput, D14): its underrun count, and whether it exists (windowed with an audio device).
     uint64_t SoundUnderruns() const;

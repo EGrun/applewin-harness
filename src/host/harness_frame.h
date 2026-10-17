@@ -29,6 +29,9 @@ public:
     // first present.
     FrameView PresentedFrame(bool borders) const;
     void SetPresentHook(std::function<void()> hook);   // called after each snapshot; an empty hook does nothing
+    // Copies the live video buffer into the presented-frame snapshot as VideoPresentScreen does, without counting a
+    // present or calling the hook: a re-render (restore), not a presented frame.
+    void RefreshSnapshot();
 
     // Sound (D14): CreateSoundBuffer returns a VirtualSoundBuffer in every mode, with voice id 0, 1, 2, ... (a counter per
     // frame). Its commits go to the capture set here (null: nothing is captured) at the clock's cycle (empty: AppleWin's

@@ -5,6 +5,7 @@
 #include "host/audio_output.h"
 #include "core/pacing.h"
 #include "core/audio_capture.h"
+#include "core/sha256.h"
 
 #pragma warning(push, 3)
 #include "StdAfx.h"
@@ -16,6 +17,7 @@
 #include "CPU.h"
 #include "CardManager.h"
 #include "Disk.h"
+#include "DiskImageHelper.h"
 #include "Joystick.h"
 #include "Keyboard.h"
 #include "Log.h"
@@ -23,6 +25,7 @@
 #include "MockingboardCardManager.h"
 #include "NTSC.h"
 #include "RGBMonitor.h"
+#include "SaveState.h"
 #include "Speaker.h"
 #include "Utilities.h"
 #include "version.h"
@@ -30,11 +33,15 @@
 #pragma warning(pop)
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -45,6 +52,8 @@
 #include <string>
 #include <variant>
 #include <vector>
+
+void CreateLanguageCard();   // Memory.cpp (external linkage, not in Memory.h): the //e's slot-0 language card
 
 namespace harness {
 
@@ -237,6 +246,49 @@ void ClearInput()
     g_input.fifo.clear();
 }
 
+// Drops every queued input and releases held keys, reporting each dropped id once as discarded (ruling D1): the inputs
+// still queued and those whose release or restore is still pending. LoadSnapshot.
+void DiscardInput()
+{
+    std::vector<uint64_t> ids;
+    for (const QueuedOp& op : g_input.fifo)
+        ids.push_back(op.id);
+    for (const TimedOp& t : g_input.timed)
+        ids.push_back(t.id);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (const uint64_t id : ids) {
+        InputApplied a;
+        a.inputId = id;
+        a.discarded = true;
+        g_input.applied.push_back(a);
+    }
+    ClearInput();
+}
+
+// Joystick 0 once every pending restore has taken effect (in due order): the position a checkpoint keeps.
+JoyState SettledJoystick()
+{
+    std::vector<const TimedOp*> restores;
+    for (const TimedOp& t : g_input.timed)
+        if (t.kind == TimedOp::Kind::JoyRestore)
+            restores.push_back(&t);
+    std::stable_sort(restores.begin(), restores.end(), [](const TimedOp* a, const TimedOp* b) { return a->due < b->due; });
+    JoyState s = g_input.joy;
+    for (const TimedOp* t : restores)
+        s = t->restore;
+    return s;
+}
+
+// The //e any-key-down flag ($C010 bit 7). AppleWin's g_AKDFlags are static and KeybReadFlag clears the strobe; the
+// harness is the only caller of KeybAnyKeyDown (the window is view-only), so the flag is set exactly while a key it
+// pressed waits for its release.
+bool AnyKeyDown()
+{
+    return std::any_of(g_input.timed.begin(), g_input.timed.end(),
+                       [](const TimedOp& t) { return t.kind == TimedOp::Kind::KeyUp; });
+}
+
 // Applies every event that is due at the current step boundary.
 void ProcessDueInput()
 {
@@ -406,6 +458,116 @@ unsigned FullSpeedReasonBits()
     return bits;
 }
 
+// ---- Video phase (docs/specs/m4.md "Restore purity", pass condition 6).
+// Two pieces of video state decide what a frame looks like: the scanner's position in the frame (g_dwCyclesThisFrame,
+// which AppleWin's save state holds, and NTSC.cpp's clocks, set from it) and the text flash phase (NTSC.cpp's static
+// g_nTextFlashCounter and g_nTextFlashMask, for FLASH characters such as the Applesoft cursor), which no save state
+// holds. The flash counter goes up by one every time the scanner wraps from the last line to line 0, and the mask flips
+// every 16; a fresh process starts both at 0, so the flash state is the number of wraps since the process started,
+// mod 32. Neither static can be read or written, so the harness counts the wraps itself (g_flashFrames) and moves the
+// phase forward with whole-screen redraws (NTSC_VideoRedrawWholeScreen: exactly one wrap each).
+// The scanner advances only in two ways: CpuExecute with video updates (a normal step) moves it by exactly the cycles
+// executed, and every whole-screen redraw (VideoRedrawScreen, which presents) wraps it once. At full speed CpuExecute
+// leaves it alone and NTSC_VideoClockResync only moves it within the frame.
+constexpr uint32_t kFlashPeriod = 32;   // 16 frames per flash state, two states
+uint32_t g_flashFrames = 0;             // scanner wraps since the process started (only the value mod 32 matters)
+
+uint32_t ScannerCycle()
+{
+    uint16_t vert = 0, horz = 0;
+    NTSC_GetVideoVertHorzForDebugger(vert, horz);   // between steps and outside full speed: no side effect
+    return uint32_t(vert) * NTSC_GetCyclesPerLine() + horz;
+}
+
+// Whole-screen redraws per VideoRedrawScreen (Video::VideoRefreshBuffer draws twice when paused or debugging).
+uint32_t RedrawsPerPresent()
+{
+    return (g_nAppMode == MODE_DEBUG || g_nAppMode == MODE_PAUSED) ? 2u : 1u;
+}
+
+// ExecuteStep, counting the scanner's wraps. Normal step: (start + executed) / cycles per frame. Full speed: every
+// present inside the step is a whole-screen redraw (VideoRedrawScreenDuringFullSpeed).
+uint32_t TrackedExecuteStep(uint32_t cycles, bool fullSpeed = false)
+{
+    if (fullSpeed) {
+        const uint64_t presents = HostFrame().presentedFrames();
+        const uint32_t executed = ExecuteStep(cycles, true);
+        g_flashFrames += uint32_t(HostFrame().presentedFrames() - presents) * RedrawsPerPresent();
+        return executed;
+    }
+    const uint32_t start = ScannerCycle();
+    const uint32_t executed = ExecuteStep(cycles, false);
+    g_flashFrames += (start + executed) / NTSC_GetCyclesPerFrame();
+    return executed;
+}
+
+// Moves the flash phase forward to `phase` (mod kFlashPeriod) with whole-screen redraws. Draws into the video buffer;
+// the scanner's position is unchanged.
+void AdvanceFlashTo(uint32_t phase)
+{
+    while (g_flashFrames % kFlashPeriod != phase % kFlashPeriod) {
+        NTSC_VideoRedrawWholeScreen();
+        ++g_flashFrames;
+    }
+}
+
+// The scanner at cycle 0 of a frame and the flash phase of a fresh process, with a cleared video buffer: what Start's
+// Video::Initialize gives a fresh process (g_dwCyclesThisFrame is 0 there). Start and PowerCycle (pass condition 6).
+void ResetVideoPhase()
+{
+    g_dwCyclesThisFrame = 0;
+    GetVideo().VideoReinitialize(true);   // NTSC clocks from g_dwCyclesThisFrame, as NTSC_VideoInit does
+    AdvanceFlashTo(0);
+    GetVideo().ClearFrameBuffer();
+}
+
+// Re-renders the whole screen from video memory at the scanner's current position (Video::VideoRefreshBuffer, as
+// AppleWin's full-speed redraw does) and makes it the presented frame, without counting a present or calling the
+// present observer. Windowed: the window shows it.
+void RenderPresentedFrame()
+{
+    GetVideo().VideoRefreshBuffer(GetVideo().GetVideoMode(), true);
+    g_flashFrames += RedrawsPerPresent();
+    HostFrame().RefreshSnapshot();
+    if (g_window) {
+        g_window->Show(HostFrame().PresentedFrame(false));
+        g_window->Pump();
+    }
+}
+
+// ---- Speaker (docs/specs/m4.md "Restore purity", M4-5).
+// AppleWin saves only the speaker's last update cycle. The rest is history: the output level (g_nSpeakerData), the
+// 8-bit-DAC quietening flag, the sample and remainder buffers, the quiet-cycle counter, the active flag and Speaker.cpp's
+// static DC filter (g_uDCFilterState: 32768 + 10000 after every toggle, down by one per sample queued, output scaled by
+// it). Each is put back to a fresh process's value: SpkrReset for the buffers and flags, g_nSpeakerData and
+// g_bQuieterSpeaker directly, and the unreachable DC filter by queueing more samples than its maximum through it (a
+// fresh process's filter is 0, and 0 stays 0). The queued samples reach the speaker voice and so the capture, which the
+// caller clears afterwards. Needs g_bFullSpeed clear and the clock already set (CanonicalClock).
+void NeutralizeSpeaker()
+{
+    ResetCyclesExecutedForDebugger();   // CpuExecute's per-batch counter: nothing below may add stray cycles
+    SpkrReset();
+    // UpdateSpkr queues one sample per g_fClksPerSpkrSample cycles since its last update, at most SPKR_SAMPLE_RATE - 1
+    // (44,099 > 42,768) into an empty buffer. Run its clock forward far enough, then back (an unsigned difference that
+    // hits the buffer limit again), so its last-update cycle ends where it was.
+    const unsigned __int64 now = g_nCumulativeCycles;
+    g_nCumulativeCycles = now + uint64_t(double(SPKR_SAMPLE_RATE + 1) * (g_fClksPerSpkrSample + 1.0));
+    SpkrUpdate(0);
+    g_nCumulativeCycles = now;
+    SpkrUpdate(0);
+    g_nSpeakerData = static_cast<short>(-32768);   // SPKR_DATA_INIT, (short)0x8000 (Speaker.cpp)
+    g_bQuieterSpeaker = false;
+    SpkrReset();
+}
+
+// The clock every stepped run uses (ruling C7), applied unconditionally: SetCurrentCLK6502 also re-initializes the
+// speaker's samples per cycle and every Mockingboard's clock, so afterwards they no longer depend on history.
+void CanonicalClock()
+{
+    g_dwSpeed = SPEED_NORMAL;
+    SetCurrentCLK6502();
+}
+
 // The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
 // holds the window-closed rule for all three.
 // Stepped: stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only
@@ -457,7 +619,7 @@ public:
         ProcessDueInput();   // input takes effect at the start of the step (D10)
         if (!realtime_) {
             ApplyClock(SPEED_NORMAL);   // a no-op after the first step
-            ExecuteStep(uint32_t((std::min)(uint64_t(period_), remaining)));
+            TrackedExecuteStep(uint32_t((std::min)(uint64_t(period_), remaining)));
             return WindowClosed();
         }
 
@@ -487,7 +649,7 @@ public:
         }
         if (cycles > remaining)
             cycles = remaining;
-        ExecuteStep(uint32_t(cycles), fullSpeed_);
+        TrackedExecuteStep(uint32_t(cycles), fullSpeed_);
         if (!fullSpeed_) {
             if (g_audioOutput)
                 g_audioOutput->Pump(Capture(), CaptureClock());
@@ -510,7 +672,9 @@ private:
     {
         g_bFullSpeed = false;
         fullSpeed_ = false;
+        const uint64_t presents = HostFrame().presentedFrames();
         GetFrame().VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame);   // resync the video clock, redraw, present
+        g_flashFrames += uint32_t(HostFrame().presentedFrames() - presents) * RedrawsPerPresent();
         GetCardMgr().GetMockingboardCardMgr().MuteControl(false);
         clock_ = g_fCurrentCLK6502;
         budget_.emplace(clock_, std::chrono::milliseconds(1));
@@ -710,6 +874,9 @@ void Emulator::Start(const EmulatorConfig& config)
     }
     Boot();
     g_cyclesAtPowerOn = g_nCumulativeCycles;
+    // A fresh process's video phase and speaker (already so in a new process; not after an earlier Start in it).
+    ResetVideoPhase();
+    NeutralizeSpeaker();
     Capture().Clear();   // the timeline starts at this power-on
 }
 
@@ -741,6 +908,13 @@ void Emulator::PowerCycle()
     PinPowerOnRandomness();
     g_nAppMode = MODE_RUNNING;
     g_cyclesAtPowerOn = g_nCumulativeCycles;
+    // Pass condition 6: what a fresh Start has. ResetMachineState leaves the video scanner where the last run stopped
+    // (mid-frame after a realtime run) and the flash phase, the speaker's history and the Mockingboard manager's
+    // audio-frame counter as they were.
+    CanonicalClock();
+    GetCardMgr().GetMockingboardCardMgr().Reset(true);
+    ResetVideoPhase();
+    NeutralizeSpeaker();
     Capture().Clear();   // the timeline restarts at cycle 0 (D14)
     ResetJoystick();
 }
@@ -1075,60 +1249,396 @@ bool Emulator::FullSpeedStepping() const
     return g_realtime && g_bFullSpeed;
 }
 
-// ---- Checkpoints (docs/specs/m4.md). Stubs until M4 Task 2: each fails with std::runtime_error.
+// ---- Checkpoints (docs/specs/m4.md; D5, D13, rulings D1, D2, D6, D7, D8).
 namespace {
-[[noreturn]] void NotYet(const char* what)
+
+// Disk2InterfaceCard keeps its drives private, and the image type (list_disks' format) has no accessor. A pointer to
+// the private member is taken through an explicit instantiation (where access checks do not apply); no AppleWin file
+// is changed.
+struct Disk2DrivesTag {
+    using type = FloppyDrive (Disk2InterfaceCard::*)[NUM_DRIVES];
+    friend type Disk2Drives(Disk2DrivesTag);
+};
+template <typename Tag, typename Tag::type Member>
+struct PrivateMember {
+    friend typename Tag::type Disk2Drives(Tag) { return Member; }
+};
+template struct PrivateMember<Disk2DrivesTag, &Disk2InterfaceCard::m_floppyDrive>;
+
+std::string ImageFormat(Disk2InterfaceCard& card, int drive)
 {
-    throw std::runtime_error(std::string("Emulator::") + what + ": not implemented yet (M4 Task 2)");
+    const ImageInfo* info = (card.*Disk2Drives(Disk2DrivesTag{}))[drive].m_disk.m_imagehandle;
+    if (!info || !info->pImageType)
+        return "UNKNOWN";
+    switch (info->pImageType->GetType()) {
+    case eImageDO: return "DO";
+    case eImagePO: return "PO";
+    case eImageNIB1: case eImageNIB2: return "NIB";
+    case eImageHDV: return "HDV";
+    case eImageIIE: return "IIE";
+    case eImageAPL: return "APL";
+    case eImagePRG: return "PRG";
+    case eImageWOZ1: case eImageWOZ2: return "WOZ";
+    default: return "UNKNOWN";
+    }
 }
+
+// The Disk II motor: Disk2InterfaceCard::IsConditionForFullSpeed() is motor && enhance, and SetEnhanceDisk has no side
+// effects, so enhance is set for the question and put back.
+bool Disk2MotorOn(Disk2InterfaceCard& card)
+{
+    const bool enhance = card.GetEnhanceDisk();
+    card.SetEnhanceDisk(true);
+    const bool motor = card.IsConditionForFullSpeed();
+    card.SetEnhanceDisk(enhance);
+    return motor;
+}
+
+// The images EjectAll took out, for ReinsertAll.
+struct EjectedImage {
+    int drive = 0;
+    std::string path;
+    bool writeProtected = false;
+};
+std::vector<EjectedImage> g_ejected;
+
+// A FrameMessageBox call since `before` (messages count) becomes an exception carrying every new message.
+void ThrowIfNewMessages(size_t before, const std::string& what)
+{
+    const auto& msgs = HostFrame().messages();
+    if (msgs.size() == before)
+        return;
+    std::string text = what;
+    for (size_t i = before; i < msgs.size(); ++i)
+        text += "\n  " + msgs[i];
+    throw std::runtime_error(text);
+}
+
+std::string Trim(std::string v)
+{
+    const size_t b = v.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos)
+        return {};
+    const size_t e = v.find_last_not_of(" \t\r\n");
+    v = v.substr(b, e - b + 1);
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+        v = v.substr(1, v.size() - 2);
+    return v;
+}
+
+// The disk images a save state names: each "Filename" (the bare name Disk2InterfaceCard::LoadSnapshotFloppy tries
+// first, relative to the current directory) with the "Absolute Path" after it. Both are UTF-8 (YamlSaveHelper).
+struct NamedImage {
+    std::string filename, absolutePath;
+};
+
+std::vector<NamedImage> ImagesNamedBy(const std::filesystem::path& stateFile)
+{
+    std::ifstream in(stateFile, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("LoadSnapshot: cannot read " + stateFile.string());
+    std::vector<NamedImage> images;
+    std::string line;
+    static const std::string kFilename = "Filename:", kAbsolute = "Absolute Path:";
+    while (std::getline(in, line)) {
+        const size_t b = line.find_first_not_of(' ');
+        if (b == std::string::npos)
+            continue;
+        if (line.compare(b, kFilename.size(), kFilename) == 0) {
+            images.push_back(NamedImage{Trim(line.substr(b + kFilename.size())), {}});
+        } else if (line.compare(b, kAbsolute.size(), kAbsolute) == 0 && !images.empty() &&
+                   images.back().absolutePath.empty()) {
+            images.back().absolutePath = Trim(line.substr(b + kAbsolute.size()));
+        }
+    }
+    return images;
+}
+
+std::filesystem::path Utf8Path(const std::string& s)
+{
+    return std::filesystem::path(std::u8string(s.begin(), s.end()));
+}
+
+// Ruling D7 and the dialog rule: LoadSnapshotFloppy opens a file dialog (UserSelectNewDiskImage) for an image it cannot
+// find, and it tries the bare file name in the current directory before the absolute path. So before loading, every
+// named image must exist at its absolute path, and its bare name must not find a different file first.
+void CheckImagesExist(const std::filesystem::path& stateFile)
+{
+    namespace fs = std::filesystem;
+    for (const NamedImage& image : ImagesNamedBy(stateFile)) {
+        if (image.filename.empty())
+            continue;   // an empty drive
+        std::error_code ec;
+        const fs::path bare = Utf8Path(image.filename);
+        const fs::path absolute = Utf8Path(image.absolutePath);
+        const bool absoluteExists = !image.absolutePath.empty() && fs::is_regular_file(absolute, ec);
+        if (fs::exists(bare, ec)) {
+            if (!absoluteExists || !fs::equivalent(bare, absolute, ec))
+                throw std::runtime_error("LoadSnapshot: the save state's disk image " + image.filename +
+                                         " would be found in the current directory, not at " + image.absolutePath);
+            continue;
+        }
+        if (!absoluteExists)
+            throw std::runtime_error("LoadSnapshot: disk image missing: " +
+                                     (image.absolutePath.empty() ? image.filename : image.absolutePath));
+    }
+}
+
+// After a failed Snapshot_LoadState (which has removed every card, writing that to the config file, and may have
+// inserted only some again): the slot cards and the aux card the machine had, in the machine and in the config file,
+// so that InsertDisk, PowerCycle and a later Start see the session's cards.
+struct CardLayout {
+    std::array<SS_CARDTYPE, NUM_SLOTS> slots{};
+    SS_CARDTYPE aux = CT_Empty;
+};
+
+CardLayout CurrentCards()
+{
+    CardLayout c;
+    for (UINT slot = SLOT0; slot < NUM_SLOTS; ++slot)
+        c.slots[slot] = GetCardMgr().QuerySlot(slot);
+    c.aux = GetCardMgr().QueryAux();
+    return c;
+}
+
+void RestoreCards(const CardLayout& c)
+{
+    CardManager& mgr = GetCardMgr();
+    for (UINT slot = SLOT0; slot < NUM_SLOTS; ++slot) {
+        if (mgr.QuerySlot(slot) == c.slots[slot])
+            continue;
+        if (slot == SLOT0) {
+            if (c.slots[slot] == CT_LanguageCardIIe)
+                ::CreateLanguageCard();
+            else
+                SetExpansionMemType(c.slots[slot]);
+        } else if (c.slots[slot] == CT_Empty) {
+            mgr.Remove(slot);
+        } else {
+            mgr.Insert(slot, c.slots[slot]);
+        }
+    }
+    if (mgr.QueryAux() != c.aux)
+        mgr.InsertAux(c.aux);
+}
+
 }  // namespace
 
-SnapshotMeta Emulator::SaveSnapshot(const std::filesystem::path&)
+SnapshotMeta Emulator::SaveSnapshot(const std::filesystem::path& stateFile)
 {
     RequireStarted();
-    NotYet("SaveSnapshot");
+    g_realtime.reset();   // M4-7: the realtime run ends (full speed and the Mockingboard mute are cleared)
+    SnapshotMeta meta;
+    meta.emulatedCycles = EmulatedNow();
+    meta.powerOnOrigin = g_cyclesAtPowerOn;
+    meta.speed = Speed();
+    const JoyState joy = SettledJoystick();
+    meta.joystickX = joy.x;
+    meta.joystickY = joy.y;
+
+    const size_t before = HostFrame().messages().size();
+    Snapshot_SetFilename(std::filesystem::path(stateFile).make_preferred().string());
+    Snapshot_SaveState();
+    ThrowIfNewMessages(before, "Emulator::SaveSnapshot: AppleWin could not save " + stateFile.string() + ":");
+    return meta;
 }
 
-void Emulator::LoadSnapshot(const std::filesystem::path&, const SnapshotMeta&)
+void Emulator::LoadSnapshot(const std::filesystem::path& stateFile, const SnapshotMeta& meta)
 {
     RequireStarted();
-    NotYet("LoadSnapshot");
+    g_realtime.reset();   // no open realtime run: g_bFullSpeed clear, the Mockingboard unmuted
+
+    // Ruling D7: everything that can be checked before the load is checked first; a failure here changes nothing.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(stateFile, ec))
+        throw std::runtime_error("LoadSnapshot: no save state at " + stateFile.string());
+    CheckImagesExist(stateFile);
+
+    const bool sessionEnhance = GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk();   // D8: the session's setting
+    const CardLayout cards = CurrentCards();
+    const size_t before = HostFrame().messages().size();
+
+    Snapshot_SetFilename(std::filesystem::path(stateFile).make_preferred().string());
+    Snapshot_LoadState();
+    g_nAppMode = MODE_RUNNING;   // as before the load (AppleWin's own load leaves it; a failed one may not)
+
+    if (HostFrame().messages().size() != before) {
+        // AppleWin reported the error and asked for a restart (HarnessFrame::Restart only records it). Put the cards
+        // back so that InsertDisk and PowerCycle work; the machine state is undefined until PowerCycle.
+        try { RestoreCards(cards); } catch (...) {}
+        DiscardInput();
+        ThrowIfNewMessages(before, "Emulator::LoadSnapshot: AppleWin could not load " + stateFile.string() + ":");
+    }
+
+    // Cycle origin: EmulatedCycles() continues from the checkpoint's (the save state restores g_nCumulativeCycles).
+    if (g_nCumulativeCycles < meta.emulatedCycles || g_nCumulativeCycles - meta.emulatedCycles != meta.powerOnOrigin) {
+        DiscardInput();
+        throw std::runtime_error("Emulator::LoadSnapshot: the checkpoint's metadata does not match its save state");
+    }
+    g_cyclesAtPowerOn = meta.powerOnOrigin;
+
+    // Restore purity (docs/specs/m4.md), in the spec's order.
+    // Speed (D8): the session's settings. Machine speed and the full-speed override are harness state the load does not
+    // touch; enhanced disk access is Disk II card state the save state carries, so the session's is put back. AppleWin's
+    // clock is set to the stepped clock unconditionally (it re-initializes the speaker and Mockingboard clocks).
+    GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(sessionEnhance);
+    CanonicalClock();
+    // Random numbers (M4-3, D2, D13): RNDL/RNDH come from the snapshot's RAM; only the C runtime's stream is reset.
+    std::srand(1);
+    // Speaker (M4-5): every internal AppleWin does not save, back to a fresh process's.
+    NeutralizeSpeaker();
+    // Mockingboard: the manager's audio-frame counter (when it next mixes, with no 6522 timer running) is not saved.
+    // The cards themselves are new (the load replaces every card) and their 6522 timers come from the save state.
+    GetCardMgr().GetMockingboardCardMgr().Reset(false);
+    GetCardMgr().GetMockingboardCardMgr().MuteControl(false);
+    // Video scanner: AppleWin's save state restores g_dwCyclesThisFrame and the load sets NTSC's clocks from it (kept).
+    // The flash phase is set from the restored cycle as a stepped run from power-on has it (one wrap per frame), less
+    // the one wrap of the re-render below.
+    const uint32_t framePhase = uint32_t((meta.emulatedCycles / NTSC_GetCyclesPerFrame()) % kFlashPeriod);
+    AdvanceFlashTo(framePhase + kFlashPeriod - RedrawsPerPresent());
+    // Harness state (M4-4): pending input discarded (reported), held keys and buttons released, the joystick where the
+    // checkpoint left it (AppleWin saves no joystick position).
+    DiscardInput();
+    JoySetJoyType(JN_JOYSTICK0, J0C_MOUSE);
+    JoyState joy;
+    joy.x = meta.joystickX;
+    joy.y = meta.joystickY;
+    ApplyJoy(joy);
+    Capture().Clear();   // audio from before the restore is gone; every voice's next commit is placed afresh
+    RenderPresentedFrame();
 }
 
 std::string Emulator::StateChecksum() const
 {
     RequireStarted();
-    NotYet("StateChecksum");
+    std::vector<uint8_t> b;
+    b.reserve(2 * 64 * 1024 + 64);
+    auto put8 = [&](uint32_t v) { b.push_back(uint8_t(v)); };
+    auto put16 = [&](uint32_t v) { put8(v); put8(v >> 8); };
+    auto put32 = [&](uint32_t v) { put16(v); put16(v >> 16); };
+    auto putBytes = [&](const uint8_t* p, size_t n) { b.insert(b.end(), p, p + n); };
+
+    // 1. CPU registers.
+    put8(regs.a); put8(regs.x); put8(regs.y); put8(regs.ps); put16(regs.sp); put16(regs.pc);
+    // 2. Memory mode.
+    put32(GetMemMode());
+    // 3. Main RAM (64 KiB, the language-card banks included: AppleWin keeps LC bank 1 at $C000-$CFFF), then the aux
+    // card's RAM as MemSaveSnapshotAux saves it. MemGetBankPtr flushes the dirty shadow pages first (BackMainImage).
+    putBytes(MemGetBankPtr(0), 64 * 1024);
+    const SS_CARDTYPE aux = GetCardMgr().QueryAux();
+    put8(uint32_t(aux));
+    if (aux == CT_80Col) {
+        putBytes(MemGetBankPtr(1) + TEXT_PAGE1_BEGIN, TEXT_PAGE1_SIZE);
+    } else if (aux == CT_Extended80Col || aux == CT_RamWorksIII) {
+        for (UINT bank = 1;; ++bank) {
+            const uint8_t* p = MemGetBankPtr(bank);
+            if (!p || (aux == CT_Extended80Col && bank > 1))
+                break;
+            putBytes(p, 64 * 1024);
+        }
+    }
+    // 4. Keyboard latch and strobe.
+    put8(KeybReadData());
+    // 5. Video soft switches.
+    put32(GetVideo().GetVideoMode());
+    put8(GetVideo().VideoGetSWAltCharSet() ? 1 : 0);
+    // 6. Disk II controller.
+    if (GetCardMgr().QuerySlot(SLOT6) == CT_Disk2) {
+        Disk2InterfaceCard& card = Disk2Card();
+        put8(Disk2MotorOn(card) ? 1 : 0);
+        put8(uint32_t(card.GetCurrentDrive()));
+        for (int drive = DRIVE_1; drive <= DRIVE_2; ++drive) {
+            const float phase = card.GetPhase(drive);
+            uint32_t bits = 0;
+            std::memcpy(&bits, &phase, sizeof(bits));
+            put32(bits);
+            put32(uint32_t(card.GetTrack(drive)));
+        }
+    } else {
+        put8(0xFF);
+    }
+    // 7. Input state (ruling D6).
+    put8(AnyKeyDown() ? 1 : 0);
+    put8(g_input.joy.b0 ? 1 : 0);
+    put8(g_input.joy.b1 ? 1 : 0);
+    put8(g_input.joy.x);
+    put8(g_input.joy.y);
+    return Sha256Hex(b);
 }
 
-void Emulator::RunCycles(uint64_t)
+void Emulator::RunCycles(uint64_t cycles)
 {
     RequireStarted();
-    NotYet("RunCycles");
+    g_realtime.reset();
+    if (cycles == 0)
+        return;
+    Stepper stepper(Pacing::Stepped);
+    const uint64_t target = g_nCumulativeCycles + cycles;
+    while (g_nCumulativeCycles < target)
+        stepper.Step(target - g_nCumulativeCycles);   // stepped: the window closing does not stop it
 }
 
 std::vector<DiskInfo> Emulator::Disks() const
 {
     RequireStarted();
-    NotYet("Disks");
+    std::vector<DiskInfo> disks;
+    if (GetCardMgr().QuerySlot(SLOT6) != CT_Disk2)
+        return disks;
+    Disk2InterfaceCard& card = Disk2Card();
+    for (int drive = DRIVE_1; drive <= DRIVE_2; ++drive) {
+        if (card.IsDriveEmpty(drive))
+            continue;
+        DiskInfo d;
+        d.drive = drive;
+        d.workingPath = std::filesystem::path(card.DiskGetFullPathName(drive));
+        d.writeProtected = card.GetProtect(drive);
+        d.format = ImageFormat(card, drive);
+        disks.push_back(std::move(d));
+    }
+    return disks;
 }
 
 void Emulator::FlushDisks()
 {
     RequireStarted();
-    NotYet("FlushDisks");
+    if (GetCardMgr().QuerySlot(SLOT6) != CT_Disk2)
+        return;
+    Disk2InterfaceCard& card = Disk2Card();
+    for (int drive = DRIVE_1; drive <= DRIVE_2; ++drive)
+        if (!card.IsDriveEmpty(drive))
+            card.FlushCurrentTrack(drive);
 }
 
 void Emulator::EjectAll()
 {
     RequireStarted();
-    NotYet("EjectAll");
+    g_ejected.clear();
+    if (GetCardMgr().QuerySlot(SLOT6) != CT_Disk2)
+        return;
+    Disk2InterfaceCard& card = Disk2Card();
+    for (int drive = DRIVE_1; drive <= DRIVE_2; ++drive) {
+        if (card.IsDriveEmpty(drive))
+            continue;
+        g_ejected.push_back(EjectedImage{drive, card.DiskGetFullPathName(drive), card.GetProtect(drive)});
+        card.FlushCurrentTrack(drive);
+        card.EjectDisk(drive);   // the drive's head and phase stay (Disk2InterfaceCard keeps drive attributes)
+    }
 }
 
 void Emulator::ReinsertAll()
 {
     RequireStarted();
-    NotYet("ReinsertAll");
+    Disk2InterfaceCard& card = Disk2Card();
+    for (const EjectedImage& image : g_ejected) {
+        const size_t before = HostFrame().messages().size();
+        const ImageError_e err = card.InsertDisk(image.drive, image.path, image.writeProtected, false);
+        if (err != eIMAGE_ERROR_NONE) {
+            card.NotifyInvalidImage(image.drive, image.path, err);
+            ThrowIfNewMessages(before, "Emulator: cannot insert " + image.path + " (image error " +
+                                           std::to_string(int(err)) + ")");
+            throw std::runtime_error("Emulator: cannot insert " + image.path + " (image error " + std::to_string(int(err)) + ")");
+        }
+    }
 }
 
 }  // namespace harness

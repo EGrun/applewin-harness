@@ -33,7 +33,7 @@ void HarnessFrame::Destroy()
     buffer_.shrink_to_fit();
 }
 
-void HarnessFrame::VideoPresentScreen()
+void HarnessFrame::RefreshSnapshot()
 {
     Video& video = GetVideo();
     const uint8_t* live = video.GetFrameBuffer();
@@ -42,6 +42,11 @@ void HarnessFrame::VideoPresentScreen()
         snapshot_.resize(bytes);   // no-op unless Video's dimensions ever differ from kFullWidth x kFullHeight
         std::memcpy(snapshot_.data(), live, bytes);
     }
+}
+
+void HarnessFrame::VideoPresentScreen()
+{
+    RefreshSnapshot();
     ++presentedFrames_;
     if (presentHook_)
         presentHook_();

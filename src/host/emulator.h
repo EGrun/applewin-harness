@@ -68,7 +68,10 @@ struct DiskInfo {
 struct SnapshotMeta {
     uint64_t emulatedCycles = 0;   // EmulatedCycles() when the snapshot was taken
     uint64_t powerOnOrigin = 0;    // the power-on origin (g_nCumulativeCycles at the last power-on)
-    SpeedSettings speed{};         // the session's speed settings when the snapshot was taken
+    SpeedSettings speed{};         // the session's speed settings when the snapshot was taken (informational, ruling D8)
+    // Joystick 0's position (paddles 0 and 1) once every held change has ended: AppleWin's save state has no
+    // joystick position, so the harness keeps it. LoadSnapshot restores it (buttons are released). 127 = centre.
+    uint8_t joystickX = 127, joystickY = 127;
 };
 
 class Emulator {
@@ -83,7 +86,10 @@ public:
     void Start(const EmulatorConfig&);
     // Releases every sound voice before DSUninit(), then AudioOutput, then the window. Safe to call twice; no-op if not started.
     void Shutdown();
-    void PowerCycle();                   // ResetMachineState() then boot; EmulatedCycles() counts from 0 again
+    // ResetMachineState() then boot; EmulatedCycles() counts from 0 again. Like Start (pass condition 6): video scanner
+    // at cycle 0 of a frame with the text-flash phase of a fresh process, speaker internals as a fresh process's,
+    // AudioCapture cleared.
+    void PowerCycle();
     uint64_t EmulatedCycles() const;     // cycles since the last power-on (D10)
 
     // Runs exactly frames x NTSC_GetCyclesPerFrame() cycles (more only because of the last instruction), in steps of
@@ -177,14 +183,19 @@ public:
     // AppleWin's save state to stateFile (Snapshot_SetFilename + Snapshot_SaveState). A FrameMessageBox during the save
     // throws std::runtime_error carrying its text. Disks are not copied here (CheckpointStore does that).
     SnapshotMeta SaveSnapshot(const std::filesystem::path& stateFile);
-    // Snapshot_LoadState from stateFile, then restore purity in the spec's order: speed settings from meta re-applied
-    // (enhance-disk included), srand(1), speaker internals reset (SpkrReset), video scanner phase from the restored
-    // cycle, pending input discarded (each id reported once by TakeAppliedInputs with discarded = true) and held keys
-    // and buttons released, AudioCapture cleared with every voice reset (audio before meta.emulatedCycles is gone), the
+    // Snapshot_LoadState from stateFile, then restore purity in the spec's order: the session's CURRENT speed settings
+    // re-applied (ruling D8; enhance-disk included, meta.speed is not used), srand(1), speaker internals reset to a
+    // fresh process's (SpkrReset and more), the video scanner phase kept from the save state (AppleWin restores
+    // g_dwCyclesThisFrame) with the text-flash phase set from the restored cycle, pending input discarded (each id
+    // reported once by TakeAppliedInputs with discarded = true), held keys and buttons released and the joystick put at
+    // meta's position, AudioCapture cleared with every voice reset (audio before meta.emulatedCycles is gone), the
     // presented frame re-rendered from the restored video memory, and EmulatedCycles() == meta.emulatedCycles.
     // The disk images the save state names must already be in place (the caller ejects with EjectAll and restores the
-    // copies first); a missing image never opens a dialog. Any FrameMessageBox during the load throws
-    // std::runtime_error carrying its text; the machine state is then undefined until PowerCycle.
+    // copies first). Before loading, every image the save state names is checked: a missing one (or a bare file name
+    // that would resolve to another file in the current directory) throws std::runtime_error with the machine state
+    // unchanged, so AppleWin never opens its file dialog (ruling D7). Any FrameMessageBox during the load throws
+    // std::runtime_error carrying its text; the slot cards are put back, and the machine state is undefined until
+    // PowerCycle.
     void LoadSnapshot(const std::filesystem::path& stateFile, const SnapshotMeta& meta);
     // SHA-256 (64 lowercase hex) over the documented byte layout of docs/specs/m4.md get_state_checksum: CPU
     // registers, memory mode, main and aux RAM with the language-card banks (shadow pages flushed first, as

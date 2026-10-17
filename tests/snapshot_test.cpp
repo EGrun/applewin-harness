@@ -368,6 +368,44 @@ TEST_CASE("ckpt: LoadSnapshot discards pending input and reports each id as disc
     CHECK(e.TakeAppliedInputs().empty());
 }
 
+TEST_CASE("ckpt: FLASH text replays identically after restores, whatever ran before (full speed included)")
+{
+    // The text-flash phase (NTSC.cpp's flash counter) is in no save state; the restore sets it from the restored cycle.
+    // The Applesoft cursor blinks in software, so pass condition 1's script does not show it: FLASH text does.
+    auto& e = StartedEmulator();
+    DosBoot boot(e, "flash");
+    e.QueueText("HOME:FLASH:PRINT \"FLASHING TEXT\":NORMAL\r", 0);
+    REQUIRE(e.RunFrames(60));
+    const fs::path state = boot.dir.path / "state.yaml";
+    const SnapshotMeta meta = e.SaveSnapshot(state);
+    auto frames = [&] {
+        std::vector<std::string> hashes;
+        for (int i = 0; i < 40; ++i) {   // more than one flash period (32 frames)
+            REQUIRE(e.RunFrames(1));
+            hashes.push_back(RawFrameHash(e.Frame()));
+        }
+        return hashes;
+    };
+    e.EjectAll();
+    e.LoadSnapshot(state, meta);
+    const std::vector<std::string> first = frames();
+    // A flash phase that differs from the first restore's: 7 frames, a realtime run at full speed (whole-screen
+    // redraws) and one at normal speed, ending mid-frame.
+    REQUIRE(e.RunFrames(7));
+    e.SetFullSpeedOverride(true);
+    REQUIRE(e.RunRealtime(std::chrono::milliseconds(120)));
+    e.SetFullSpeedOverride(false);
+    REQUIRE(e.RunRealtime(std::chrono::milliseconds(37)));
+    e.EjectAll();
+    e.LoadSnapshot(state, meta);
+    const std::vector<std::string> second = frames();
+    CHECK_MESSAGE(std::count(first.begin(), first.end(), first.front()) < 40, "no flashing seen: the test proves nothing");
+    for (size_t i = 0; i < first.size(); ++i) {
+        INFO("frame " << i + 1);
+        CHECK(second[i] == first[i]);
+    }
+}
+
 // ---- Pass condition 6 ----
 
 TEST_CASE("ckpt: frames after PowerCycle equal a fresh process's through the DOS boot")

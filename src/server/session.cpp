@@ -187,7 +187,8 @@ void Session::Post(ConnectionPtr connection, json request)
 bool Session::IsOperatorOnly(std::string_view method)
 {
     return method == "create_session" || method == "close_session" || method == "pause" || method == "resume" ||
-           method == "step_frames";
+           method == "step_frames" ||
+           method == "set_speed" || method == "get_speed";
 }
 
 int Session::RunMainLoop()
@@ -267,6 +268,8 @@ void Session::Dispatch(const Command& command)
         else if (m == "type_text") result = TypeText(conn, params);
         else if (m == "press_key") result = PressKey(conn, params);
         else if (m == "set_joystick") result = SetJoystick(conn, params);
+        else if (m == "set_speed") result = SetSpeed(params);
+        else if (m == "get_speed") result = GetSpeed(params);
         else if (m == "get_audio") result = GetAudio(params);
         else if (m == "subscribe_audio") result = SubscribeAudio(conn, params);
         else throw RpcError{kMethodNotFound, "method not found: " + m};
@@ -476,6 +479,10 @@ json Session::StepFrames(const json& params)
 }
 
 // ---- Agent methods ----
+
+// Stubs until M3 Part C Task 3.
+json Session::SetSpeed(const json&) { throw RpcError{kInternalError, "not implemented"}; }
+json Session::GetSpeed(const json&) { throw RpcError{kInternalError, "not implemented"}; }
 
 json Session::GetFrame(const json& params)
 {

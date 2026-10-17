@@ -377,8 +377,8 @@ TEST_CASE("vsound: AppleWin's speaker feedback stays 0 over a stepped tone (Revi
 
 TEST_SUITE("realtime")
 {
-    // Review Focus 2. Part C changes the clock; until then g_dwSpeed is set directly. Skipped until Part C.
-    TEST_CASE("vsound: a tone keeps its pitch when the clock speed changes" * doctest::skip())
+    // Review Focus 4 (M3 Part C): the clock changes through Emulator::SetMachineSpeed.
+    TEST_CASE("vsound: a tone keeps its pitch when the clock speed changes")
     {
         auto& e = StartedEmulator();
         const auto work =
@@ -398,8 +398,7 @@ TEST_SUITE("realtime")
         double hz[2] = {};
         const uint32_t speeds[2] = {10, 20};
         for (int i = 0; i < 2; ++i) {
-            g_dwSpeed = speeds[i];
-            SetCurrentCLK6502();
+            e.SetMachineSpeed(speeds[i]);
             REQUIRE(e.RunRealtime(1500ms));
             const auto [h, db] = MeasureNewest(e);
             CAPTURE(speeds[i]);

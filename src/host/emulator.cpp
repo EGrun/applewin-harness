@@ -860,4 +860,14 @@ bool Emulator::SoundActive() const
     return g_started && g_audioOutput != nullptr;
 }
 
+// ---- Speed controls: stubs until M3 Part C Task 2 ----
+void Emulator::SetMachineSpeed(uint32_t) { throw std::logic_error("not implemented"); }
+void Emulator::UseClockMultiplier(double) { throw std::logic_error("not implemented"); }
+void Emulator::SetEnhanceDiskSpeed(bool) { throw std::logic_error("not implemented"); }
+void Emulator::SetFullSpeedOverride(bool) { throw std::logic_error("not implemented"); }
+SpeedSettings Emulator::Speed() const { throw std::logic_error("not implemented"); }
+double Emulator::EffectiveClockHz() const { throw std::logic_error("not implemented"); }
+std::vector<std::string> Emulator::FullSpeedReasons() const { throw std::logic_error("not implemented"); }
+bool Emulator::FullSpeedActive() const { throw std::logic_error("not implemented"); }
+
 }  // namespace harness

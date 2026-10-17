@@ -327,13 +327,202 @@ class SessionTest(PipeTestCase):
                             disks=[{"slot": 6, "drive": 1, "path": "dos33.dsk"}])
 
     def test_deferred_options_get_32006(self):
-        cases = [{"allow_text_screen": True}, {"shared_memory_frames": True}, {"model": "apple2"},
-                 {"speed": {"machine_speed": 10}}]
+        cases = [{"allow_text_screen": True}, {"shared_memory_frames": True}, {"model": "apple2"}]
         for extra in cases:
             with self.subTest(**{k: json.dumps(v) for k, v in extra.items()}):
                 h = self.launch()
                 op = h.connect("operator")
                 self.assertRpcError(-32006, op, "create_session", run_mode="stepped", **extra)
+
+
+# ---- Speed (D11, M3 Part C) ----
+
+SPEED_KEYS = ["base_clock_hz", "clock_multiplier", "effective_clock_hz", "enhance_disk_speed", "full_speed_active",
+              "full_speed_reasons", "full_speed_override", "machine_speed", "video_refresh"]
+
+
+class SpeedTest(PipeTestCase):
+    def assertSpeed(self, got, machine_speed, **expected):
+        """Checks a get_speed-shaped reply: exact key set, the machine speed, and any further fields given."""
+        self.assertEqual(sorted(got), SPEED_KEYS)
+        self.assertEqual(got["machine_speed"], machine_speed)
+        self.assertEqual(got["video_refresh"], 60)
+        self.assertAlmostEqual(got["base_clock_hz"], BASE_CLOCK_HZ, delta=1e-3)
+        for key, value in expected.items():
+            self.assertEqual(got[key], value, key)
+
+    def scenario_hash(self, speed=None, set_speed=None):
+        """The M2 scenario in a stepped session with the given speed settings; the SHA-256 of the final frame."""
+        h = self.launch()
+        op = h.connect("operator")
+        params = {"run_mode": "stepped", "disks": dos_disks()}
+        if speed is not None:
+            params["speed"] = speed
+        op.call("create_session", timeout=30.0, **params)
+        if set_speed is not None:
+            op.call("set_speed", **set_speed)
+        op.call("step_frames", frames=720)
+        agent = h.connect("agent")
+        agent.call("type_text", text="PRINT 2+2\n", inter_key_delay_ms=0)
+        op.call("step_frames", frames=60)
+        frame = agent.call("get_frame", format="PNG")
+        return png_rgb_sha256(base64.b64decode(frame["data"]))[2]
+
+    def test_defaults(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        got = op.call("get_speed")
+        self.assertSpeed(got, 10, enhance_disk_speed=True, full_speed_override=False, full_speed_active=False,
+                         full_speed_reasons=[])
+        self.assertAlmostEqual(got["clock_multiplier"], 1.0, places=6)
+        self.assertAlmostEqual(got["effective_clock_hz"], BASE_CLOCK_HZ, delta=1e-3)
+
+    def test_set_speed_round_trips_and_replies_like_get_speed(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        for value, speed, factor in ((5, 5, 0.75), ("authentic", 10, 1.0), (20, 20, 2.0), (0, 0, 0.5), (39, 39, 3.9)):
+            with self.subTest(machine_speed=value):
+                set_reply = op.call("set_speed", machine_speed=value)
+                self.assertSpeed(set_reply, speed, full_speed_reasons=[])
+                self.assertAlmostEqual(set_reply["effective_clock_hz"], BASE_CLOCK_HZ * factor, delta=1e-3)
+                self.assertAlmostEqual(set_reply["clock_multiplier"], factor, places=6)
+                self.assertEqual(op.call("get_speed"), set_reply)
+
+    def test_max_has_a_null_clock_and_a_reason(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        got = op.call("set_speed", machine_speed="max")
+        self.assertSpeed(got, 40, effective_clock_hz=None, full_speed_reasons=["machine_speed_max"])
+        self.assertEqual(op.call("get_speed"), got)
+        self.assertEqual(op.call("set_speed", machine_speed=40), got)
+
+    def test_clock_multiplier_converts_to_a_machine_speed(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        # AppleWin's UseClockMultiplier: below 0.5 is raised to 0.5, below 1 is (x-0.5)*20, else x*10, at most 39.
+        for x, speed in ((0.3, 0), (0.5, 0), (0.75, 5), (1.0, 10), (1.55, 15), (2.0, 20), (3.95, 39), (10, 39)):
+            with self.subTest(clock_multiplier=x):
+                self.assertSpeed(op.call("set_speed", clock_multiplier=x), speed)
+
+    def test_fields_left_out_keep_their_values(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        op.call("set_speed", enhance_disk_speed=False, full_speed_override=True)
+        got = op.call("set_speed", machine_speed=7)
+        self.assertSpeed(got, 7, enhance_disk_speed=False, full_speed_override=True,
+                         full_speed_reasons=["override"])
+        got = op.call("set_speed", full_speed_override=False)
+        self.assertSpeed(got, 7, enhance_disk_speed=False, full_speed_override=False, full_speed_reasons=[])
+        self.assertSpeed(op.call("set_speed"), 7, enhance_disk_speed=False)   # no fields: unchanged
+        got = op.call("set_speed", machine_speed="max", full_speed_override=True)
+        self.assertEqual(got["full_speed_reasons"], ["machine_speed_max", "override"])
+
+    def test_invalid_params_get_32602_and_change_nothing(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        before = op.call("set_speed", machine_speed=15)
+        bad = [{"machine_speed": 5, "clock_multiplier": 1.0}, {"machine_speed": 41}, {"machine_speed": -1},
+               {"machine_speed": "fast"}, {"machine_speed": 2.5}, {"machine_speed": True},
+               {"clock_multiplier": 0}, {"clock_multiplier": -1}, {"clock_multiplier": "2"},
+               {"enhance_disk_speed": "yes"}, {"full_speed_override": 1},
+               {"video_refresh": 50}, {"machine_speed": 5, "video_refresh": 50}]
+        for params in bad:
+            with self.subTest(**{k: json.dumps(v) for k, v in params.items()}):
+                self.assertRpcError(-32602, op, "set_speed", **params)
+        self.assertEqual(op.call("get_speed"), before)
+
+    def test_speed_methods_before_a_session_get_32002(self):
+        h = self.launch()
+        op = h.connect("operator")
+        self.assertRpcError(-32002, op, "get_speed")
+        self.assertRpcError(-32002, op, "set_speed", machine_speed=5)
+
+    def test_speed_is_an_operator_method(self):
+        h = self.launch()
+        self.stepped_session(h)
+        agent = h.connect("agent")
+        self.assertRpcError(-32001, agent, "get_speed")
+        self.assertRpcError(-32001, agent, "set_speed", machine_speed=5)
+        self.assertEqual(agent.call("get_frame", format="BGRA32")["format"], "BGRA32")   # still open
+
+    def test_create_session_speed_applies_its_settings(self):
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", run_mode="stepped",
+                speed={"machine_speed": 20, "enhance_disk_speed": False, "full_speed_override": True,
+                       "video_refresh": 60})
+        got = op.call("get_speed")
+        self.assertSpeed(got, 20, enhance_disk_speed=False, full_speed_override=True, full_speed_reasons=["override"])
+        self.assertAlmostEqual(got["effective_clock_hz"], BASE_CLOCK_HZ * 2.0, delta=1e-3)
+
+    def test_create_session_speed_accepts_clock_multiplier_and_max(self):
+        for speed, expected in (({"clock_multiplier": 0.75}, 5), ({"machine_speed": "max"}, 40),
+                                ({"machine_speed": "authentic"}, 10)):
+            with self.subTest(speed=json.dumps(speed)):
+                h = self.launch()
+                op = h.connect("operator")
+                op.call("create_session", run_mode="stepped", speed=speed)
+                self.assertSpeed(op.call("get_speed"), expected)
+
+    def test_create_session_speed_errors(self):
+        cases = [(-32006, {"video_refresh": 50}), (-32006, {"machine_speed": 10, "video_refresh": 50}),
+                 (-32602, {"machine_speed": 5, "clock_multiplier": 1.0}), (-32602, {"machine_speed": 41}),
+                 (-32602, {"clock_multiplier": 0}), (-32602, {"enhance_disk_speed": "yes"}),
+                 (-32602, {"video_refresh": 30}), (-32602, "fast")]
+        for code, speed in cases:
+            with self.subTest(code=code, speed=json.dumps(speed)):
+                h = self.launch()
+                op = h.connect("operator")
+                self.assertRpcError(code, op, "create_session", run_mode="stepped", speed=speed)
+                # The failed create left no session behind.
+                self.assertRpcError(-32002, op, "get_speed")
+
+    def test_stepped_hash_is_the_same_at_any_speed(self):
+        """Review focus 1: stepped results do not depend on the speed settings (the M2 golden at every setting)."""
+        expected = golden("m2_dos_print.sha256")
+        runs = {
+            "machine_speed 5": self.scenario_hash(set_speed={"machine_speed": 5}),
+            "machine_speed 40": self.scenario_hash(set_speed={"machine_speed": 40}),
+            "full_speed_override": self.scenario_hash(set_speed={"full_speed_override": True}),
+            "create_session speed 40": self.scenario_hash(speed={"machine_speed": "max"}),
+            "enhance_disk_speed off": self.scenario_hash(set_speed={"enhance_disk_speed": False}),
+        }
+        for name, digest in runs.items():
+            with self.subTest(name):
+                self.assertEqual(digest, expected)
+
+    def test_set_speed_while_running_changes_the_pace(self):
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", run_mode="realtime")
+        agent = h.connect("agent")
+        op.call("set_speed", machine_speed=20)
+        time.sleep(0.5)
+        start = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
+        time.sleep(1.5)
+        end = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
+        rate = (end - start) / 1.5
+        self.assertGreater(rate, 1.5 * BASE_CLOCK_HZ, "machine_speed 20 did not run faster than authentic")
+
+    def test_frame_ready_is_capped_at_60_per_second_at_max(self):
+        """Realtime at max: subscribe to every frame for 2 s of wall time; at most 60 per wall second arrive."""
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", run_mode="realtime", speed={"machine_speed": "max"})
+        agent = h.connect("agent")
+        agent.call("subscribe_frames", every_n_frames=1)
+        start = time.monotonic()
+        count = 0
+        while time.monotonic() - start < 2.0:
+            try:
+                note = agent.next_notification(timeout=0.2)
+            except TimeoutError:
+                continue
+            if note.get("method") == "frame_ready":
+                count += 1
+        elapsed = time.monotonic() - start
+        self.assertLessEqual(count, 60 * elapsed + 3, "{} frame_ready in {:.2f} s".format(count, elapsed))
+        self.assertGreater(count, 20, "frame_ready stopped arriving at max")
 
 
 # ---- Agent methods ----

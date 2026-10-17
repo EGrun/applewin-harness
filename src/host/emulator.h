@@ -45,6 +45,14 @@ struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
 };
 
+// Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is AppleWin's g_dwSpeed (0..40; 10 = authentic,
+// 40 = SPEED_MAX, unthrottled).
+struct SpeedSettings {
+    uint32_t machineSpeed;
+    bool enhanceDisk;
+    bool fullSpeedOverride;
+};
+
 class Emulator {
 public:
     static Emulator& Instance();
@@ -114,6 +122,25 @@ public:
     // The agent-audio timeline (D14): every sound voice, mixed, by emulated cycle since power-on; cleared by Start and
     // PowerCycle. Fed by the VirtualSoundBuffers AppleWin creates, in every mode.
     const AudioCapture& Audio() const;
+
+    // ---- Speed controls (D11). Session settings: they survive PowerCycle. Only realtime pacing is affected; stepped
+    // runs never change. Each throws std::logic_error before Start.
+    // g_dwSpeed = v (std::out_of_range above 40), then SetCurrentCLK6502().
+    void SetMachineSpeed(uint32_t speed);
+    // AppleWin's ::UseClockMultiplier(x): converts to a slider value (never 40). x must be finite and above 0
+    // (std::invalid_argument otherwise).
+    void UseClockMultiplier(double multiplier);
+    // GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(b). Default true.
+    void SetEnhanceDiskSpeed(bool enable);
+    // Harness stand-in for Scroll Lock: forces full speed in realtime runs. Default false.
+    void SetFullSpeedOverride(bool enable);
+    SpeedSettings Speed() const;
+    // g_fCurrentCLK6502 (still the clock of speed 40 as AppleWin sets it; callers report null at 40).
+    double EffectiveClockHz() const;
+    // Why a realtime step would run at full speed right now, in this order: "machine_speed_max", "override",
+    // "disk_motor" (Disk II motor on, enhance on, speaker and Mockingboard silent).
+    std::vector<std::string> FullSpeedReasons() const;
+    bool FullSpeedActive() const;   // !FullSpeedReasons().empty()
 
     // Windowed playback (AudioOutput, D14): its underrun count, and whether it exists (windowed with an audio device).
     uint64_t SoundUnderruns() const;

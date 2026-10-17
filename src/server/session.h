@@ -93,6 +93,8 @@ private:
     nlohmann::json TypeText(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json PressKey(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json SetJoystick(const ConnectionPtr& connection, const nlohmann::json& params);
+    nlohmann::json SetSpeed(const nlohmann::json& params);
+    nlohmann::json GetSpeed(const nlohmann::json& params);
     nlohmann::json GetAudio(const nlohmann::json& params);
     nlohmann::json SubscribeAudio(const ConnectionPtr& connection, const nlohmann::json& params);
 

@@ -218,10 +218,10 @@ def build_server(args, machine):
         return await asyncio.to_thread(machine.type_text, text, inter_key_delay_ms)
 
     @mcp.tool()
-    async def press_key(key: str, hold_ms: int = 0) -> str:
-        """Press one key: a character, an ASCII code, or a name such as RETURN, ESC, TAB, DELETE, LEFT, RIGHT, UP,
-        DOWN, CTRL-A to CTRL-Z, or RESET. Blocks until the keyboard has read it. If the program is not reading the
-        keyboard this fails with an error. To let time pass, call wait."""
+    async def press_key(key: str | int, hold_ms: int = 0) -> str:
+        """Press one key: a character, an ASCII code (an integer 0-127, e.g. 13 for
+        RETURN), or a name such as RETURN, ESC, TAB, DELETE, LEFT, RIGHT, UP, DOWN, CTRL-A to CTRL-Z,
+        or RESET. Blocks until the keyboard has read it. If the program is not reading the keyboard this fails with an error. To let time pass, call wait."""
         return await asyncio.to_thread(machine.press_key, key, hold_ms)
 
     @mcp.tool()

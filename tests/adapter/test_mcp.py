@@ -154,6 +154,11 @@ class EndToEndTest(AdapterTestCase):
                 self.assertEqual(len(images), 1)
                 self.assertEqual(images[0].mime_type, "image/png")
                 self.assertEqual(png_size(base64.b64decode(images[0].data)), (560, 384))
+                # press_key takes a numeric ASCII code (13 = RETURN), not only a string
+                schema = next(t for t in (await s.list_tools()).tools if t.name == "press_key").input_schema
+                self.assertIn("integer", [o.get("type") for o in schema["properties"]["key"]["anyOf"]])
+                pressed = await call(s, "press_key", key=13)
+                self.assertFalse(pressed.is_error, text_of(pressed))
         self.run_async(go)
 
     def test_stdout_is_clean_mcp_only(self):

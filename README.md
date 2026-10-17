@@ -2,7 +2,7 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 Part A (the `--serve` pipe server) is done; agent audio and speed controls are pending. See [project.md](project.md).
+**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 Part A (the `--serve` pipe server) is done; agent audio (`get_audio`, `subscribe_audio`) is done; speed controls are pending. See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
@@ -49,6 +49,8 @@ step: --frames <n> | --type <text>
 - Exit codes: 0 success, 2 bad arguments (usage on stderr), 1 any other failure.
 
 The default display mode is windowed: a view-only window shows the live Apple screen and plays its sound (keys and mouse clicks in the window do nothing). Sound plays only during realtime runs (`--realtime`, or windowed with no steps); stepped runs without `--realtime` are muted. `--headless` opens no window and no audio device, for CI and batch runs (decision D8).
+
+Agent audio: through `--serve`, an agent can hear the Apple with `get_audio` and `subscribe_audio` in every mode, headless and stepped included (decisions D12, D14). In windowed mode the sound you hear lags the window by about 200 to 300 ms.
 
 Examples:
 ```

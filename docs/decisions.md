@@ -102,13 +102,13 @@ The harness runs in one of two display modes, chosen when it starts:
 **How it works:**
 - Both modes use the same `FrameBase` implementation, `HarnessFrame` (renamed from the M1 headless frame), and the same harness-owned main loop (D2). The only differences are a small *presenter* and the sound output.
 - In windowed mode the presenter is the view-only `Window`: it draws the latest presented frame with `StretchDIBits` and pumps window messages on the harness thread. Headless mode simply has no presenter.
-- Sound uses AppleWin's existing seam. AppleWin asks the frontend for each sound buffer through `FrameBase::CreateSoundBuffer`. In windowed mode the harness returns AppleWin's own DirectSound buffer (`Windows/DXSoundBuffer.cpp`), just as `Win32Frame` does, wrapped in a `MonitoredSoundBuffer`. The wrapper mutes the buffer outside realtime runs (D8 rules below) and counts underruns. In headless mode it returns `nullptr`, which takes AppleWin's existing no-sound path (`DSGetSoundBuffer` in `SoundCore.cpp`).
-- **How underruns are measured:** the wrapper counts an underrun per buffer, only after playback has visibly started (the play cursor has moved). It mirrors AppleWin's unsafe-zone check (`SoundCore_ValidateAndAlignWriteOffset`): the end of the last committed write must not lie between the play and write cursors. The startup realignment of a freshly created buffer isn't an underrun.
+- Sound uses AppleWin's existing seam, `FrameBase::CreateSoundBuffer`, in every mode. AppleWin is given a virtual buffer, never a real DirectSound one (D14). In windowed mode the harness's own `AudioOutput` plays the mixed result and counts underruns of its own buffer; headless has no `AudioOutput` and opens no device.
+- **How underruns are measured:** `AudioOutput` counts an underrun when the play cursor of its own buffer passes the end of the written data after playback has started. Startup and resync after a pause aren't underruns.
 - AppleWin's own `Win32Frame` (with its menus, dialogs and message loop) is deliberately not reused. It would take control of the main loop away from the harness.
 
 **Rules:**
 - The window is **view-only**. Keyboard and mouse input to the window doesn't reach the emulator, so the agent API stays the only source of input and runs stay deterministic.
-- The display mode does not affect emulated state, with one exception: SSI263 speech chips on Mockingboard cards. Headless, `SSI263::Update` returns early without DirectSound, so the phoneme-complete IRQ never fires. Windowed, that IRQ is driven partly by the DirectSound play position, which depends on host timing. So for programs that use speech, headless and windowed runs differ, and stepped windowed runs are not reproducible. Otherwise, in stepped mode, a headless run and a windowed run produce identical frames and state checksums. In realtime mode the two can differ in where input lands, because of the audio feedback (D9).
+- The display mode does not affect emulated state. In stepped mode, a headless run and a windowed run produce identical frames, state checksums and audio. (The SSI263 speech exception of earlier drafts is gone: with virtual buffers (D14) the phoneme IRQ no longer depends on host timing.) In realtime mode the two can differ in where input lands, because of the audio feedback (D9).
 - Sound plays through the speakers only in realtime mode. In stepped mode emulation doesn't run in real time, so playback is muted.
 - The agent's audio (D12) is captured separately, in every mode, and doesn't depend on whether sound is playing.
 - If windowed mode can't open an audio device, the harness logs a warning and carries on without sound.
@@ -123,9 +123,9 @@ AppleWin times emulation by counting 6502 cycles. The video scanner, Disk II, sp
 **Realtime mode** copies AppleWin's loop:
 - Each burst runs `g_fCurrentCLK6502 × 1 ms` cycles through `CpuExecute`, then waits for the next 1 ms tick.
 - The tick comes from a high-resolution Windows waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`). AppleWin uses a DirectShow `IReferenceClock` in `SoundCore.cpp` instead. The waitable timer works the same way in both display modes, including on machines with no audio device.
-- AppleWin's speaker feedback (`g_nCpuCyclesFeedback`) is kept, as in AppleWin.
-  - **Windowed mode:** the feedback adjusts each burst's size according to how full the DirectSound buffer is. That keeps sound free of gaps and crackle, and makes the sound card the long-term clock reference.
-  - **Headless mode:** there's no sound buffer, so the feedback stays at zero and every burst is the same size.
+- Speaker feedback (`g_nCpuCyclesFeedback`) now comes from the harness's `AudioOutput` (D14), not from AppleWin's buffers, which always report the ideal fill.
+  - **Windowed mode:** after each `Spkr_SubmitWaveBuffer`, the feedback adjusts the next burst's size according to how full the harness's DirectSound buffer is. It uses AppleWin's rule, with cycles per sample truncated as AppleWin does. That keeps sound free of gaps and crackle, and makes the sound card the long-term clock reference.
+  - **Headless mode:** there's no `AudioOutput`, so the feedback stays at zero and every burst is the same size.
   - **The trade-off:** in windowed realtime mode, burst sizes depend on the host's audio device. That only changes *where* input lands, which realtime mode can't make reproducible anyway, and `applied_at_cycle` records it (D10).
 - AppleWin's full-speed conditions still apply (see D11).
 
@@ -191,21 +191,18 @@ While at full speed the timer is skipped and frames are redrawn the way AppleWin
 - They are session settings. `restore_checkpoint` doesn't change them.
 
 ## D12 — The agent can hear
-**Status:** Accepted. The tap points are confirmed in M3.
+**Status:** Accepted. Updated in M3 Part B: capture goes through virtual sound buffers (D14), not AppleWin patches.
 
 Sound can be an important cue for the agent: a bell on an error, a beep on a prompt, music changing in a game. So the agent API lets the agent hear the Apple. Audio counts as human I/O (D4), so no session option is needed to turn it on.
 
 **Capture at the source, in emulated time:**
-- AppleWin builds speaker samples from emulated cycles (`Speaker.cpp`: samples queued into `g_pSpeakerBuffer`) and mixes Mockingboard output into `MockingboardCardManager::m_mixBuffer`. Both happen *before* anything is sent to DirectSound.
-- The harness captures audio at those two points, through a small AppleWin patch (D2, D7). AppleWin's existing `-wav-speaker` / `-wav-mockingboard` WAV output (`Riff.cpp`) is the model for this patch. The patch must:
-  - Pass each block of samples to the harness, tagged with its emulated cycle.
-  - Still produce the Mockingboard mix when there is no sound buffer. Today `MockingboardCardManager` returns early if `DSGetLock` fails, which would leave headless mode silent.
-  - Capture before AppleWin's output adjustments: the audio-buffer feedback that adds or drops samples, the full-speed Mockingboard mute, and volume.
+- AppleWin's speaker, Mockingboard and SSI263 code all write their samples into sound buffers they get from `FrameBase::CreateSoundBuffer`. The harness hands out virtual buffers (D14) and `AudioCapture` records every commit to them, before anything reaches a real device. **No AppleWin patch is needed.**
+- Commits are placed on the timeline by the cycle interval between commits, using each voice's own sample rate (D14). Because AppleWin always sees the ideal buffer fill, the samples depend only on emulated time.
 - Capture runs in every display mode and run mode (windowed, headless, realtime, stepped).
 
 **Format of the captured audio:**
 - 16-bit PCM, stereo, 44,100 samples per emulated second, measured against the base clock (D10). The speaker is mono and is mixed equally into both channels; Mockingboard is stereo.
-- AppleWin computes speaker samples at the *current* clock (`g_fClksPerSpkrSample`). At speeds other than authentic, the harness patch computes the capture stream at the base clock instead, so the same program sounds the same to the agent at any speed.
+- Part C will make the capture stream independent of the speed setting (so the same program sounds the same at any speed); until then, the stream follows what AppleWin generates.
 - The harness keeps the most recent 30 emulated seconds in a ring buffer.
 
 **What this guarantees:** agent audio depends only on emulated state. In stepped mode the same input script produces byte-identical audio in windowed and headless mode, at any speed setting. M4 checks this.
@@ -224,3 +221,31 @@ At every power-on, AppleWin seeds the zero-page random bytes RNDL/RNDH (`$4E`/`$
 After `Start` and after each `PowerCycle`, the harness sets both bytes to `0x20` (AppleWin's floor value, so the Pooyan workaround still holds) and calls `srand(1)`.
 
 **Consequence:** runs are reproducible. Programs that read RNDL/RNDH at power-on see a fixed value rather than a random one. No AppleWin patch is needed.
+
+## D14 — Virtual sound buffers
+**Status:** Accepted
+
+AppleWin never gets a real DirectSound buffer. The harness replaces the translation unit `external/AppleWin/source/Windows/DXSoundBuffer.cpp` in `AppleWinCore` with its own `src/host/virtual_sound.cpp`, the same way M1 replaced `AppleWin.cpp`. No AppleWin file is modified. `virtual_sound.cpp` defines every symbol the rest of the core uses from the original (`DSInit` succeeds and opens no device, `GetDefaultAudioDeviceName` returns `"harness"`, and so on).
+
+**Virtual buffers:** `HarnessFrame::CreateSoundBuffer` returns a `VirtualSoundBuffer` in every mode: a memory ring of the requested size, rate and channels. Its cursors are derived so AppleWin always sees the ideal fill: the play cursor is the end of the last commit minus 3/8 of the buffer, and the write cursor is the end of the last commit (ruling B6, so a voice that starts at the write cursor, like the Mockingboard, sees the ideal fill from its first call). Nothing is dropped, AppleWin's error correction stays at 0 and `g_nCpuCyclesFeedback` is 0.
+
+**Capture:** each commit (except a whole-buffer zero fill, which is AppleWin re-initialising the buffer) is appended to `AudioCapture`.
+- Voices (speaker, Mockingboard, SSI263) register with their own sample rate (`RegisterVoice`). They are mixed additively with saturation into one 44,100 Hz stereo int16 timeline. Each voice's samples are clamped to int16 first, and other rates are resampled linearly.
+- A commit is placed by the cycle interval since the voice's previous commit (B2), not by a fixed rate: the speaker really runs at about clock/23, near 44,369 Hz.
+- Gap rule (B7): if the interval exceeds the commit's own length plus 100 ms of cycles, the voice was paused. The gap stays silent and the commit is placed as a first commit.
+- The timeline is held in a 30 s ring.
+
+**Playback (windowed, realtime runs only):**
+- `AudioOutput` streams the mixed timeline to a harness-owned DirectSound buffer (`dsound.dll` is delay-loaded; headless never loads it). It has `GLOBALFOCUS`, so sound continues when the view-only window is in the background.
+- It plays 110 ms behind the newest committed audio (B11), so slow Mockingboard commits are heard. In practice the audio lags the window by about 200 to 300 ms.
+- Burst-size feedback keeps that buffer between 1/4 and 1/2 full. It is computed after each `Spkr_SubmitWaveBuffer` with AppleWin's rule and constants (`SoundCore_GetErrorInc`/`GetErrorMax`), with cycles per sample truncated as AppleWin truncates them.
+- Underruns are counted only after playback has started, when the play cursor passes the end of the written data. `audio underruns` reports this count. `MonitoredSoundBuffer` is deleted.
+- Outside realtime runs the buffer is stopped, so it is silent (B12). Resuming resynchronises, and that isn't an underrun.
+
+**Sound events:** the level detector runs 110 ms behind the newest committed audio (B9), matching the gap rule, because a voice can commit up to about 64 ms after another. Level is the AC RMS of each 10 ms block after removing the block's mean and linear trend (B8). AppleWin's speaker ramps its DC level back to zero after a sound, and that ramp must not count as sound.
+
+**Consequences:**
+- D8: the SSI263 exception is gone; stepped runs are identical in both display modes, including audio.
+- D9: the realtime feedback comes from `AudioOutput`.
+- D12: no AppleWin patches; capture goes through the virtual buffers.
+- Maintenance: the replacement TU must track AppleWin's `DXSoundBuffer` interface whenever the submodule pin moves (D7).

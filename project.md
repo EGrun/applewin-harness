@@ -45,9 +45,9 @@ See `docs/decisions.md` for the reasoning behind each choice.
 - API: split into an agent API and an operator API (D4). The spec is in `docs/api_spec.md`.
 - State: checkpoints cover machine state and disks together (D5).
 - Display and sound: windowed with sound by default, headless (no window or sound) as an option. The window and sound are output only; they never change emulated state (D8).
-- Pacing: realtime mode runs 1 ms bursts of cycles paced by a high-resolution timer, plus AppleWin's audio-buffer feedback when sound is playing. Stepped mode runs exact cycle counts with no timer and no sound (D9).
+- Pacing: realtime mode runs 1 ms bursts of cycles paced by a high-resolution timer, plus audio-buffer feedback from the harness's own `AudioOutput` when sound is playing. Stepped mode runs exact cycle counts with no timer and no sound (D9).
 - Time: all API durations are in emulated milliseconds, and every input reports the cycle it was applied at (D10).
-- Agent audio: captured at the source, in emulated time, in every mode. Exposed as `get_audio` and as `sound_started`/`sound_stopped` events (D12).
+- Agent audio: captured from virtual sound buffers (D14), in emulated time, in every mode. Exposed as `get_audio` and as `sound_started`/`sound_stopped` events (D12).
 - Speed: the operator API mirrors AppleWin's speed controls exactly: the speed slider, clock multiplier, enhanced disk speed, the Scroll Lock full-speed override, and the 50/60 Hz setting (D11).
 
 ## Key AppleWin files
@@ -94,11 +94,11 @@ Add keyboard input and frame capture. Add the windowed presenter with sound, whi
 - Headless mode opens no audio device.
 
 ### M3 — JSON-RPC server
-**Status:** Part A (server) is done. Parts B (agent audio) and C (speed controls) are pending. See `docs/specs/m3.md`.
+**Status:** Parts A (server) and B (agent audio) are done. Part C (speed controls) is pending. See `docs/specs/m3.md`.
 
 Serve the named pipe with an ACL and the `hello` handshake. Implement the agent API (keys, joystick, `get_frame`, `subscribe_frames`) and the operator API for `create_session`, `close_session`, `pause`, `resume` and `step_frames`. `create_session` and `close_session` moved here from M4, because the M2 scenario over the pipe needs them. There is one session per process; multiple sessions need AppleWin re-initialisation work and come later.
 
-This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: the AppleWin capture patch, `get_audio` and `subscribe_audio` (D12).
+This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: virtual sound buffers (D14), `get_audio` and `subscribe_audio` (D12).
 
 **Acceptance:**
 - A small Python client reproduces the M2 test over the pipe.
@@ -106,7 +106,8 @@ This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: the
 - In realtime mode, measured emulated cycles per wall-clock second are within ±2% of `effective_clock_hz` for `machine_speed` values 5, 10 and 20.
 - `"max"` and `full_speed_override` both run well above 2× speed.
 - For a range of `clock_multiplier` inputs, the resulting `machine_speed` matches what AppleWin's `UseClockMultiplier` produces.
-- In headless mode, `PRINT CHR$(7)` produces a `sound_started` event followed by a `sound_stopped` event with a `dominant_hz` close to the bell's pitch. `get_audio` returns the bell.
+- Agent audio (Part B, done): in headless mode, `PRINT CHR$(7)` produces a `sound_started` event followed by a `sound_stopped` event with a `dominant_hz` close to the bell's pitch (about 935 Hz). `get_audio` returns the bell, and the same stepped script gives byte-identical audio in both display modes.
+- The speed bullets above belong to Part C (pending).
 
 ### M4 — Checkpoints, determinism
 Add `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `list_disks`, `export_disk` and `step_cycles`. (`create_session`, `close_session` and stepped run mode arrive in M3.)
@@ -135,7 +136,7 @@ Session record/replay, batch experiment orchestration, sector-level disk access.
 - **GPL-2.0 obligations** (D6).
 - **Hidden sources of non-determinism**, such as the real-time clock, the no-slot clock, random memory initialisation, and AppleWin's speaker feedback (which changes how many cycles each burst runs, depending on the host audio buffer). Mitigation: speaker feedback only runs in windowed realtime mode, stepped mode has no feedback and pins or disables the rest (D9), and M4 tests for it.
 - **SSI263 speech is display-mode dependent.** Headless, the phoneme-complete IRQ never fires (no DirectSound). Windowed, it is partly driven by the DirectSound play position, so it depends on host timing (D8). Mitigation: M4 includes a determinism test for SSI263 speech, or pins speech off for deterministic runs.
-- **Agent audio needs AppleWin patches** in `Speaker.cpp` and `MockingboardCardManager.cpp`: tap points, a Mockingboard mix that works with no sound buffer, and capture at the base clock rate. Mitigation: model the patch on the existing WAV output, keep it small, and confirm it in M3 (D12).
+- **The replacement DXSoundBuffer TU must track AppleWin's interface** on submodule updates (D14). Mitigation: it is one small file, and the audio tests fail loudly if the interface drifts.
 - **Realtime input timing depends on when clients send input.** Mitigation: every input reports `applied_at_cycle` (D10). Use stepped mode when a run must be reproducible.
 - **Frame timing:** whole-frame capture at vsync may miss mid-frame effects. Accepted for now; per-scanline capture isn't planned.
 

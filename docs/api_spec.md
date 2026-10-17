@@ -1,6 +1,6 @@
 # AppleWin Harness — API & Protocol Specification
 
-**Version:** 0.3 (draft). Part A of M3 (server, sessions, input, frames, execution control) is implemented. Sections marked "M3 Part B/C — pending" describe features that are not built yet. Design reasoning lives in [decisions.md](decisions.md).
+**Version:** 0.3 (draft). Parts A and B of M3 (server, sessions, input, frames, execution control, agent audio) are implemented. Sections marked "M3 Part C — pending" describe features that are not built yet. Design reasoning lives in [decisions.md](decisions.md).
 
 ## Overview
 The harness lets clients drive an AppleWin emulator that it hosts in-process. The API is split by role (D4):
@@ -115,7 +115,7 @@ Returns `{ mode: "40col" | "80col" | "graphics", lines: string[24] }`.
 - The text is decoded from video memory, which goes beyond strictly reading pixels. That's why it's opt-in (`allow_text_screen`).
 - It returns `mode: "graphics"` with empty `lines` when the screen isn't in a text mode.
 
-### Sound (D12) — M3 Part B — pending
+### Sound (D12, D14)
 The agent hears the same sound a person would: the speaker and Mockingboard, mixed together.
 - It's captured in emulated time, in every mode, including headless and stepped.
 - Playback volume and muting don't affect it.
@@ -123,22 +123,26 @@ The agent hears the same sound a person would: the speaker and Mockingboard, mix
 **`get_audio`** `{ from_cycle?: int, duration_ms?: int = 1000, format?: "WAV" | "PCM16" = "WAV" }`
 
 Returns `{ start_cycle, end_cycle, sample_rate: 44100, channels: 2, format, data }`.
-- `data` is base64-encoded.
+- `data` is base64. `WAV` is a canonical 44-byte-header WAV; `PCM16` is raw little-endian int16 interleaved samples.
+- `duration_ms` must be 1 to 30,000 (`-32602` otherwise).
 - If `from_cycle` is left out, the result is the most recent `duration_ms` of audio.
-- `duration_ms` is capped at 30,000.
-- Audio older than the 30-second ring buffer returns `-32009`.
+- A range that starts before the oldest sample in the 30-second ring buffer returns `-32009`.
+- A range that extends past the newest sample is cut short; `end_cycle` reports the actual end.
 
 **`subscribe_audio`** `{ threshold_db?: number = -50, min_silence_ms?: int = 100 }`
 
-After this call the server sends `sound_started` and `sound_stopped` notifications.
-- Sound "starts" when the level rises above `threshold_db`.
-- It "stops" once it has stayed below the threshold for `min_silence_ms`.
+`threshold_db` must be a number in -120..0 and `min_silence_ms` an integer in 10..10000 (`-32602` otherwise). After this call the server sends `sound_started` and `sound_stopped` notifications.
+- The level is the AC RMS in dBFS of each 10 ms block, after removing the block's mean and linear trend.
+- Sound "starts" at the first block above `threshold_db`.
+- It "stops" once it has stayed below the threshold for `min_silence_ms`. `end_cycle` is the end of the last loud block.
+- Events are produced 110 ms of emulated time behind the newest audio, so a trailing sound's `sound_stopped` arrives once emulation has advanced that far.
+- Measured example: the //e bell (`PRINT CHR$(7)`) has a dominant frequency of about 934.5 Hz and lasts about 120 ms by the detector (the ROM's tone timing is about 103 ms).
 
 ### Agent notifications
 - `frame_ready` `{ frame_id, emulated_cycles, width, height }` (shared-memory fields are planned)
 - `input_applied` `{ input_id, first_cycle, last_cycle }`
-- `sound_started` *(M3 Part B — pending)* `{ start_cycle, emulated_ms }`
-- `sound_stopped` *(M3 Part B — pending)* `{ start_cycle, end_cycle, duration_ms, peak_db, dominant_hz }`. Fetch the actual samples with `get_audio { from_cycle: start_cycle }`.
+- `sound_started` `{ start_cycle, emulated_ms }` (`emulated_ms` is milliseconds of emulated time since power-on)
+- `sound_stopped` `{ start_cycle, end_cycle, duration_ms, peak_db, dominant_hz }` (`peak_db` in dBFS, `dominant_hz` in Hz). Fetch the actual samples with `get_audio { from_cycle: start_cycle }`.
 
 ## Operator API
 

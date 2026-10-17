@@ -854,8 +854,9 @@ bool IsDeviceName(std::wstring segment)
 void RequirePlainFilePath(const fs::path& dest)
 {
     const std::wstring& w = dest.native();
-    if (w.rfind(L"\\\\?\\", 0) == 0 || w.rfind(L"\\\\.\\", 0) == 0 || w.rfind(L"//?/", 0) == 0 ||
-        w.rfind(L"//./", 0) == 0)
+    std::wstring slashed = w;   // Win32 treats '/' and '\' alike, so "/\.\x" is also a device path
+    std::replace(slashed.begin(), slashed.end(), L'/', L'\\');
+    if (slashed.rfind(L"\\\\?\\", 0) == 0 || slashed.rfind(L"\\\\.\\", 0) == 0)
         InvalidParams("dest_path must not use a \\\\?\\ or \\\\.\\ prefix");
     const size_t afterDrive = dest.has_root_name() && dest.root_name().native().size() == 2 &&
                                       dest.root_name().native()[1] == L':'

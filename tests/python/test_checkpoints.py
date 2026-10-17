@@ -348,7 +348,7 @@ class DiskTest(CheckpointTestCase):
         unsafe += [os.path.join(out, "AUX", "export.dsk"), os.path.join(out, "nul.d", "export.dsk")]
         unsafe += [DOS_IMAGE + ":x", existing + ":stream", os.path.join(out, "a.dsk:x"), out + ":x",
                    os.path.dirname(work_dir(h)) + ":x", "\\\\?\\" + os.path.join(out, "b.dsk"),
-                   "\\\\.\\" + "NUL"]
+                   "\\\\.\\" + "NUL", "/\\.\\" + "NUL", "\\/.\\pipe\\x", "/\\?\\" + os.path.join(out, "c.dsk")]
         for dest in unsafe:
             with self.subTest(dest=dest):
                 self.assertRpcError(-32602, op, "export_disk", slot=6, drive=1, dest_path=dest)

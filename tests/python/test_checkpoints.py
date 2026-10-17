@@ -150,9 +150,10 @@ def unrelated_work(op, agent):
 
 
 class CheckpointTestCase(PipeTestCase):
-    def launch(self, headless=True, timeout_s=90.0):
-        """As PipeTestCase.launch, with a longer watchdog (checkpoint tests boot DOS and replay scripts)."""
-        harness = Harness.launch(headless=headless)
+    def launch(self, headless=True, timeout_s=90.0, cwd=None):
+        """As PipeTestCase.launch, with a longer watchdog (checkpoint tests boot DOS and replay scripts); cwd: the
+        server's working directory (default: the exe's directory)."""
+        harness = Harness.launch(headless=headless, cwd=cwd)
         self.addCleanup(harness.close)
         watchdog = threading.Timer(timeout_s, harness.kill)
         watchdog.daemon = True
@@ -338,6 +339,20 @@ class DiskTest(CheckpointTestCase):
             with self.subTest(dest=dest):
                 self.assertRpcError(-32602, op, "export_disk", slot=6, drive=1, dest_path=dest)
         self.assertFalse(os.path.exists(inside_work))
+        with open(existing, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+        # Review M-2/M-3: device names in any segment, with or without an extension, and alternate data streams.
+        devices = ["NUL", "nul.txt", "CON", "Con .dsk", "PRN", "AUX.dsk", "COM1", "com9.dsk", "LPT1", "lpt9.do",
+                   "CONOUT$"]
+        unsafe = [os.path.join(out, name) for name in devices]
+        unsafe += [os.path.join(out, "AUX", "export.dsk"), os.path.join(out, "nul.d", "export.dsk")]
+        unsafe += [DOS_IMAGE + ":x", existing + ":stream", os.path.join(out, "a.dsk:x"), out + ":x",
+                   os.path.dirname(work_dir(h)) + ":x", "\\\\?\\" + os.path.join(out, "b.dsk"),
+                   "\\\\.\\" + "NUL"]
+        for dest in unsafe:
+            with self.subTest(dest=dest):
+                self.assertRpcError(-32602, op, "export_disk", slot=6, drive=1, dest_path=dest)
+        self.assertEqual(sorted(os.listdir(out)), ["existing.dsk"])
         with open(existing, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
         self.assertRpcError(-32602, op, "export_disk", slot=5, drive=1, dest_path=os.path.join(out, "a.dsk"))
@@ -645,14 +660,103 @@ class RestoreFailureTest(CheckpointTestCase):
         with open(state, "rb") as f:
             data = f.read()
         self.assertGreater(len(data), 1000)
-        with open(state, "wb") as f:   # the header survives, so the load starts replacing state before it fails
-            f.write(data[:len(data) * 2 // 5] + b"\n  ]]] not: [yaml\n")
+        # The header survives, so the load starts replacing state before it fails; the rest (with the disk image
+        # names the pre-load checks read) is kept, so the failure comes from the load, not before it.
+        cut = data.index(b"\n", len(data) * 2 // 5) + 1
+        with open(state, "wb") as f:
+            f.write(data[:cut] + b"  ]]] not: [yaml\n" + data[cut:])
         rid = op.request("restore_checkpoint", {"checkpoint_id": cp["checkpoint_id"]})
         reply = op.wait_reply(rid, timeout=30.0)
         self.assertIn("error", reply, reply)
         self.assertEqual(reply["error"]["code"], -32004, reply)
         self.assertTrue(reply["error"]["message"].strip(), "the -32004 carries no message")
         self.assertUnusable(op)
+
+    def test_failed_restore_before_eject_leaves_the_disk_reading_as_without_it(self):
+        """Review I-3: a restore refused for a missing checkpoint disk copy is refused before the drives are touched,
+        so list_disks and a later disk read are the same as in a control session that never made the failed call.
+        Ejecting and re-inserting would lose the drive's position in its current track (InsertDisk clears the floppy;
+        a .dsk track read starts at nibble 0), which only shows when the next read stays on that track: the first
+        CATALOG leaves the head on the catalog track, the second reads it again."""
+        def run(fail):
+            h = self.launch()
+            op, agent = self.booted(h)
+            agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)
+            op.call("step_frames", frames=200)
+            cp = op.call("checkpoint")
+            if fail:
+                cp_dir = os.path.join(work_dir(h), "checkpoints", cp["checkpoint_id"])
+                for f in os.listdir(cp_dir):
+                    if f.startswith("disk"):
+                        os.remove(os.path.join(cp_dir, f))
+            op.call("step_frames", frames=10)
+            if fail:
+                self.assertRpcError(-32004, op, "restore_checkpoint", checkpoint_id=cp["checkpoint_id"])
+            disks = [dict(d, working_path=os.path.relpath(d["working_path"], work_dir(h)))
+                     for d in op.call("list_disks")]
+            agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)
+            samples = []
+            for _ in range(8):
+                op.call("step_frames", frames=5)
+                samples.append((op.call("get_state_checksum"), frame_hash(agent.call("get_frame", format="BGRA32"))))
+            h.close()
+            return disks, samples
+
+        control = run(False)
+        failed = run(True)
+        self.assertEqual(failed[0], control[0], "list_disks differs after the failed restore")
+        for i, (a, b) in enumerate(zip(failed[1], control[1])):
+            self.assertEqual(a, b, "the disk read differs {} frames into the second CATALOG".format(5 * (i + 1)))
+
+    def test_a_stale_restore_backup_is_removed_before_the_restore(self):
+        """A <working copy>.restore-bak left behind (a crash during an earlier restore) can never be put back over a
+        good working disk: the restore removes it first, and restores the checkpoint's disk."""
+        h = self.launch()
+        op, _ = self.booted(h)
+        cp = op.call("checkpoint")
+        cp_dir = os.path.join(work_dir(h), "checkpoints", cp["checkpoint_id"])
+        copy = [f for f in os.listdir(cp_dir) if f.startswith("disk1-")]
+        self.assertEqual(len(copy), 1, os.listdir(cp_dir))
+        working = op.call("list_disks")[0]["working_path"]
+        stale = working + ".restore-bak"
+        with open(stale, "wb") as f:
+            f.write(b"stale backup")
+        op.call("step_frames", frames=30)
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]),
+                         {"emulated_cycles": cp["emulated_cycles"]})
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual(sha256_file(working), sha256_file(os.path.join(cp_dir, copy[0])))
+
+
+class RestoreLookupTest(CheckpointTestCase):
+    def test_restore_works_when_the_working_directory_holds_a_same_named_image(self):
+        """Review I-1: AppleWin looks a save state's bare image name up in the current directory first. A server started
+        from a directory that holds a file of that name still restores (the lookup runs from the checkpoint's own
+        directory), the file is left alone, and the restored disk is the session's."""
+        decoy_dir = self.scratch_dir()
+        decoy = os.path.join(decoy_dir, os.path.basename(DOS_IMAGE))
+        with open(decoy, "wb") as f:
+            f.write(b"not a disk image" * 64)
+        h = self.launch(cwd=decoy_dir)
+        op, agent = self.booted(h)
+        disks = op.call("list_disks")
+        self.assertEqual(os.path.basename(disks[0]["working_path"]), os.path.basename(decoy))
+        cp = op.call("checkpoint")
+        at = op.call("get_state_checksum")
+        op.call("step_frames", frames=30)
+        after_catalog = []
+        for _ in range(2):   # the second restore shows the first put everything back
+            self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]),
+                             {"emulated_cycles": cp["emulated_cycles"]})
+            self.assertEqual(op.call("get_state_checksum"), at)
+            self.assertEqual(op.call("list_disks"), disks)
+            agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)   # the restored disk reads
+            op.call("step_frames", frames=240)
+            after_catalog.append((op.call("get_state_checksum"),
+                                  frame_hash(agent.call("get_frame", format="BGRA32"))))
+        self.assertEqual(after_catalog[0], after_catalog[1])
+        with open(decoy, "rb") as f:
+            self.assertEqual(f.read(), b"not a disk image" * 64)
 
 
 # ---- Pass condition 5 (speech) ----

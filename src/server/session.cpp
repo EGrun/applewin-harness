@@ -830,6 +830,43 @@ bool IsInside(const fs::path& child, const fs::path& dir)
     return c.size() > d.size() && c.compare(0, d.size(), d) == 0 && (c[d.size()] == L'\\' || c[d.size()] == L'/');
 }
 
+// Review M-2/M-3: a Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9 and their superscript-digit forms,
+// CONIN$, CONOUT$), with or without an extension and with trailing spaces or dots, as Win32 treats it in any path
+// segment.
+bool IsDeviceName(std::wstring segment)
+{
+    const size_t dot = segment.find(L'.');
+    if (dot != std::wstring::npos) segment.resize(dot);
+    while (!segment.empty() && (segment.back() == L' ' || segment.back() == L'.')) segment.pop_back();
+    for (wchar_t& ch : segment) ch = wchar_t(towupper(ch));
+    if (segment == L"CON" || segment == L"PRN" || segment == L"AUX" || segment == L"NUL" || segment == L"CONIN$" ||
+        segment == L"CONOUT$")
+        return true;
+    if (segment.size() == 4 && (segment.compare(0, 3, L"COM") == 0 || segment.compare(0, 3, L"LPT") == 0)) {
+        const wchar_t d = segment[3];
+        return (d >= L'1' && d <= L'9') || d == L'\u00B9' || d == L'\u00B2' || d == L'\u00B3';
+    }
+    return false;
+}
+
+// export_disk's dest_path names an ordinary file: no \\?\ or \\.\ prefix, no ':' after the drive (an NTFS alternate
+// data stream), and no device name in any segment.
+void RequirePlainFilePath(const fs::path& dest)
+{
+    const std::wstring& w = dest.native();
+    if (w.rfind(L"\\\\?\\", 0) == 0 || w.rfind(L"\\\\.\\", 0) == 0 || w.rfind(L"//?/", 0) == 0 ||
+        w.rfind(L"//./", 0) == 0)
+        InvalidParams("dest_path must not use a \\\\?\\ or \\\\.\\ prefix");
+    const size_t afterDrive = dest.has_root_name() && dest.root_name().native().size() == 2 &&
+                                      dest.root_name().native()[1] == L':'
+                                  ? 2
+                                  : 0;
+    if (w.find(L':', afterDrive) != std::wstring::npos)
+        InvalidParams("dest_path must not name an alternate data stream (':')");
+    for (const fs::path& segment : dest.relative_path())
+        if (IsDeviceName(segment.native())) InvalidParams("dest_path names a device: " + PathUtf8(segment));
+}
+
 }  // namespace
 
 void Session::RequireUsable() const
@@ -878,21 +915,48 @@ json Session::RestoreCheckpoint(const json& params)
         throw RpcError{kInvalidState, "the window was closed"};
     }
 
-    // Before the load (ruling D7): a failure leaves the session usable with its machine state unchanged.
+    // Before the load (ruling D7): a failure leaves the session usable with its machine state unchanged. Review I-3:
+    // every check that needs no ejected drive runs before EjectAll, so those failures leave the drives untouched.
     const std::vector<DiskInfo> current = emulator_.Disks();
-    emulator_.EjectAll();
     try {
-        checkpoints_->RestoreDisks(entry, current);
+        checkpoints_->PrepareRestore(entry, current);
+        std::vector<fs::path> images;
+        for (const CheckpointStore::DiskCopy& c : entry.disks) images.push_back(c.workingPath);
+        emulator_.CheckSnapshot(entry.StateFile(), images);
     } catch (const std::exception& e) {
-        try { emulator_.ReinsertAll(); } catch (...) {}
         throw RpcError{kCheckpointFailed, e.what()};
+    }
+
+    // After EjectAll a failure before the load puts the working copies and the drives back (re-inserting may reset a
+    // drive's rotational position: docs/api_spec.md). If that fails too, the drives no longer hold what they held and
+    // the session is unusable (review I-2): -32004 now, -32008 for the gated methods after.
+    auto abandon = [&](std::string what, bool disksRestored) -> RpcError {
+        if (disksRestored) {
+            try {
+                emulator_.ReinsertAll();
+                return RpcError{kCheckpointFailed, what};
+            } catch (const std::exception& e) {
+                what += "; re-inserting the disks failed: " + std::string(e.what());
+            }
+        }
+        unusable_ = true;
+        state_ = State::Paused;
+        return RpcError{kCheckpointFailed, what + "; the session is unusable, close_session"};
+    };
+    try {
+        emulator_.EjectAll();
+        checkpoints_->RestoreDisks(entry, current);
+    } catch (const RestoreRollbackError& e) {
+        throw abandon(e.what(), false);
+    } catch (const std::exception& e) {
+        throw abandon(e.what(), true);
     }
     try {
         emulator_.LoadSnapshot(entry.StateFile(), entry.meta);
     } catch (const SnapshotPreLoadError& e) {   // the machine is untouched: put the disks and drives back
-        checkpoints_->RollbackRestore(entry);
-        try { emulator_.ReinsertAll(); } catch (...) {}
-        throw RpcError{kCheckpointFailed, e.what()};
+        const std::string rollback = checkpoints_->RollbackRestore(entry);
+        if (!rollback.empty()) throw abandon(std::string(e.what()) + "; " + rollback, false);
+        throw abandon(e.what(), true);
     } catch (const std::exception& e) {   // in or after the load: the restored disks stay, the session is unusable
         checkpoints_->CommitRestore(entry);
         unusable_ = true;
@@ -984,6 +1048,7 @@ json Session::ExportDisk(const json& params)
     const uint64_t drive = GetUint(params, "drive", 1, 2, std::nullopt);
     const fs::path dest = Utf8Path(GetString(params, "dest_path", std::nullopt));
     if (!dest.is_absolute()) InvalidParams("dest_path must be absolute");
+    RequirePlainFilePath(dest);
     std::error_code ec;
     if (fs::exists(fs::symlink_status(dest, ec))) InvalidParams("dest_path already exists");
     for (const fs::path& original : originals_)

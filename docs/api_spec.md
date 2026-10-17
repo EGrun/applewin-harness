@@ -163,7 +163,7 @@ Returns `{ session_id }`.
 **`list_disks`** `{}` — returns `[ { slot: 6, drive: 1|2, original_path, working_path, write_protected, format } ]`, with empty drives left out. `format` is the image type AppleWin reports (`"DO"`, `"PO"`, `"NIB"`, `"WOZ"`, ...). Before a session exists: `-32002`.
 
 **`export_disk`** `{ slot: 6, drive: 1|2, dest_path }` — flushes the drive's current track, copies the working image to `dest_path` and replies `{}`.
-- `dest_path` must be absolute, must not exist, must not be any session's original image, must not be inside the harness work directory (`%TEMP%\applewin-harness`), and its directory must exist; otherwise `-32602`. Original images are never touched.
+- `dest_path` must be absolute, must not exist, must not be any session's original image, must not be inside the harness work directory (`%TEMP%\applewin-harness`), and its directory must exist; otherwise `-32602`. It must also name an ordinary file: no `\\?\` or `\\.\` prefix, no `:` after the drive letter (an NTFS alternate data stream), and no Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, `CONIN$`, `CONOUT$`, with or without an extension) in any path segment; otherwise `-32602`. Original images are never touched.
 - An empty drive is `-32005`. Any slot other than 6 is `-32602`. After a failed restore it returns `-32008`.
 
 ### Execution control
@@ -220,23 +220,25 @@ A checkpoint is an AppleWin save state plus copies of the working disks, stored 
 - **Non-ASCII working paths (D10):** AppleWin stores image paths as UTF-8 but loads them through the ANSI file API. If a working copy's path would not survive that round trip (for example a `%TEMP%` path with non-ASCII characters), `checkpoint` returns `-32004` and writes nothing.
 
 **`restore_checkpoint`** `{ checkpoint_id }` — returns `{ emulated_cycles }`. It restores the save state and the disks together, and leaves the session paused in both run modes (use `resume` to start a realtime run). An unknown id is `-32602`.
-- After a restore, everything observable depends only on the checkpoint (see D5): the machine, the disks, the video scanner position, the speaker, the random stream and the harness's own queues. Running the same script from the same checkpoint always gives the same state checksum, frames and audio, whatever happened before the restore.
+- After a restore, everything observable depends only on the checkpoint (see D5), except the frame id counter (below): the machine, the disks, the video scanner position, the speaker, the random stream and the harness's own queues. Running the same script from the same checkpoint always gives the same state checksum, frames and audio, whatever happened before the restore.
 - `emulated_cycles` continues from the checkpoint's value. Input still queued is discarded and reported with `discarded: true` (see Input replies), held keys and joystick buttons are released, and the joystick returns to the position it had at the checkpoint.
 - The audio capture is cleared: `get_audio` for audio from before the restore returns `-32009`. `subscribe_audio` detectors restart at the restored cycle. `get_frame` straight after a restore shows the restored screen.
 - The session's current speed settings are kept (D8).
-- **Failure before the load** (for example a missing checkpoint disk copy): `-32004`. The session stays usable and unchanged: the working disks are rolled back and re-inserted, and `get_state_checksum` equals its value before the call (D7).
+- Frame ids and `frame_ready` cadence continue across a restore; they are not reset. `frame_id` only counts up: the re-rendered frame straight after a restore keeps the last id (its pixels are the restored screen), no `frame_ready` is sent for it, and the `every_n_frames` phase carries on from before the restore.
+- AppleWin looks each disk image up by its bare file name in the process's current directory before its absolute path. The harness makes the checkpoint's own directory current for the load and puts the previous one back, so the server's working directory may hold files of any name.
+- **Failure before the load** (for example a missing checkpoint disk copy): `-32004`. The session stays usable and unchanged: `get_state_checksum` equals its value before the call (D7). Every check that does not need the drives empty (the save state, the disk copies, the image names) runs before the drives are ejected, so those failures leave the drives untouched. A failure after ejecting (a disk copy that can't be read or written) rolls the working disks back and re-inserts them; such a failure may reset the drive's rotational position. If the working disks can't be put back or re-inserted, the reply is still `-32004` and the session is then unusable, as below.
 - **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum` and `export_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
 
 **`list_checkpoints`** `{}` — returns `[ { checkpoint_id, name, created_at, emulated_cycles } ]`, oldest first. `created_at` is ISO 8601 UTC; `name` may be `null`.
 
 **`delete_checkpoint`** `{ checkpoint_id }` — returns `{}`. An unknown id is `-32602`.
 
-**Startup sweep (D11).** A killed server cannot clean up after itself. On start, the harness removes stale `%TEMP%\applewin-harness\<pid>` directories and `<pid>.ini` files whose process is no longer running. A live process's entries are never touched.
+**Startup sweep (D11).** A killed server cannot clean up after itself. On start, the harness removes stale `%TEMP%\applewin-harness\<pid>` directories and `<pid>.ini` files whose process is no longer running. A live process's entries are never touched, and junctions and symbolic links are skipped, never followed.
 
 ### Test helpers
 **`get_state_checksum`** `{}` — returns `{ sha256, emulated_cycles }`. It is an operator method.
 
-`sha256` is the lowercase hex SHA-256 of the byte string below, little-endian throughout. It never includes wall-clock time, paths or harness bookkeeping. It is computed at any time, and gives the same value after a restore as when the checkpoint was made.
+`sha256` is the lowercase hex SHA-256 of the byte string below, little-endian throughout. It never includes wall-clock time, paths or harness bookkeeping. It is computed at any time. After a restore it equals the value when the checkpoint was made, except for input state the restore releases: keys and joystick buttons held at the checkpoint and timed joystick moves still pending then (the //e any-key-down flag, button and paddle bytes). Two restores of the same checkpoint always give the same value.
 
 | # | Size in bytes | Content |
 |---|---|---|

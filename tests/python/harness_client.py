@@ -232,10 +232,11 @@ class Harness:
             pass
 
     @classmethod
-    def launch(cls, headless=True, announce_timeout=15.0):
+    def launch(cls, headless=True, announce_timeout=15.0, cwd=None):
+        """cwd: the server's working directory (default: the exe's directory)."""
         args = [exe_path(), "--serve"] + (["--headless"] if headless else [])
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   cwd=os.path.dirname(exe_path()))
+                                   cwd=cwd or os.path.dirname(exe_path()))
         line_box = []
 
         def read_line():

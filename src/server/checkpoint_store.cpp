@@ -1,5 +1,6 @@
 #include "server/checkpoint_store.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -137,15 +138,42 @@ fs::path BackupOf(const fs::path& p)
 }
 }  // namespace
 
+void CheckpointStore::PrepareRestore(const Entry& entry, const std::vector<DiskInfo>& current)
+{
+    std::error_code ec;
+    if (entry.disks.size() != current.size())
+        throw std::runtime_error("checkpoint " + entry.id + ": it holds " + std::to_string(entry.disks.size()) +
+                                 " disk(s), the drives hold " + std::to_string(current.size()));
+    for (const DiskCopy& c : entry.disks) {
+        const bool inserted = std::any_of(current.begin(), current.end(), [&](const DiskInfo& d) {
+            return d.drive == c.drive && d.workingPath == c.workingPath;
+        });
+        if (!inserted)
+            throw std::runtime_error("checkpoint " + entry.id + ": drive " + std::to_string(c.drive + 1) +
+                                     " does not hold " + Utf8(c.workingPath));
+        if (!fs::is_regular_file(c.copy, ec))
+            throw std::runtime_error("checkpoint " + entry.id + ": disk copy missing: " + Utf8(c.copy));
+    }
+    for (const DiskCopy& c : entry.disks) {   // a stale backup would be "rolled back" over a good working copy
+        const fs::path bak = BackupOf(c.workingPath);
+        fs::remove(bak, ec);
+        if (fs::exists(fs::symlink_status(bak, ec)) || (ec && ec != std::errc::no_such_file_or_directory))
+            throw std::runtime_error("checkpoint " + entry.id + ": cannot remove the stale " + Utf8(bak));
+    }
+}
+
 void CheckpointStore::RestoreDisks(const Entry& entry, const std::vector<DiskInfo>&)
 {
     std::error_code ec;
-    for (const DiskCopy& c : entry.disks)   // all present before anything is touched
+    for (const DiskCopy& c : entry.disks) {   // all present, no backup in the way, before anything is touched
         if (!fs::is_regular_file(c.copy, ec))
             throw std::runtime_error("checkpoint " + entry.id + ": disk copy missing: " + Utf8(c.copy));
+        if (fs::exists(fs::symlink_status(BackupOf(c.workingPath), ec)))
+            throw std::runtime_error("checkpoint " + entry.id + ": a backup is in the way: " +
+                                     Utf8(BackupOf(c.workingPath)));
+    }
     try {
         for (const DiskCopy& c : entry.disks) {   // working copies aside
-            fs::remove(BackupOf(c.workingPath), ec);
             fs::rename(c.workingPath, BackupOf(c.workingPath), ec);
             if (ec) Fail("cannot move " + Utf8(c.workingPath) + " aside", ec);
         }
@@ -153,8 +181,9 @@ void CheckpointStore::RestoreDisks(const Entry& entry, const std::vector<DiskInf
             fs::copy_file(c.copy, c.workingPath, fs::copy_options::overwrite_existing, ec);
             if (ec) Fail("cannot restore disk image " + Utf8(c.workingPath), ec);
         }
-    } catch (...) {
-        RollbackRestore(entry);
+    } catch (const std::exception& e) {
+        const std::string rollback = RollbackRestore(entry);
+        if (!rollback.empty()) throw RestoreRollbackError(std::string(e.what()) + "; " + rollback);
         throw;
     }
 }
@@ -165,15 +194,18 @@ void CheckpointStore::CommitRestore(const Entry& entry) noexcept
     for (const DiskCopy& c : entry.disks) fs::remove(BackupOf(c.workingPath), ec);
 }
 
-void CheckpointStore::RollbackRestore(const Entry& entry) noexcept
+std::string CheckpointStore::RollbackRestore(const Entry& entry)
 {
+    std::string failed;
     std::error_code ec;
     for (const DiskCopy& c : entry.disks) {
         const fs::path bak = BackupOf(c.workingPath);
-        if (!fs::exists(bak, ec)) continue;
+        if (!fs::exists(bak, ec)) continue;   // not moved aside (PrepareRestore removed any stale backup)
         fs::remove(c.workingPath, ec);
         fs::rename(bak, c.workingPath, ec);
+        if (ec) failed += (failed.empty() ? "" : "; ") + ("cannot put back " + Utf8(c.workingPath) + ": " + ec.message());
     }
+    return failed.empty() ? failed : "rolling back failed: " + failed;
 }
 
 }  // namespace harness

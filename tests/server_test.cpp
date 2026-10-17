@@ -476,6 +476,8 @@ TEST_SUITE("windowed")
 }
 
 // Ruling D11: a harness that starts sweeps the work directories and INIs of dead pids, and leaves live ones alone.
+// Review M-4/M-5: the live pid belongs to a suspended child process (never this test process, whose own work directory
+// must survive), and a junction named for a dead pid is skipped, not followed.
 TEST_CASE("server: startup removes the work directory and INI of a pid that is not running, and keeps a live one's")
 {
     auto running = [](DWORD pid) {
@@ -486,22 +488,50 @@ TEST_CASE("server: startup removes the work directory and INI of a pid that is n
         CloseHandle(h);
         return r;
     };
-    DWORD dead = 0;
-    for (DWORD pid = 4000004; pid < 4000400 && !dead; pid += 4)
-        if (!running(pid)) dead = pid;
-    REQUIRE(dead != 0);
-    const DWORD live = GetCurrentProcessId();
+    // Starts cmd.exe with args (the caller waits or kills it).
+    auto cmd = [](const std::wstring& args, DWORD flags, PROCESS_INFORMATION& pi) {
+        wchar_t system[MAX_PATH] = {};
+        GetSystemDirectoryW(system, MAX_PATH);
+        const std::wstring exe = std::wstring(system) + L"\\cmd.exe";
+        std::wstring line = L"\"" + exe + L"\" " + args;
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        return CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, FALSE, flags | CREATE_NO_WINDOW, nullptr,
+                              nullptr, &si, &pi) != FALSE;
+    };
+    std::vector<DWORD> dead;
+    for (DWORD pid = 4000004; pid < 4000800 && dead.size() < 2; pid += 4)
+        if (!running(pid)) dead.push_back(pid);
+    REQUIRE(dead.size() == 2);
+    PROCESS_INFORMATION child{};
+    REQUIRE(cmd(L"/c exit 0", CREATE_SUSPENDED, child));
+    struct Kill {
+        PROCESS_INFORMATION& pi;
+        ~Kill() { TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000); CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    } kill{child};
+    const DWORD live = child.dwProcessId;
+    REQUIRE(live != GetCurrentProcessId());
+
     const fs::path root = HarnessTempDir();
     fs::create_directories(root);
-    const fs::path deadDir = root / std::to_string(dead), deadIni = root / (std::to_string(dead) + ".ini");
+    const fs::path deadDir = root / std::to_string(dead[0]), deadIni = root / (std::to_string(dead[0]) + ".ini");
     const fs::path liveDir = root / std::to_string(live), liveIni = root / (std::to_string(live) + ".ini");
     const fs::path other = root / "not-a-pid";
+    const fs::path junction = root / std::to_string(dead[1]), target = root / "junction-target";
     fs::create_directories(deadDir / "checkpoints" / "cp-1");
     std::ofstream(deadDir / "checkpoints" / "cp-1" / "state.yaml") << "x";
     std::ofstream(deadIni) << "x";
     fs::create_directories(liveDir);
     std::ofstream(liveIni) << "x";
     fs::create_directories(other);
+    fs::create_directories(target);
+    std::ofstream(target / "keep") << "x";
+    PROCESS_INFORMATION mk{};
+    REQUIRE(cmd(L"/c mklink /J \"" + junction.wstring() + L"\" \"" + target.wstring() + L"\" >nul", 0, mk));
+    WaitForSingleObject(mk.hProcess, 10000);
+    CloseHandle(mk.hThread);
+    CloseHandle(mk.hProcess);
+    REQUIRE((GetFileAttributesW(junction.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
     {
         Server s = StartServer();
         CHECK(!fs::exists(deadDir));
@@ -509,8 +539,12 @@ TEST_CASE("server: startup removes the work directory and INI of a pid that is n
         CHECK(fs::exists(liveDir));
         CHECK(fs::exists(liveIni));
         CHECK(fs::exists(other));
+        CHECK(GetFileAttributesW(junction.c_str()) != INVALID_FILE_ATTRIBUTES);   // skipped, not removed
+        CHECK(fs::exists(target / "keep"));                                      // and never followed
     }
     std::error_code ec;
+    RemoveDirectoryW(junction.c_str());   // the link only
+    fs::remove_all(target, ec);
     fs::remove_all(liveDir, ec);
     fs::remove(liveIni, ec);
     fs::remove_all(other, ec);

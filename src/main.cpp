@@ -136,7 +136,8 @@ void ReleaseEmulator(harness::Emulator& emu)
 }
 
 // Ruling D11: a harness that was killed leaves %TEMP%\applewin-harness\<pid> and <pid>.ini behind. At startup, entries named
-// for a pid that is no longer running are removed (never throws). Live pids and this process are skipped.
+// for a pid that is no longer running are removed (never throws). Live pids, this process and reparse points (junctions,
+// symbolic links: never followed) are skipped.
 bool ProcessIsRunning(DWORD pid)
 {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -162,6 +163,8 @@ void SweepStaleWorkDirs() noexcept
             if (ini) name.resize(name.size() - 4);
             if (name.empty() || name.size() > 9 || name.find_first_not_of("0123456789") != std::string::npos) continue;
             std::error_code e2;
+            const DWORD attributes = GetFileAttributesW(p.c_str());   // review M-4: never follow a junction or link
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
             if (ini ? !it->is_regular_file(e2) : !it->is_directory(e2)) continue;
             const DWORD pid = DWORD(std::stoul(name));
             if (pid == self || ProcessIsRunning(pid)) continue;

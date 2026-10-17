@@ -200,12 +200,19 @@ public:
     // meta's position, AudioCapture cleared with every voice reset (audio before meta.emulatedCycles is gone), the
     // presented frame re-rendered from the restored video memory, and EmulatedCycles() == meta.emulatedCycles.
     // The disk images the save state names must already be in place (the caller ejects with EjectAll and restores the
-    // copies first). Before loading, every image the save state names is checked: a missing one (or a bare file name
-    // that would resolve to another file in the current directory) throws std::runtime_error with the machine state
-    // unchanged, so AppleWin never opens its file dialog (ruling D7). Any FrameMessageBox during the load throws
-    // std::runtime_error carrying its text; the slot cards are put back, and the machine state is undefined until
-    // PowerCycle.
+    // copies first). The checks and Snapshot_LoadState run with stateFile's directory as the process's current
+    // directory (AppleWin looks each image's bare file name up there first; review I-1), and the previous current
+    // directory is put back on every path. Before loading, every image the save state names is checked: a missing one
+    // (or a bare file name that would resolve to another file in that directory) throws SnapshotPreLoadError with the
+    // machine state unchanged, so AppleWin never opens its file dialog (ruling D7). Any FrameMessageBox during the load
+    // throws std::runtime_error carrying its text; the slot cards are put back, and the machine state is undefined
+    // until PowerCycle.
     void LoadSnapshot(const std::filesystem::path& stateFile, const SnapshotMeta& meta);
+    // LoadSnapshot's pre-load checks alone, with the drives and machine untouched (review I-3: the session runs them
+    // before EjectAll): the save state exists, names exactly expectedImages (absolute paths, case-insensitive) and each
+    // is found as AppleWin will look it up from stateFile's directory. Throws SnapshotPreLoadError naming the cause.
+    void CheckSnapshot(const std::filesystem::path& stateFile,
+                       const std::vector<std::filesystem::path>& expectedImages) const;
     // SHA-256 (64 lowercase hex) over the documented byte layout of docs/specs/m4.md get_state_checksum: CPU
     // registers, memory mode, main and aux RAM with the language-card banks (shadow pages flushed first, as
     // MemSaveSnapshot does), keyboard latch and strobe, video mode, Disk II controller state, and (ruling D6) the //e

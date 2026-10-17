@@ -1432,14 +1432,28 @@ std::optional<std::pair<DWORD, uint64_t>> FileIdentityA(const std::string& path)
 // Ruling D7 and the dialog rule. Disk2InterfaceCard::LoadSnapshotFloppy (Disk.cpp) passes the loaded bytes to the
 // narrow GetFileAttributes (ANSI code page): first the bare file name (relative to the current directory), then the
 // absolute path; if neither is found it opens a file dialog (UserSelectNewDiskImage). The same lookups are made here,
-// on the same bytes, before loading. Refused: an image neither finds (the save state's UTF-8 bytes of a non-ASCII path
-// do not name the file in the ANSI code page, for one), a directory, and a bare name that finds a different file than
-// the absolute path.
-void CheckImagesExist(const std::filesystem::path& stateFile)
+// on the same bytes, before loading, with the same current directory (the caller holds a ScopedCurrentDirectory).
+// Refused: an image neither finds (the save state's UTF-8 bytes of a non-ASCII path do not name the file in the ANSI
+// code page, for one), a directory, and a bare name that finds a different file than the absolute path. With
+// expected, the save state must also name exactly those images (as absolute paths, compared case-insensitively).
+void CheckImagesExist(const std::filesystem::path& stateFile, const std::vector<std::filesystem::path>* expected)
 {
+    size_t named = 0;
     for (const NamedImage& image : ImagesNamedBy(stateFile)) {
         if (image.filename.empty())
             continue;   // an empty drive: no lookup
+        ++named;
+        if (expected) {
+            const std::wstring absolute = std::filesystem::path(image.absolutePath).lexically_normal().native();
+            const bool listed = std::any_of(expected->begin(), expected->end(), [&](const std::filesystem::path& p) {
+                const std::wstring w = p.lexically_normal().native();
+                return CompareStringOrdinal(w.c_str(), int(w.size()), absolute.c_str(), int(absolute.size()), TRUE) ==
+                       CSTR_EQUAL;
+            });
+            if (!listed)
+                throw std::runtime_error("LoadSnapshot: the save state names a disk image the checkpoint has no copy "
+                                         "of: " + image.absolutePath);
+        }
         std::string used = image.filename;
         DWORD attributes = GetFileAttributesA(used.c_str());
         const bool bareFound = attributes != INVALID_FILE_ATTRIBUTES;
@@ -1459,6 +1473,76 @@ void CheckImagesExist(const std::filesystem::path& stateFile)
                 throw std::runtime_error("LoadSnapshot: the save state's disk image " + image.filename +
                                          " would be found in the current directory, not at " + image.absolutePath);
         }
+    }
+    if (expected && named != expected->size())
+        throw std::runtime_error("LoadSnapshot: the save state names " + std::to_string(named) +
+                                 " disk image(s), the checkpoint has " + std::to_string(expected->size()));
+}
+
+// Review I-1: the bare file name LoadSnapshotFloppy tries first is looked up in the process's current directory, so a
+// user's same-named image there would be found (and refused). Around the image checks and Snapshot_LoadState the
+// current directory is the checkpoint's own directory, whose files are state.yaml, meta.json and disk<N>-<name>; the
+// previous one is put back on every path. Only the main thread (which owns the emulator) runs harness code that uses
+// paths while it is switched; the pipe threads use no relative paths.
+class ScopedCurrentDirectory {
+public:
+    explicit ScopedCurrentDirectory(const std::filesystem::path& dir)
+    {
+        const DWORD n = GetCurrentDirectoryW(0, nullptr);
+        if (n == 0)
+            throw std::runtime_error("LoadSnapshot: cannot read the current directory (error " +
+                                     std::to_string(GetLastError()) + ")");
+        previous_.resize(n);
+        const DWORD got = GetCurrentDirectoryW(n, previous_.data());
+        if (got == 0 || got >= n)
+            throw std::runtime_error("LoadSnapshot: cannot read the current directory");
+        previous_.resize(got);
+        if (!SetCurrentDirectoryW(dir.c_str()))
+            throw std::runtime_error("LoadSnapshot: cannot make " + dir.string() + " the current directory (error " +
+                                     std::to_string(GetLastError()) + ")");
+    }
+    ~ScopedCurrentDirectory() { SetCurrentDirectoryW(previous_.c_str()); }
+    ScopedCurrentDirectory(const ScopedCurrentDirectory&) = delete;
+    ScopedCurrentDirectory& operator=(const ScopedCurrentDirectory&) = delete;
+
+private:
+    std::wstring previous_;
+};
+
+// Everything that can be checked about a save state without touching the machine or the drives (ruling D7), with the
+// current directory already switched; every failure becomes a SnapshotPreLoadError.
+void PreLoadChecks(const std::filesystem::path& stateFile, const std::vector<std::filesystem::path>* expected)
+{
+    try {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(stateFile, ec))
+            throw SnapshotPreLoadError("LoadSnapshot: no save state at " + stateFile.string());
+        CheckImagesExist(stateFile, expected);
+    } catch (const SnapshotPreLoadError&) {
+        throw;
+    } catch (const std::exception& e) {   // runtime_error from the image checks, filesystem_error, bad_alloc...
+        const std::string what = e.what();
+        throw SnapshotPreLoadError(what.rfind("LoadSnapshot:", 0) == 0 ? what : "LoadSnapshot: " + what);
+    }
+}
+
+// The save state's absolute path (made before the current directory changes).
+std::filesystem::path AbsoluteStateFile(const std::filesystem::path& stateFile)
+{
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::absolute(stateFile, ec);
+    if (ec)
+        throw SnapshotPreLoadError("LoadSnapshot: cannot make " + stateFile.string() + " absolute: " + ec.message());
+    return p.make_preferred();
+}
+
+// The save state's own directory made current; a failure is a SnapshotPreLoadError (nothing has been touched yet).
+std::unique_ptr<ScopedCurrentDirectory> EnterStateDirectory(const std::filesystem::path& absoluteStateFile)
+{
+    try {
+        return std::make_unique<ScopedCurrentDirectory>(absoluteStateFile.parent_path());
+    } catch (const std::exception& e) {
+        throw SnapshotPreLoadError(e.what());
     }
 }
 
@@ -1553,30 +1637,32 @@ SnapshotMeta Emulator::SaveSnapshot(const std::filesystem::path& stateFile)
     return meta;
 }
 
+void Emulator::CheckSnapshot(const std::filesystem::path& stateFile,
+                             const std::vector<std::filesystem::path>& expectedImages) const
+{
+    RequireStarted();
+    const std::filesystem::path state = AbsoluteStateFile(stateFile);
+    const auto cwd = EnterStateDirectory(state);
+    PreLoadChecks(state, &expectedImages);
+}
+
 void Emulator::LoadSnapshot(const std::filesystem::path& stateFile, const SnapshotMeta& meta)
 {
     RequireStarted();
     g_realtime.reset();   // no open realtime run: g_bFullSpeed clear, the Mockingboard unmuted
 
     // Ruling D7: everything that can be checked before the load is checked first; a failure here changes nothing.
-    try {
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(stateFile, ec))
-            throw SnapshotPreLoadError("LoadSnapshot: no save state at " + stateFile.string());
-        CheckImagesExist(stateFile);
-    } catch (const SnapshotPreLoadError&) {
-        throw;
-    } catch (const std::exception& e) {   // runtime_error from the image checks, filesystem_error, bad_alloc...
-        const std::string what = e.what();
-        throw SnapshotPreLoadError(what.rfind("LoadSnapshot:", 0) == 0 ? what : "LoadSnapshot: " + what);
-    }
-
+    // Review I-1: the checks and the load run with the save state's directory current (see ScopedCurrentDirectory).
+    const std::filesystem::path state = AbsoluteStateFile(stateFile);
     const bool sessionEnhance = GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk();   // D8: the session's setting
     const CardLayout cards = CurrentCards();
     const size_t before = HostFrame().messages().size();
-
-    Snapshot_SetFilename(std::filesystem::path(stateFile).make_preferred().string());
-    Snapshot_LoadState();
+    {
+        const auto cwd = EnterStateDirectory(state);
+        PreLoadChecks(state, nullptr);
+        Snapshot_SetFilename(state.string());
+        Snapshot_LoadState();
+    }
     g_nAppMode = MODE_RUNNING;   // as before the load (AppleWin's own load leaves it; a failed one may not)
 
     if (HostFrame().messages().size() != before) {

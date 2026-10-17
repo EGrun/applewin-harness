@@ -406,6 +406,93 @@ TEST_CASE("ckpt: FLASH text replays identically after restores, whatever ran bef
     }
 }
 
+// AppleWin's save state stores disk image names as UTF-8 and its load hands those bytes to the ANSI file API
+// (YamlSaveHelper::SaveString, Disk2InterfaceCard::LoadSnapshotFloppy). Unless the ANSI code page is UTF-8, a non-ASCII
+// path cannot come back: the checkpoint is refused, and a save state naming one is refused before loading (no file
+// dialog, machine unchanged, ruling D7).
+TEST_CASE("ckpt: a non-ASCII disk path is refused at checkpoint, or restores; a save state naming one never opens a dialog")
+{
+    auto& e = StartedEmulator();
+    const bool utf8Acp = GetACP() == CP_UTF8;
+    const std::wstring accented = L"awh-ckpt-café-" + std::to_wstring(GetCurrentProcessId());
+    const fs::path dir = fs::temp_directory_path() / accented;
+    struct RemoveDir {
+        fs::path p;
+        ~RemoveDir() { std::error_code ec; fs::remove_all(p, ec); }
+    } removeDir{dir};
+    {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    fs::create_directories(dir);
+    BOOL usedDefault = FALSE;
+    const std::wstring w = dir.wstring();
+    const bool ansiRepresentable =
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), -1, nullptr, 0, nullptr, &usedDefault) > 0 && !usedDefault;
+    REQUIRE_MESSAGE(ansiRepresentable, "pick a character this machine's ANSI code page has (InsertDisk needs one)");
+
+    // 1. Checkpoint with the working copy under the accented directory.
+    {
+        WorkingCopy copy(DosMasterImage(), dir / "disk");
+        e.InsertDisk(0, copy.Path());
+        EjectAndPowerCycle guard{e};
+        e.PowerCycle();
+        REQUIRE(e.RunFrames(60));
+        const std::string before = e.StateChecksum();
+        const fs::path state = dir / "state.yaml";
+        if (utf8Acp) {
+            const SnapshotMeta meta = e.SaveSnapshot(state);
+            e.EjectAll();
+            e.LoadSnapshot(state, meta);
+            CHECK(e.StateChecksum() == before);
+        } else {
+            CHECK_THROWS_AS(e.SaveSnapshot(state), std::runtime_error);
+            CHECK_FALSE(fs::exists(state));
+            CHECK(e.StateChecksum() == before);
+        }
+    }
+
+    // 2. A save state that names an image under the accented directory (an ASCII checkpoint, edited): LoadSnapshot makes
+    // AppleWin's own lookups on the same bytes before loading.
+    ScratchDir ascii("ansi");
+    WorkingCopy copy(DosMasterImage(), ascii.path / "disk");
+    e.InsertDisk(0, copy.Path());
+    EjectAndPowerCycle guard{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(60));
+    const fs::path state = ascii.path / "state.yaml";
+    const SnapshotMeta meta = e.SaveSnapshot(state);
+    const std::string before = e.StateChecksum();
+    fs::create_directories(dir / "disk");
+    fs::copy_file(copy.Path(), dir / "disk" / copy.Path().filename(), fs::copy_options::overwrite_existing);
+    const std::u8string from = ascii.path.filename().u8string(), to = fs::path(accented).u8string();
+    std::vector<uint8_t> bytes = ReadAll(state);
+    std::string text(bytes.begin(), bytes.end());
+    const std::string fromS(from.begin(), from.end()), toS(to.begin(), to.end());
+    size_t replaced = 0;
+    for (size_t pos = 0; (pos = text.find(fromS, pos)) != std::string::npos; pos += toS.size(), ++replaced)
+        text.replace(pos, fromS.size(), toS);
+    REQUIRE(replaced > 0);
+    WriteAll(state, std::vector<uint8_t>(text.begin(), text.end()));
+
+    e.EjectAll();
+    if (utf8Acp) {
+        e.LoadSnapshot(state, meta);
+        CHECK(e.StateChecksum() == before);
+    } else {
+        std::string what;
+        try {
+            e.LoadSnapshot(state, meta);
+        } catch (const std::runtime_error& ex) {
+            what = ex.what();
+        }
+        CHECK_MESSAGE(what.find("not found") != std::string::npos, "expected the pre-load refusal, got: " << what);
+        e.ReinsertAll();   // ruling D7: the restore is abandoned, the machine unchanged
+        CHECK(e.StateChecksum() == before);
+        REQUIRE(e.RunFrames(2));
+    }
+}
+
 // ---- Pass condition 6 ----
 
 TEST_CASE("ckpt: frames after PowerCycle equal a fresh process's through the DOS boot")

@@ -45,6 +45,9 @@ public:
     void FrameDrawDiskLEDS() override {}
     void FrameDrawDiskStatus() override {}
     void FrameRefreshStatus(int) override {}
+    // Must stay a no-op: AppleWin's Snapshot_LoadState calls it, and Win32Frame's redraws the screen there. A redraw
+    // would wrap the video scanner once without the Emulator's text-flash tracking counting it (emulator.cpp, "Video
+    // phase").
     void FrameUpdateApple2Type() override {}
     void FrameSetCursorPosByMousePos() override {}
 

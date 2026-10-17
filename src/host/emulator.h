@@ -181,7 +181,9 @@ public:
     // ---- Checkpoints (docs/specs/m4.md; D5, D13). Each throws std::logic_error before Start.
     // Ends any realtime run first (as StopRealtime: full speed and the Mockingboard mute are cleared), then writes
     // AppleWin's save state to stateFile (Snapshot_SetFilename + Snapshot_SaveState). A FrameMessageBox during the save
-    // throws std::runtime_error carrying its text. Disks are not copied here (CheckpointStore does that).
+    // throws std::runtime_error carrying its text. Disks are not copied here (CheckpointStore does that). Refused with
+    // std::runtime_error before writing anything: a disk image path AppleWin's save state cannot bring back (it stores
+    // names as UTF-8 and loads them as ANSI, so any non-ASCII path unless the ANSI code page is UTF-8).
     SnapshotMeta SaveSnapshot(const std::filesystem::path& stateFile);
     // Snapshot_LoadState from stateFile, then restore purity in the spec's order: the session's CURRENT speed settings
     // re-applied (ruling D8; enhance-disk included, meta.speed is not used), srand(1), speaker internals reset to a
@@ -204,15 +206,16 @@ public:
     // bookkeeping.
     std::string StateChecksum() const;
     // A stepped run of exactly cycles cycles (more only because of the last instruction); the input queue is serviced
-    // at each step boundary as in RunFrames. 0 does nothing.
-    void RunCycles(uint64_t cycles);
+    // at each step boundary as in RunFrames. 0 does nothing. Returns false if the window was closed (as RunFrames).
+    bool RunCycles(uint64_t cycles);
     // The slot-6 drives that hold an image, drive 0 first; empty drives are left out.
     std::vector<DiskInfo> Disks() const;
     // Writes each drive's current track back to its image (FlushCurrentTrack), so the file holds every write.
     void FlushDisks();
     // EjectAll: flushes and ejects both slot-6 drives, so AppleWin releases the files, and remembers what was inserted.
     // ReinsertAll: inserts the remembered images again (same paths, same write protection), for a restore abandoned
-    // before LoadSnapshot. Insert errors throw std::runtime_error as InsertDisk does.
+    // before LoadSnapshot, and forgets them; a no-op when nothing is remembered (a successful LoadSnapshot also forgets
+    // them). Insert errors throw std::runtime_error as InsertDisk does.
     void EjectAll();
     void ReinsertAll();
 private:

@@ -469,6 +469,9 @@ unsigned FullSpeedReasonBits()
 // The scanner advances only in two ways: CpuExecute with video updates (a normal step) moves it by exactly the cycles
 // executed, and every whole-screen redraw (VideoRedrawScreen, which presents) wraps it once. At full speed CpuExecute
 // leaves it alone and NTSC_VideoClockResync only moves it within the frame.
+// Load-bearing dependency: AppleWin's Snapshot_LoadState calls frame.FrameUpdateApple2Type(), which in Win32Frame
+// redraws the screen (one untracked wrap). HarnessFrame overrides it as a no-op (harness_frame.h); if it ever redraws,
+// LoadSnapshot must count that wrap. Every path that runs the CPU or redraws must count its wraps here.
 constexpr uint32_t kFlashPeriod = 32;   // 16 frames per flash state, two states
 uint32_t g_flashFrames = 0;             // scanner wraps since the process started (only the value mod 32 matters)
 
@@ -487,18 +490,38 @@ uint32_t RedrawsPerPresent()
 
 // ExecuteStep, counting the scanner's wraps. Normal step: (start + executed) / cycles per frame. Full speed: every
 // present inside the step is a whole-screen redraw (VideoRedrawScreenDuringFullSpeed).
+// Counts the whole-screen redraws presented since construction, also when a present hook (or the observer) throws out
+// of the step: HarnessFrame counts a present before calling its hook.
+class CountPresentedRedraws {
+public:
+    CountPresentedRedraws() : presents_(HostFrame().presentedFrames()) {}
+    CountPresentedRedraws(const CountPresentedRedraws&) = delete;
+    CountPresentedRedraws& operator=(const CountPresentedRedraws&) = delete;
+    ~CountPresentedRedraws() { g_flashFrames += uint32_t(HostFrame().presentedFrames() - presents_) * RedrawsPerPresent(); }
+
+private:
+    uint64_t presents_;
+};
+
 uint32_t TrackedExecuteStep(uint32_t cycles, bool fullSpeed = false)
 {
     if (fullSpeed) {
-        const uint64_t presents = HostFrame().presentedFrames();
-        const uint32_t executed = ExecuteStep(cycles, true);
-        g_flashFrames += uint32_t(HostFrame().presentedFrames() - presents) * RedrawsPerPresent();
-        return executed;
+        CountPresentedRedraws count;
+        return ExecuteStep(cycles, true);
     }
+    // A normal step's wraps all happen inside CpuExecute, before ExecuteStep's present (the only place it can throw:
+    // the present hook), so they are counted from the scanner's position afterwards in that case.
     const uint32_t start = ScannerCycle();
-    const uint32_t executed = ExecuteStep(cycles, false);
-    g_flashFrames += (start + executed) / NTSC_GetCyclesPerFrame();
-    return executed;
+    const uint32_t frame = NTSC_GetCyclesPerFrame();
+    try {
+        const uint32_t executed = ExecuteStep(cycles, false);
+        g_flashFrames += (start + executed) / frame;
+        return executed;
+    } catch (...) {
+        const uint32_t end = ScannerCycle();
+        g_flashFrames += end < start ? 1 : 0;   // a step is at most 1 ms, far less than a frame: at most one wrap
+        throw;
+    }
 }
 
 // Moves the flash phase forward to `phase` (mod kFlashPeriod) with whole-screen redraws. Draws into the video buffer;
@@ -551,9 +574,14 @@ void NeutralizeSpeaker()
     // (44,099 > 42,768) into an empty buffer. Run its clock forward far enough, then back (an unsigned difference that
     // hits the buffer limit again), so its last-update cycle ends where it was.
     const unsigned __int64 now = g_nCumulativeCycles;
-    g_nCumulativeCycles = now + uint64_t(double(SPKR_SAMPLE_RATE + 1) * (g_fClksPerSpkrSample + 1.0));
-    SpkrUpdate(0);
-    g_nCumulativeCycles = now;
+    {
+        struct RestoreClock {   // the emulated clock is never left moved, whatever SpkrUpdate does
+            unsigned __int64 now;
+            ~RestoreClock() { g_nCumulativeCycles = now; }
+        } restoreClock{now};
+        g_nCumulativeCycles = now + uint64_t(double(SPKR_SAMPLE_RATE + 1) * (g_fClksPerSpkrSample + 1.0));
+        SpkrUpdate(0);
+    }
     SpkrUpdate(0);
     g_nSpeakerData = static_cast<short>(-32768);   // SPKR_DATA_INIT, (short)0x8000 (Speaker.cpp)
     g_bQuieterSpeaker = false;
@@ -672,9 +700,10 @@ private:
     {
         g_bFullSpeed = false;
         fullSpeed_ = false;
-        const uint64_t presents = HostFrame().presentedFrames();
-        GetFrame().VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame);   // resync the video clock, redraw, present
-        g_flashFrames += uint32_t(HostFrame().presentedFrames() - presents) * RedrawsPerPresent();
+        {
+            CountPresentedRedraws count;
+            GetFrame().VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame);   // resync the video clock, redraw, present
+        }
         GetCardMgr().GetMockingboardCardMgr().MuteControl(false);
         clock_ = g_fCurrentCLK6502;
         budget_.emplace(clock_, std::chrono::milliseconds(1));
@@ -1314,20 +1343,45 @@ void ThrowIfNewMessages(size_t before, const std::string& what)
     throw std::runtime_error(text);
 }
 
-std::string Trim(std::string v)
+// A YAML scalar's value as libyaml hands it to YamlLoadHelper, then with YamlLoadHelper::LoadString_NoThrow's
+// backslash un-doubling (YamlHelper.cpp): exactly the bytes LoadSnapshotFloppy passes to GetFileAttributes.
+// YamlSaveHelper::SaveString writes a plain scalar, or a double-quoted one when the text contains '#'. A double-quoted
+// value with an escape other than \\ or \" is refused (std::nullopt), which is conservative.
+std::optional<std::string> YamlStringValue(std::string v)
 {
     const size_t b = v.find_first_not_of(" \t\r\n");
     if (b == std::string::npos)
-        return {};
+        return std::string();
     const size_t e = v.find_last_not_of(" \t\r\n");
     v = v.substr(b, e - b + 1);
-    if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
-        v = v.substr(1, v.size() - 2);
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') {
+        std::string out;
+        for (size_t i = 1; i + 1 < v.size(); ++i) {
+            if (v[i] != '\\') {
+                out += v[i];
+                continue;
+            }
+            if (i + 2 >= v.size() || (v[i + 1] != '\\' && v[i + 1] != '"'))
+                return std::nullopt;
+            out += v[++i];
+        }
+        v = out;
+    } else if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'') {
+        std::string out;
+        for (size_t i = 1; i + 1 < v.size(); ++i) {
+            out += v[i];
+            if (v[i] == '\'' && i + 2 < v.size() && v[i + 1] == '\'')
+                ++i;
+        }
+        v = out;
+    }
+    for (size_t pos = 0; (pos = v.find("\\\\", pos)) != std::string::npos; ++pos)   // LoadString_NoThrow
+        v.replace(pos, 2, "\\");
     return v;
 }
 
-// The disk images a save state names: each "Filename" (the bare name Disk2InterfaceCard::LoadSnapshotFloppy tries
-// first, relative to the current directory) with the "Absolute Path" after it. Both are UTF-8 (YamlSaveHelper).
+// The disk images a save state names: each "Filename" (the bare name LoadSnapshotFloppy tries first, relative to the
+// current directory) with the "Absolute Path" after it, as the bytes AppleWin's load will use.
 struct NamedImage {
     std::string filename, absolutePath;
 };
@@ -1340,48 +1394,92 @@ std::vector<NamedImage> ImagesNamedBy(const std::filesystem::path& stateFile)
     std::vector<NamedImage> images;
     std::string line;
     static const std::string kFilename = "Filename:", kAbsolute = "Absolute Path:";
+    auto value = [&](size_t from) {
+        const std::optional<std::string> v = YamlStringValue(line.substr(from));
+        if (!v)
+            throw std::runtime_error("LoadSnapshot: the save state names a disk image the harness cannot check: " + line);
+        return *v;
+    };
     while (std::getline(in, line)) {
         const size_t b = line.find_first_not_of(' ');
         if (b == std::string::npos)
             continue;
         if (line.compare(b, kFilename.size(), kFilename) == 0) {
-            images.push_back(NamedImage{Trim(line.substr(b + kFilename.size())), {}});
+            images.push_back(NamedImage{value(b + kFilename.size()), {}});
         } else if (line.compare(b, kAbsolute.size(), kAbsolute) == 0 && !images.empty() &&
                    images.back().absolutePath.empty()) {
-            images.back().absolutePath = Trim(line.substr(b + kAbsolute.size()));
+            images.back().absolutePath = value(b + kAbsolute.size());
         }
     }
     return images;
 }
 
-std::filesystem::path Utf8Path(const std::string& s)
+// The identity of an existing file (volume and file index), for "is it the same file"; nullopt if it cannot be opened.
+std::optional<std::pair<DWORD, uint64_t>> FileIdentityA(const std::string& path)
 {
-    return std::filesystem::path(std::u8string(s.begin(), s.end()));
+    HANDLE h = CreateFileA(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return std::nullopt;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const BOOL ok = GetFileInformationByHandle(h, &info);
+    CloseHandle(h);
+    if (!ok)
+        return std::nullopt;
+    return std::make_pair(info.dwVolumeSerialNumber, (uint64_t(info.nFileIndexHigh) << 32) | info.nFileIndexLow);
 }
 
-// Ruling D7 and the dialog rule: LoadSnapshotFloppy opens a file dialog (UserSelectNewDiskImage) for an image it cannot
-// find, and it tries the bare file name in the current directory before the absolute path. So before loading, every
-// named image must exist at its absolute path, and its bare name must not find a different file first.
+// Ruling D7 and the dialog rule. Disk2InterfaceCard::LoadSnapshotFloppy (Disk.cpp) passes the loaded bytes to the
+// narrow GetFileAttributes (ANSI code page): first the bare file name (relative to the current directory), then the
+// absolute path; if neither is found it opens a file dialog (UserSelectNewDiskImage). The same lookups are made here,
+// on the same bytes, before loading. Refused: an image neither finds (the save state's UTF-8 bytes of a non-ASCII path
+// do not name the file in the ANSI code page, for one), a directory, and a bare name that finds a different file than
+// the absolute path.
 void CheckImagesExist(const std::filesystem::path& stateFile)
 {
-    namespace fs = std::filesystem;
     for (const NamedImage& image : ImagesNamedBy(stateFile)) {
         if (image.filename.empty())
-            continue;   // an empty drive
-        std::error_code ec;
-        const fs::path bare = Utf8Path(image.filename);
-        const fs::path absolute = Utf8Path(image.absolutePath);
-        const bool absoluteExists = !image.absolutePath.empty() && fs::is_regular_file(absolute, ec);
-        if (fs::exists(bare, ec)) {
-            if (!absoluteExists || !fs::equivalent(bare, absolute, ec))
+            continue;   // an empty drive: no lookup
+        std::string used = image.filename;
+        DWORD attributes = GetFileAttributesA(used.c_str());
+        const bool bareFound = attributes != INVALID_FILE_ATTRIBUTES;
+        if (!bareFound && !image.absolutePath.empty()) {
+            used = image.absolutePath;
+            attributes = GetFileAttributesA(used.c_str());
+        }
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+            throw std::runtime_error("LoadSnapshot: disk image not found as AppleWin will look it up: " +
+                                     (image.absolutePath.empty() ? image.filename : image.absolutePath));
+        if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+            throw std::runtime_error("LoadSnapshot: the save state's disk image is a directory: " + used);
+        if (bareFound) {
+            const auto bare = FileIdentityA(image.filename);
+            const auto absolute = image.absolutePath.empty() ? std::nullopt : FileIdentityA(image.absolutePath);
+            if (!bare || !absolute || *bare != *absolute)
                 throw std::runtime_error("LoadSnapshot: the save state's disk image " + image.filename +
                                          " would be found in the current directory, not at " + image.absolutePath);
-            continue;
         }
-        if (!absoluteExists)
-            throw std::runtime_error("LoadSnapshot: disk image missing: " +
-                                     (image.absolutePath.empty() ? image.filename : image.absolutePath));
     }
+}
+
+// The save state stores each image name as the UTF-8 of AppleWin's ANSI string (YamlSaveHelper::SaveString), and the
+// load hands those bytes back to the ANSI file API (see CheckImagesExist). The two agree only when the UTF-8 bytes equal
+// the ANSI bytes (ASCII, or a UTF-8 ANSI code page); otherwise the checkpoint could never be restored.
+bool SurvivesSaveState(const std::string& ansi)
+{
+    if (ansi.empty())
+        return true;
+    const int wideLen = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, ansi.data(), int(ansi.size()), nullptr, 0);
+    if (wideLen <= 0)
+        return false;
+    std::wstring wide(size_t(wideLen), L'\0');
+    MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, ansi.data(), int(ansi.size()), wide.data(), wideLen);
+    const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLen, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0)
+        return false;
+    std::string utf8(size_t(utf8Len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLen, utf8.data(), utf8Len, nullptr, nullptr);
+    return utf8 == ansi;
 }
 
 // After a failed Snapshot_LoadState (which has removed every card, writing that to the config file, and may have
@@ -1435,6 +1533,18 @@ SnapshotMeta Emulator::SaveSnapshot(const std::filesystem::path& stateFile)
     const JoyState joy = SettledJoystick();
     meta.joystickX = joy.x;
     meta.joystickY = joy.y;
+
+    if (GetCardMgr().QuerySlot(SLOT6) == CT_Disk2) {
+        Disk2InterfaceCard& card = Disk2Card();
+        for (int drive = DRIVE_1; drive <= DRIVE_2; ++drive) {
+            if (card.IsDriveEmpty(drive))
+                continue;
+            if (!SurvivesSaveState(card.DiskGetFullPathName(drive)) || !SurvivesSaveState(card.GetFullName(drive)))
+                throw std::runtime_error("Emulator::SaveSnapshot: the disk image path " + card.DiskGetFullPathName(drive) +
+                                         " has characters AppleWin's save state cannot bring back (its file names are "
+                                         "UTF-8 in the save state but ANSI when loaded); no checkpoint was written");
+        }
+    }
 
     const size_t before = HostFrame().messages().size();
     Snapshot_SetFilename(std::filesystem::path(stateFile).make_preferred().string());
@@ -1506,6 +1616,7 @@ void Emulator::LoadSnapshot(const std::filesystem::path& stateFile, const Snapsh
     ApplyJoy(joy);
     Capture().Clear();   // audio from before the restore is gone; every voice's next commit is placed afresh
     RenderPresentedFrame();
+    g_ejected.clear();   // the restored images are in; nothing is left to reinsert
 }
 
 std::string Emulator::StateChecksum() const
@@ -1566,16 +1677,19 @@ std::string Emulator::StateChecksum() const
     return Sha256Hex(b);
 }
 
-void Emulator::RunCycles(uint64_t cycles)
+bool Emulator::RunCycles(uint64_t cycles)
 {
     RequireStarted();
     g_realtime.reset();
     if (cycles == 0)
-        return;
+        return true;
     Stepper stepper(Pacing::Stepped);
     const uint64_t target = g_nCumulativeCycles + cycles;
-    while (g_nCumulativeCycles < target)
-        stepper.Step(target - g_nCumulativeCycles);   // stepped: the window closing does not stop it
+    while (g_nCumulativeCycles < target) {
+        if (stepper.Step(target - g_nCumulativeCycles))
+            return false;   // the window was closed (as RunFrames)
+    }
+    return true;
 }
 
 std::vector<DiskInfo> Emulator::Disks() const
@@ -1628,15 +1742,20 @@ void Emulator::EjectAll()
 void Emulator::ReinsertAll()
 {
     RequireStarted();
+    const std::vector<EjectedImage> images = std::exchange(g_ejected, {});   // used once
+    if (images.empty())
+        return;
     Disk2InterfaceCard& card = Disk2Card();
-    for (const EjectedImage& image : g_ejected) {
+    for (const EjectedImage& image : images) {
         const size_t before = HostFrame().messages().size();
         const ImageError_e err = card.InsertDisk(image.drive, image.path, image.writeProtected, false);
         if (err != eIMAGE_ERROR_NONE) {
             card.NotifyInvalidImage(image.drive, image.path, err);
-            ThrowIfNewMessages(before, "Emulator: cannot insert " + image.path + " (image error " +
-                                           std::to_string(int(err)) + ")");
-            throw std::runtime_error("Emulator: cannot insert " + image.path + " (image error " + std::to_string(int(err)) + ")");
+            std::string what = "Emulator: cannot insert " + image.path + " (image error " + std::to_string(int(err)) + ")";
+            const auto& msgs = HostFrame().messages();
+            for (size_t i = before; i < msgs.size(); ++i)
+                what += "\n  " + msgs[i];
+            throw std::runtime_error(what);
         }
     }
 }

@@ -53,7 +53,12 @@ public:
     // Copies each of the entry's disk copies over its working copy (current: the drives as they are now, already
     // ejected by Emulator::EjectAll). Throws std::runtime_error naming the file if a copy is missing or can't be
     // written (the session's -32004).
+    // Each working copy is first renamed to <name>.restore-bak. If anything fails the partial copies are deleted, the
+    // backups renamed back (nothing is lost) and std::runtime_error thrown. On success the backups are kept until
+    // CommitRestore (the load worked) or RollbackRestore (it failed before touching the machine).
     void RestoreDisks(const Entry& entry, const std::vector<DiskInfo>& current);
+    void CommitRestore(const Entry& entry) noexcept;     // deletes the backups
+    void RollbackRestore(const Entry& entry) noexcept;   // restores the working copies from the backups
 
 private:
     std::filesystem::path workDir_;

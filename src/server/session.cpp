@@ -565,6 +565,7 @@ void Session::ApplySpeed(const json& p, bool create)
 json Session::SetSpeed(const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     ApplySpeed(params, false);
     return GetSpeed(params);
 }
@@ -888,19 +889,18 @@ json Session::RestoreCheckpoint(const json& params)
     }
     try {
         emulator_.LoadSnapshot(entry.StateFile(), entry.meta);
-    } catch (const std::exception& e) {
-        const std::string what = e.what();
-        // LoadSnapshot's own checks before the load throw "LoadSnapshot: ..." and change nothing; a failure in or after
-        // the load throws "Emulator::LoadSnapshot: ...".
-        if (what.rfind("LoadSnapshot:", 0) == 0) {
-            try { emulator_.ReinsertAll(); } catch (...) {}
-        } else {
-            unusable_ = true;
-            state_ = State::Paused;
-            SendInputApplied();   // the discarded inputs
-        }
-        throw RpcError{kCheckpointFailed, what};
+    } catch (const SnapshotPreLoadError& e) {   // the machine is untouched: put the disks and drives back
+        checkpoints_->RollbackRestore(entry);
+        try { emulator_.ReinsertAll(); } catch (...) {}
+        throw RpcError{kCheckpointFailed, e.what()};
+    } catch (const std::exception& e) {   // in or after the load: the restored disks stay, the session is unusable
+        checkpoints_->CommitRestore(entry);
+        unusable_ = true;
+        state_ = State::Paused;
+        SendInputApplied();   // the discarded inputs
+        throw RpcError{kCheckpointFailed, e.what()};
     }
+    checkpoints_->CommitRestore(entry);
 
     // Restore purity owned by the session: discarded inputs reported (D1), detectors reset to the restored cycle.
     SendInputApplied();
@@ -932,6 +932,8 @@ json Session::DeleteCheckpoint(const json& params)
         checkpoints_->Delete(id);
     } catch (const std::out_of_range&) {
         InvalidParams("unknown checkpoint: " + id);
+    } catch (const std::exception& e) {
+        throw RpcError{kCheckpointFailed, e.what()};
     }
     return json::object();
 }
@@ -976,6 +978,7 @@ json Session::ListDisks(const json&)
 json Session::ExportDisk(const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
     const uint64_t slot = GetUint(params, "slot", 0, 7, std::nullopt);
     if (slot != 6) InvalidParams("slot must be 6");
     const uint64_t drive = GetUint(params, "drive", 1, 2, std::nullopt);

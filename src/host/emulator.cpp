@@ -1559,10 +1559,17 @@ void Emulator::LoadSnapshot(const std::filesystem::path& stateFile, const Snapsh
     g_realtime.reset();   // no open realtime run: g_bFullSpeed clear, the Mockingboard unmuted
 
     // Ruling D7: everything that can be checked before the load is checked first; a failure here changes nothing.
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(stateFile, ec))
-        throw std::runtime_error("LoadSnapshot: no save state at " + stateFile.string());
-    CheckImagesExist(stateFile);
+    try {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(stateFile, ec))
+            throw SnapshotPreLoadError("LoadSnapshot: no save state at " + stateFile.string());
+        CheckImagesExist(stateFile);
+    } catch (const SnapshotPreLoadError&) {
+        throw;
+    } catch (const std::exception& e) {   // runtime_error from the image checks, filesystem_error, bad_alloc...
+        const std::string what = e.what();
+        throw SnapshotPreLoadError(what.rfind("LoadSnapshot:", 0) == 0 ? what : "LoadSnapshot: " + what);
+    }
 
     const bool sessionEnhance = GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk();   // D8: the session's setting
     const CardLayout cards = CurrentCards();

@@ -527,6 +527,48 @@ class RestoreFailureTest(CheckpointTestCase):
         stepped = op.call("step_frames", frames=1)["emulated_cycles"]
         self.assertGreater(stepped, before["emulated_cycles"])
 
+    def test_restore_failing_after_the_first_disk_is_copied_rolls_back(self):
+        """Ruling D7 (review fix round 1): the second checkpoint disk copy cannot be read, so the restore fails after
+        the first working disk was already overwritten. The working disks, drives and machine state are as before."""
+        import ctypes
+        h = self.launch()
+        disks = [{"slot": 6, "drive": 1, "path": DOS_IMAGE}, {"slot": 6, "drive": 2, "path": DOS_IMAGE}]
+        op, _ = self.booted(h, disks=disks)
+        cp = op.call("checkpoint")
+        cp_dir = os.path.join(work_dir(h), "checkpoints", cp["checkpoint_id"])
+        copy1 = [f for f in os.listdir(cp_dir) if f.startswith("disk1-")]
+        copy2 = [f for f in os.listdir(cp_dir) if f.startswith("disk2-")]
+        self.assertEqual((len(copy1), len(copy2)), (1, 1), os.listdir(cp_dir))
+        with open(os.path.join(cp_dir, copy1[0]), "r+b") as f:   # drive 1's copy differs from its working disk
+            f.seek(0x1000)
+            b = f.read(1)
+            f.seek(0x1000)
+            f.write(bytes([b[0] ^ 0xFF]))
+        op.call("step_frames", frames=30)
+        before = op.call("get_state_checksum")
+        disks_before = op.call("list_disks")
+        hashes_before = [sha256_file(d["working_path"]) for d in disks_before]
+        self.assertEqual(len(hashes_before), 2)
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                         ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        lock = kernel32.CreateFileW(os.path.join(cp_dir, copy2[0]), 0x80000000, 0, None, 3, 0, None)
+        self.assertNotIn(lock, (None, ctypes.c_void_p(-1).value), "could not lock the second disk copy")
+        try:
+            self.assertRpcError(-32004, op, "restore_checkpoint", checkpoint_id=cp["checkpoint_id"])
+        finally:
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle(lock)
+        self.assertEqual(op.call("get_state_checksum"), before)
+        disks_after = op.call("list_disks")
+        self.assertEqual(disks_after, disks_before)
+        self.assertEqual([sha256_file(d["working_path"]) for d in disks_after], hashes_before)
+        for d in disks_after:
+            self.assertFalse(os.path.exists(d["working_path"] + ".restore-bak"))
+        self.assertGreater(op.call("step_frames", frames=1)["emulated_cycles"], before["emulated_cycles"])
+
     def test_restore_of_a_corrupt_state_file_gets_32004_with_the_message(self):
         h = self.launch()
         op, _ = self.booted(h)

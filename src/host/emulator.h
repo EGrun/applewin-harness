@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -21,6 +22,12 @@ struct EmulatorConfig {
     std::filesystem::path configIni;              // absolute; AppleWin settings file (g_sConfigFile)
     DisplayMode display = DisplayMode::Windowed;  // D8 default
     std::filesystem::path disk1;                  // optional; image to insert in slot 6 drive 1 before boot
+};
+
+// Thrown by Emulator::LoadSnapshot for a failure found BEFORE it touches the machine (ruling D7): the machine state is
+// unchanged. Any other exception from LoadSnapshot means the load started and the machine state is undefined.
+struct SnapshotPreLoadError : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 
 // AppleWin's state is global, so there is exactly one emulator per process.

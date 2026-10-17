@@ -7,6 +7,7 @@
 #include <aclapi.h>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -472,4 +473,45 @@ TEST_SUITE("windowed")
         CHECK(!fs::exists(work));
         CHECK(!fs::exists(HarnessTempDir() / (std::to_string(pid) + ".ini")));
     }
+}
+
+// Ruling D11: a harness that starts sweeps the work directories and INIs of dead pids, and leaves live ones alone.
+TEST_CASE("server: startup removes the work directory and INI of a pid that is not running, and keeps a live one's")
+{
+    auto running = [](DWORD pid) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!h) return GetLastError() != ERROR_INVALID_PARAMETER;
+        DWORD code = 0;
+        const bool r = !GetExitCodeProcess(h, &code) || code == STILL_ACTIVE;
+        CloseHandle(h);
+        return r;
+    };
+    DWORD dead = 0;
+    for (DWORD pid = 4000004; pid < 4000400 && !dead; pid += 4)
+        if (!running(pid)) dead = pid;
+    REQUIRE(dead != 0);
+    const DWORD live = GetCurrentProcessId();
+    const fs::path root = HarnessTempDir();
+    fs::create_directories(root);
+    const fs::path deadDir = root / std::to_string(dead), deadIni = root / (std::to_string(dead) + ".ini");
+    const fs::path liveDir = root / std::to_string(live), liveIni = root / (std::to_string(live) + ".ini");
+    const fs::path other = root / "not-a-pid";
+    fs::create_directories(deadDir / "checkpoints" / "cp-1");
+    std::ofstream(deadDir / "checkpoints" / "cp-1" / "state.yaml") << "x";
+    std::ofstream(deadIni) << "x";
+    fs::create_directories(liveDir);
+    std::ofstream(liveIni) << "x";
+    fs::create_directories(other);
+    {
+        Server s = StartServer();
+        CHECK(!fs::exists(deadDir));
+        CHECK(!fs::exists(deadIni));
+        CHECK(fs::exists(liveDir));
+        CHECK(fs::exists(liveIni));
+        CHECK(fs::exists(other));
+    }
+    std::error_code ec;
+    fs::remove_all(liveDir, ec);
+    fs::remove(liveIni, ec);
+    fs::remove_all(other, ec);
 }

@@ -135,8 +135,45 @@ void ReleaseEmulator(harness::Emulator& emu)
     try { emu.Shutdown(); } catch (...) {}
 }
 
+// Ruling D11: a harness that was killed leaves %TEMP%\applewin-harness\<pid> and <pid>.ini behind. At startup, entries named
+// for a pid that is no longer running are removed (never throws). Live pids and this process are skipped.
+bool ProcessIsRunning(DWORD pid)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return GetLastError() != ERROR_INVALID_PARAMETER;   // access denied: it exists
+    DWORD code = 0;
+    const bool running = !GetExitCodeProcess(h, &code) || code == STILL_ACTIVE;
+    CloseHandle(h);
+    return running;
+}
+
+void SweepStaleWorkDirs() noexcept
+{
+    namespace fs = std::filesystem;
+    try {
+        std::error_code ec;
+        const fs::path root = fs::temp_directory_path(ec) / "applewin-harness";
+        if (ec || !fs::is_directory(root, ec)) return;
+        const DWORD self = GetCurrentProcessId();
+        for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::path p = it->path();
+            std::string name = p.filename().string();
+            const bool ini = name.size() > 4 && name.compare(name.size() - 4, 4, ".ini") == 0;
+            if (ini) name.resize(name.size() - 4);
+            if (name.empty() || name.size() > 9 || name.find_first_not_of("0123456789") != std::string::npos) continue;
+            std::error_code e2;
+            if (ini ? !it->is_regular_file(e2) : !it->is_directory(e2)) continue;
+            const DWORD pid = DWORD(std::stoul(name));
+            if (pid == self || ProcessIsRunning(pid)) continue;
+            fs::remove_all(p, e2);
+        }
+    } catch (...) {
+    }
+}
+
 int Run(const Args& a)
 {
+    SweepStaleWorkDirs();
     namespace fs = std::filesystem;
     auto& emu = harness::Emulator::Instance();
     fs::path ini;
@@ -235,6 +272,7 @@ HANDLE OpenParentProcess()
 // closing (exit 0) or a fatal error (exit 1). The session removes the working copies and the INI on every path.
 int Serve(const Args& a)
 {
+    SweepStaleWorkDirs();
     try {
         // Exit (0, normal cleanup) when the launching process exits. Opened before the announcement, so a launcher
         // that exits right after reading it is still seen; without a handle there is no watch.

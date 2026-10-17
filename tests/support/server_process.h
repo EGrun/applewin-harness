@@ -54,6 +54,7 @@ public:
 
     ~ServerProcess()
     {
+        GracefulClose();
         Kill();
         if (outReader_.joinable()) outReader_.join();
         if (errReader_.joinable()) errReader_.join();
@@ -103,6 +104,10 @@ public:
         GetExitCodeProcess(pi_.hProcess, &code);
         return code;
     }
+
+    // close_session on a fresh operator connection and a wait of up to 5 s, so the server removes its work directory;
+    // anything that fails falls through to Kill. Defined after PipeClient.
+    void GracefulClose();
 
     void Kill()
     {
@@ -382,6 +387,25 @@ inline HWND FindHarnessWindowOf(DWORD pid)
         },
         reinterpret_cast<LPARAM>(&s));
     return s.found;
+}
+
+inline void ServerProcess::GracefulClose()
+{
+    if (!Running()) return;
+    try {
+        const auto line = WaitForLine(std::chrono::milliseconds(0));
+        if (!line) return;
+        const auto a = ParseAnnouncement(*line);
+        if (!a) return;
+        PipeClient c;
+        if (!c.Open(a->pipe, std::chrono::milliseconds(1500))) return;
+        const auto hello = c.Call("hello", {{"protocol_version", "0.3"}, {"role", "operator"}, {"token", a->operatorToken}},
+                                  std::chrono::milliseconds(3000));
+        if (!hello || !hello->contains("result")) return;
+        c.Call("close_session", nlohmann::json::object(), std::chrono::milliseconds(5000));
+        WaitExit(std::chrono::milliseconds(5000));
+    } catch (...) {
+    }
 }
 
 }  // namespace harness::testsupport

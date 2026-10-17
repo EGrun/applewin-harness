@@ -95,7 +95,6 @@ CheckpointStore::Entry CheckpointStore::Create(std::string name, const SnapshotM
         if (!out) throw std::runtime_error("cannot write " + Utf8(e.dir / "meta.json"));
     } catch (...) {
         fs::remove_all(e.dir, ec);
-        fs::remove(PendingStateFile(), ec);
         throw;
     }
     entries_.emplace(nextNumber_, e);
@@ -124,21 +123,56 @@ void CheckpointStore::Delete(const std::string& id)
         if (it->second.id != id) continue;
         std::error_code ec;
         fs::remove_all(it->second.dir, ec);
+        if (ec) throw std::runtime_error("cannot delete " + Utf8(it->second.dir) + ": " + ec.message());
         entries_.erase(it);
         return;
     }
     throw std::out_of_range("unknown checkpoint: " + id);
 }
 
+namespace {
+fs::path BackupOf(const fs::path& p)
+{
+    return fs::path(p.native() + L".restore-bak");
+}
+}  // namespace
+
 void CheckpointStore::RestoreDisks(const Entry& entry, const std::vector<DiskInfo>&)
 {
     std::error_code ec;
-    for (const DiskCopy& c : entry.disks)   // all present before anything is overwritten
+    for (const DiskCopy& c : entry.disks)   // all present before anything is touched
         if (!fs::is_regular_file(c.copy, ec))
             throw std::runtime_error("checkpoint " + entry.id + ": disk copy missing: " + Utf8(c.copy));
+    try {
+        for (const DiskCopy& c : entry.disks) {   // working copies aside
+            fs::remove(BackupOf(c.workingPath), ec);
+            fs::rename(c.workingPath, BackupOf(c.workingPath), ec);
+            if (ec) Fail("cannot move " + Utf8(c.workingPath) + " aside", ec);
+        }
+        for (const DiskCopy& c : entry.disks) {
+            fs::copy_file(c.copy, c.workingPath, fs::copy_options::overwrite_existing, ec);
+            if (ec) Fail("cannot restore disk image " + Utf8(c.workingPath), ec);
+        }
+    } catch (...) {
+        RollbackRestore(entry);
+        throw;
+    }
+}
+
+void CheckpointStore::CommitRestore(const Entry& entry) noexcept
+{
+    std::error_code ec;
+    for (const DiskCopy& c : entry.disks) fs::remove(BackupOf(c.workingPath), ec);
+}
+
+void CheckpointStore::RollbackRestore(const Entry& entry) noexcept
+{
+    std::error_code ec;
     for (const DiskCopy& c : entry.disks) {
-        fs::copy_file(c.copy, c.workingPath, fs::copy_options::overwrite_existing, ec);
-        if (ec) Fail("cannot restore disk image " + Utf8(c.workingPath), ec);
+        const fs::path bak = BackupOf(c.workingPath);
+        if (!fs::exists(bak, ec)) continue;
+        fs::remove(c.workingPath, ec);
+        fs::rename(bak, c.workingPath, ec);
     }
 }
 

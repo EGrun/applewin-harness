@@ -2,7 +2,8 @@
 // 1 and 3). Test prefix "ckpt:".
 //
 // The file is named snapshot_test.cpp, not checkpoint_test.cpp: doctest runs files in name order, and "emu:
-// precondition" (dos_test.cpp) must run before anything starts the shared emulator.
+// precondition" (dos_test.cpp) must run before anything starts the shared emulator. The restore error paths are in
+// zz_restore_failure_test.cpp, so they run after every other in-process test.
 #include "doctest/doctest.h"
 #include "host/emulator.h"
 #include "core/audio_capture.h"
@@ -13,6 +14,7 @@
 #include "support/golden.h"
 #include "support/paths.h"
 #include "support/server_process.h"
+#include "support/snapshot_support.h"
 #include <windows.h>
 #include <algorithm>
 #include <chrono>
@@ -20,8 +22,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
@@ -45,52 +45,6 @@ constexpr uint64_t kCyclesPerFrame = 17030;
 constexpr uint64_t kMaxInstructionCycles = 7;   // the longest 65C02 instruction: the most a cycle-exact run overshoots
 constexpr double kBaseClockHz = (157500000.0 / 11.0) * 65.0 / 912.0;   // CLK_6502_NTSC
 
-// A scratch directory outside %TEMP%\applewin-harness, removed (with everything in it) when the guard ends.
-struct ScratchDir {
-    fs::path path;
-    explicit ScratchDir(const std::string& tag)
-        : path(fs::temp_directory_path() / ("awh-ckpt-" + tag + "-" + std::to_string(GetCurrentProcessId())))
-    {
-        std::error_code ec;
-        fs::remove_all(path, ec);
-        fs::create_directories(path);
-    }
-    ~ScratchDir()
-    {
-        std::error_code ec;
-        fs::remove_all(path, ec);
-    }
-    ScratchDir(const ScratchDir&) = delete;
-    ScratchDir& operator=(const ScratchDir&) = delete;
-};
-
-// Ejects both drives and power-cycles, so the tests that follow start from a clean machine. Never throws.
-struct EjectAndPowerCycle {
-    Emulator& e;
-    ~EjectAndPowerCycle()
-    {
-        try { e.EjectDisk(0); } catch (...) {}
-        try { e.EjectDisk(1); } catch (...) {}
-        try { e.PowerCycle(); } catch (...) {}
-    }
-};
-
-// DOS 3.3 booted in-process from a working copy (D5: the image in the submodule is never opened for writing). Members
-// are destroyed in reverse order: the guard ejects before the copy and its directory are removed.
-struct DosBoot {
-    Emulator& e;
-    ScratchDir dir;
-    WorkingCopy copy;
-    EjectAndPowerCycle guard;
-    explicit DosBoot(Emulator& emu, const std::string& tag)
-        : e(emu), dir(tag), copy(DosMasterImage(), dir.path / "disk"), guard{emu}
-    {
-        e.InsertDisk(0, copy.Path());
-        e.PowerCycle();
-        REQUIRE(e.RunFrames(720));
-    }
-};
-
 // The presented frame's BGRA32 rows, top row first: the bytes get_frame { format: "BGRA32" } sends.
 std::vector<uint8_t> RawFrame(const FrameView& f)
 {
@@ -102,18 +56,6 @@ std::vector<uint8_t> RawFrame(const FrameView& f)
 }
 
 std::string RawFrameHash(const FrameView& f) { return Sha256Hex(RawFrame(f)); }
-
-std::vector<uint8_t> ReadAll(const fs::path& p)
-{
-    std::ifstream f(p, std::ios::binary);
-    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-}
-
-void WriteAll(const fs::path& p, const std::vector<uint8_t>& bytes)
-{
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
-}
 
 // ---- Pass condition 1 in-process ----
 
@@ -134,8 +76,9 @@ doctest::String toString(const Step& s)
     return (s.checksum + " @" + std::to_string(s.cycles) + " frame " + s.frame).c_str();
 }
 
-// The script of pass condition 1: input mixed with whole-frame and cycle-exact steps, a bell for audio, and no disk
-// access (ruling D2: weak-bit reads draw on rand()). Records the checksum, cycle and frame hash after every step.
+// The script of pass condition 1: input mixed with whole-frame and cycle-exact steps, a bell for audio, and a short disk
+// read (CATALOG; ruling D4: both runs start from a restore, which reseeds rand() the same way, D2). Records the
+// checksum, cycle and frame hash after every step.
 ScriptRun RunScript(Emulator& e, uint64_t fromCycle)
 {
     ScriptRun r;
@@ -153,6 +96,9 @@ ScriptRun RunScript(Emulator& e, uint64_t fromCycle)
     record();
     e.QueueKey(uint8_t('A'), 50);
     REQUIRE(e.RunFrames(30));
+    record();
+    e.QueueText("CATALOG\r", 0);
+    REQUIRE(e.RunFrames(90));
     record();
     e.RunCycles(1);
     record();
@@ -272,6 +218,9 @@ PipeRun RunPipeScript(PipeClient& op, PipeClient& agent, uint64_t fromCycle)
     Result(agent, "press_key", {{"key", "A"}, {"hold_ms", 50}});
     Result(op, "step_frames", {{"frames", 30}});
     record();
+    Result(agent, "type_text", {{"text", "CATALOG\n"}, {"inter_key_delay_ms", 0}});
+    Result(op, "step_frames", {{"frames", 90}});
+    record();
     const uint64_t end = Result(op, "step_cycles", {{"cycles", 1}})["emulated_cycles"].get<uint64_t>();
     record();
     const uint64_t ms = uint64_t(std::ceil(double(end - fromCycle) * 1000.0 / kBaseClockHz)) + 1;
@@ -279,8 +228,8 @@ PipeRun RunPipeScript(PipeClient& op, PipeClient& agent, uint64_t fromCycle)
     return r;
 }
 
-// In a fresh server (display mode from args): DOS booted stepped, a checkpoint, the script, a restore, the script again.
-// Returns both runs.
+// In a fresh server (display mode from args), ruling D4: DOS booted stepped, a checkpoint, some frames, a restore, the
+// script; unrelated work, a restore, the script again. Returns both runs (each starts from a restore).
 std::pair<PipeRun, PipeRun> CheckpointReplayOverPipe(const std::wstring& args)
 {
     Server s = StartServer(args);
@@ -291,7 +240,14 @@ std::pair<PipeRun, PipeRun> CheckpointReplayOverPipe(const std::wstring& args)
     auto agent = Connect(s, "agent");
     const json cp = Result(*op, "checkpoint", {{"name", "pc3"}});
     const uint64_t at = cp["emulated_cycles"].get<uint64_t>();
+    Result(*op, "step_frames", {{"frames", 30}});
+    Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
     PipeRun a = RunPipeScript(*op, *agent, at);
+    // Unrelated work: a disk read, a bell, frames, a held key.
+    Result(*agent, "type_text", {{"text", "CATALOG\nPRINT CHR$(7)\n"}, {"inter_key_delay_ms", 0}});
+    Result(*op, "step_frames", {{"frames", 300}});
+    Result(*agent, "press_key", {{"key", "Z"}, {"hold_ms", 2000}});
+    Result(*op, "step_cycles", {{"cycles", 4321}});
     Result(*op, "restore_checkpoint", {{"checkpoint_id", cp["checkpoint_id"]}});
     PipeRun b = RunPipeScript(*op, *agent, at);
     Result(*op, "close_session");
@@ -302,8 +258,9 @@ std::pair<PipeRun, PipeRun> CheckpointReplayOverPipe(const std::wstring& args)
 
 // ---- Pass condition 1 (the restore-purity core) ----
 
-TEST_CASE("ckpt: a restored run replays the script exactly, whatever ran before the restore")
+TEST_CASE("ckpt: two restored runs replay the script exactly, whatever ran before each restore")
 {
+    // Ruling D4: both runs start from a restore of the same checkpoint, with very different work before each.
     auto& e = StartedEmulator();
     DosBoot boot(e, "replay");
     const fs::path state = boot.dir.path / "state.yaml";
@@ -319,25 +276,27 @@ TEST_CASE("ckpt: a restored run replays the script exactly, whatever ran before 
     e.FlushDisks();
     fs::copy_file(boot.copy.Path(), diskCopy);
 
-    const ScriptRun straight = RunScript(e, at);
-    REQUIRE(straight.steps.size() == 7);
-    CHECK_MESSAGE(!AllZero(straight.audio), "the script's bell left no audio: the audio comparison would prove nothing");
-
+    REQUIRE(e.RunFrames(30));                     // anything
     Restore(e, state, meta, diskCopy, boot.copy.Path());
     CHECK(e.EmulatedCycles() == at);              // the cycle origin comes from the checkpoint
     CHECK(e.StateChecksum() == checksumAt);
+    const ScriptRun first = RunScript(e, at);
+    REQUIRE(first.steps.size() == 8);
+    CHECK_MESSAGE(!AllZero(first.audio), "the script's bell left no audio: the audio comparison would prove nothing");
+
     UnrelatedWork(e);
     Restore(e, state, meta, diskCopy, boot.copy.Path());
     CHECK(e.EmulatedCycles() == at);
-    const ScriptRun replay = RunScript(e, at);
+    CHECK(e.StateChecksum() == checksumAt);
+    const ScriptRun second = RunScript(e, at);
 
-    REQUIRE(replay.steps.size() == straight.steps.size());
-    for (size_t i = 0; i < straight.steps.size(); ++i) {
+    REQUIRE(second.steps.size() == first.steps.size());
+    for (size_t i = 0; i < first.steps.size(); ++i) {
         INFO("step " << i);
-        CHECK(replay.steps[i] == straight.steps[i]);
+        CHECK(second.steps[i] == first.steps[i]);
     }
-    CHECK(replay.audio.size() == straight.audio.size());
-    CHECK_MESSAGE(replay.audio == straight.audio, "audio over the script's range differs between the runs");
+    CHECK(second.audio.size() == first.audio.size());
+    CHECK_MESSAGE(second.audio == first.audio, "audio over the script's range differs between the runs");
 }
 
 TEST_CASE("ckpt: LoadSnapshot discards pending input and reports each id as discarded (D1)")
@@ -474,49 +433,6 @@ TEST_CASE("ckpt: Disks lists the inserted working copies; EjectAll and ReinsertA
     disks = e.Disks();
     REQUIRE(disks.size() == 1);
     CHECK(fs::equivalent(disks[0].workingPath, copy.Path()));
-}
-
-// ---- Restore error paths (plan Review Focus 1 and 3) ----
-
-TEST_CASE("ckpt: LoadSnapshot with a disk image missing throws and opens no dialog")
-{
-    auto& e = StartedEmulator();
-    DosBoot boot(e, "missing");
-    const fs::path state = boot.dir.path / "state.yaml";
-    const SnapshotMeta meta = e.SaveSnapshot(state);
-    e.EjectAll();
-    REQUIRE(fs::remove(boot.copy.Path()));   // the image the save state names is gone
-    CHECK_THROWS_AS(e.LoadSnapshot(state, meta), std::runtime_error);
-}
-
-TEST_CASE("ckpt: LoadSnapshot of a corrupt state file throws with AppleWin's message")
-{
-    auto& e = StartedEmulator();
-    DosBoot boot(e, "corrupt");
-    const fs::path state = boot.dir.path / "state.yaml";
-    const SnapshotMeta meta = e.SaveSnapshot(state);
-    // Keep the header (so the load gets past ParseFileHdr and has started replacing state), then garbage.
-    std::vector<uint8_t> bytes = ReadAll(state);
-    REQUIRE(bytes.size() > 1000);
-    bytes.resize(bytes.size() * 2 / 5);
-    const std::string junk = "\n  ]]] not: [yaml\n";
-    bytes.insert(bytes.end(), junk.begin(), junk.end());
-    WriteAll(state, bytes);
-
-    const size_t messagesBefore = e.Messages().size();
-    e.EjectAll();
-    std::string what;
-    try {
-        e.LoadSnapshot(state, meta);
-    } catch (const std::runtime_error& ex) {
-        what = ex.what();
-    }
-    REQUIRE_MESSAGE(!what.empty(), "LoadSnapshot of a corrupt file did not throw std::runtime_error");
-    REQUIRE(e.Messages().size() > messagesBefore);
-    CHECK(what.find(e.Messages().back()) != std::string::npos);
-
-    e.PowerCycle();   // the machine is usable again after a power cycle
-    CHECK(e.RunFrames(2));
 }
 
 // ---- Windowed (pass conditions 3 and 5), launched as servers ----

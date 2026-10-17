@@ -46,9 +46,10 @@ def work_dir(harness):
 
 
 def run_script(op, agent, from_cycle):
-    """Pass condition 1's script: type_text mixed with step_frames and step_cycles, a bell for audio, and no disk access
-    (ruling D2). Records (checksum, checksum cycle, frame cycle, frame hash) after every step, then get_audio over the
-    script's range. Returns (records, (start_cycle, end_cycle, PCM16 base64))."""
+    """Pass condition 1's script: type_text mixed with step_frames and step_cycles, a bell for audio, and a short disk
+    read (CATALOG; ruling D4: both runs start from a restore, which reseeds rand() identically, D2).
+    Records (checksum, checksum cycle, frame cycle, frame hash) after every step, then get_audio over the script's
+    range. Returns (records, (start_cycle, end_cycle, PCM16 base64))."""
     records = []
 
     def record():
@@ -69,6 +70,9 @@ def run_script(op, agent, from_cycle):
     record()
     agent.call("press_key", key="A", hold_ms=50)
     op.call("step_frames", frames=30)
+    record()
+    agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)
+    op.call("step_frames", frames=90)
     record()
     end = op.call("step_cycles", cycles=1)["emulated_cycles"]
     record()
@@ -115,8 +119,8 @@ class CheckpointTestCase(PipeTestCase):
         return path
 
     def replay(self, headless=True, speeds=None):
-        """Pass condition 1 (and 2 with speeds=(a, b)): checkpoint, script, restore, unrelated work, restore, script.
-        Returns both runs."""
+        """Pass condition 1 (and 2 with speeds=(a, b)), ruling D4: checkpoint, some frames, restore, script; unrelated
+        work, restore, script. Returns both runs, each started from a restore."""
         h = self.launch(headless=headless)
         op, agent = self.booted(h)
         if speeds:
@@ -125,14 +129,18 @@ class CheckpointTestCase(PipeTestCase):
         cp = op.call("checkpoint", name="replay")
         self.assertEqual(sorted(cp), ["checkpoint_id", "emulated_cycles"])
         self.assertEqual(cp["emulated_cycles"], at)
+        at_checksum = op.call("get_state_checksum")
+        self.assertEqual(at_checksum["emulated_cycles"], at)
+        op.call("step_frames", frames=30)   # anything
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
+        self.assertEqual(op.call("get_state_checksum"), at_checksum)
         first = run_script(op, agent, at)
         self.assertGreater(mono_ac_rms_db(base64.b64decode(first[1][2])), -50.0,
                            "the script's bell left no audio: the audio comparison would prove nothing")
 
-        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
-        self.assertEqual(op.call("get_state_checksum"), {"sha256": first[0][0][0], "emulated_cycles": at})
         unrelated_work(op, agent)
         self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]), {"emulated_cycles": at})
+        self.assertEqual(op.call("get_state_checksum"), at_checksum)
         if speeds:
             op.call("set_speed", machine_speed=speeds[1])
             self.assertEqual(op.call("get_speed")["machine_speed"], speeds[1])
@@ -266,32 +274,27 @@ class DiskTest(CheckpointTestCase):
 
 class RunningCheckpointTest(CheckpointTestCase):
     def test_checkpoint_while_running_at_max_ends_the_realtime_run(self):
+        """Ruling D5: a checkpoint taken while Running at "max" carries no full speed or Mockingboard mute; two restores
+        (with unrelated work between) give the same state, and full speed is never active after a restore."""
         h = self.launch()
         op = h.connect("operator")
         op.call("create_session", run_mode="realtime", disks=dos_disks(), speed={"machine_speed": "max"})
         time.sleep(0.5)
         cp = op.call("checkpoint")
         self.assertFalse(op.call("get_speed")["full_speed_active"])
+        agent = h.connect("agent")
+
         self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]),
                          {"emulated_cycles": cp["emulated_cycles"]})
         self.assertFalse(op.call("get_speed")["full_speed_active"])
-        running_sum = op.call("get_state_checksum")
-        self.assertEqual(running_sum["emulated_cycles"], cp["emulated_cycles"])
-        op.call("step_frames", frames=1)   # Paused after the restore: stepping is allowed
-        self.assertFalse(op.call("get_speed")["full_speed_active"])
-        h.close()
+        first = op.call("get_state_checksum")
+        self.assertEqual(first["emulated_cycles"], cp["emulated_cycles"])
 
-        # The same cycle reached by stepping in a fresh stepped session: the same machine state.
-        target = cp["emulated_cycles"]
-        h2 = self.launch()
-        op2 = self.stepped_session(h2, disks=dos_disks())
-        now = 0
-        if target // CYCLES_PER_FRAME:
-            now = op2.call("step_frames", frames=target // CYCLES_PER_FRAME, timeout=60.0)["emulated_cycles"]
-        while now < target:
-            now = op2.call("step_cycles", cycles=min(target - now, MAX_STEP_CYCLES))["emulated_cycles"]
-        self.assertEqual(now, target, "stepping did not land on the checkpoint's instruction boundary")
-        self.assertEqual(op2.call("get_state_checksum"), running_sum)
+        unrelated_work(op, agent)   # stepped while Paused: keys, a bell, the disk head, frames
+        self.assertEqual(op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"]),
+                         {"emulated_cycles": cp["emulated_cycles"]})
+        self.assertFalse(op.call("get_speed")["full_speed_active"])
+        self.assertEqual(op.call("get_state_checksum"), first)
 
 
 # ---- Restore purity in the harness ----

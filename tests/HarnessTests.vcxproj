@@ -46,6 +46,7 @@
     <ClCompile Include="fft_test.cpp" />
     <ClCompile Include="speed_test.cpp" />
     <ClCompile Include="snapshot_test.cpp" />
+    <ClCompile Include="zz_restore_failure_test.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\external\AppleWin\resource\Applewin.rc" />

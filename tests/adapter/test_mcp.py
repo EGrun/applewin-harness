@@ -166,16 +166,20 @@ class EndToEndTest(AdapterTestCase):
                 self.assertFalse(result.is_error, text_of(result))
         self.run_async(go)
 
-    def test_wait_range_is_enforced(self):
+    def test_wait_and_listen_ranges(self):
+        """wait is 1-60000 ms, listen 0-60000 ms. The stub's NotImplementedError reaches the client only as the opaque
+        text 'Error executing tool <name>', so an error alone cannot tell stub from validation: the in-range calls
+        (which the stub fails) are what pin the behavior down."""
         async def go():
             async with mcp_session(self.errlog) as s:
-                for ms in (0, -1, 60001):
-                    with self.subTest(ms=ms):
-                        result = await call(s, "wait", ms=ms)
-                        self.assertTrue(result.is_error)
-                        self.assertNotIn("not implemented", text_of(result).lower())
-                result = await call(s, "listen", ms=60001)
-                self.assertTrue(result.is_error)
+                for name, ms in (("wait", 1), ("wait", 60000), ("listen", 0), ("listen", 60000)):
+                    with self.subTest(name=name, ms=ms, kind="in range"):
+                        result = await call(s, name, ms=ms)
+                        self.assertFalse(result.is_error, text_of(result))
+                for name, ms in (("wait", 0), ("wait", 60001), ("listen", -1), ("listen", 60001)):
+                    with self.subTest(name=name, ms=ms, kind="out of range"):
+                        result = await call(s, name, ms=ms)
+                        self.assertTrue(result.is_error, "{}(ms={}) must be rejected".format(name, ms))
         self.run_async(go)
 
 
@@ -206,6 +210,7 @@ class ListenTest(AdapterTestCase):
         async def go():
             async with mcp_session(self.errlog) as s:
                 await call(s, "wait", ms=12000)   # boot DOS 3.3
+                await call(s, "listen")   # discard the boot beep, buffered since launch
                 typed = await call(s, "type_text", text="PRINT CHR$(7)\n")
                 self.assertFalse(typed.is_error, text_of(typed))
                 await call(s, "wait", ms=1000)

@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -344,21 +345,60 @@ void ProcessDueInput()
 }
 
 
+// ---- Speed (D11; docs/specs/m3.md Part C). g_dwSpeed, the clock and enhance-disk are AppleWin's own state.
+bool g_fullSpeedOverride = false;   // SetFullSpeedOverride: the harness's stand-in for Scroll Lock
+
+// ContinueExecution's full-speed condition (Windows/AppleWin.cpp), with the override in place of Scroll Lock.
+// Bit 0: speed 40; bit 1: override; bit 2: disk motor (Disk II motor on with enhance on, speaker and Mockingboard silent).
+unsigned FullSpeedReasonBits()
+{
+    unsigned bits = 0;
+    if (g_dwSpeed == SPEED_MAX)
+        bits |= 1u;
+    if (g_fullSpeedOverride)
+        bits |= 2u;
+    if (GetCardMgr().GetDisk2CardMgr().IsConditionForFullSpeed() && !Spkr_IsActive() &&
+        !GetCardMgr().GetMockingboardCardMgr().IsActiveToPreventFullSpeed())
+        bits |= 4u;
+    return bits;
+}
+
 // The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
 // holds the window-closed rule for all three.
-// Stepped: period-sized steps, no pacing. Realtime (D9, D14): a BurstBudget burst corrected by AudioOutput's
-// feedback (none without an AudioOutput), then AudioOutput::Pump, then wait for the 1 ms tick. Playback is on for
-// the Stepper's lifetime when realtime, and off again when it is destroyed (returns, throws, window closed).
+// Stepped: steps of 1 ms at the base clock (CLK_6502_NTSC whatever the speed: stepped runs ignore speed), video on,
+// never full speed, no pacing.
+// Realtime (D9, D11, D14): each step first decides full speed with ContinueExecution's rule (FullSpeedReasonBits).
+// - Normal: a BurstBudget burst at g_fCurrentCLK6502 (rebuilt whenever that clock changes) corrected by AudioOutput's
+//   feedback, then AudioOutput::Pump, then wait for the 1 ms tick.
+// - Full speed: unpaced bursts of the same size (about 1 ms of emulated time, so input, capture and the window keep
+//   working) with CpuExecute(cycles, false) and no feedback. AppleWin's entry (VideoRedrawScreenDuringFullSpeed(0,
+//   true), Mockingboard MuteControl(true), g_nCpuCyclesFeedback = 0); a redraw from the end-of-frame check at most every
+//   ~16 ms of wall time (ExecuteStep); on exit VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame) and
+//   MuteControl(false). Leaving full speed restarts the pacing, so the unpaced time is not "made up". The end of the
+//   run (return or throw) exits full speed too, so g_bFullSpeed is only ever set inside a realtime run.
+// Playback (AudioOutput, windowed): on only while a realtime run steps at the base clock (speed 10) and not at full
+// speed. The capture timeline is in emulated time, so at any other rate it cannot play in step with the wall clock,
+// and the feedback (up to +/-200 samples' worth of cycles per 1 ms step) would pull the emulation back to the base
+// clock. Otherwise the buffer is stopped (silence; it resyncs when playback resumes). Capture is never affected.
 class Stepper {
 public:
     explicit Stepper(Pacing pacing)
-        : realtime_(pacing == Pacing::Realtime), period_(uint32_t(g_fCurrentCLK6502 * 1.0e-3))
+        : realtime_(pacing == Pacing::Realtime), period_(uint32_t(CLK_6502_NTSC * 1.0e-3))
     {
         if (realtime_) {
-            budget_.emplace(g_fCurrentCLK6502, std::chrono::milliseconds(1));
+            clock_ = g_fCurrentCLK6502;
+            budget_.emplace(clock_, std::chrono::milliseconds(1));
             pacer_.emplace();
             pacer_->Start();
-            playback_.Start();
+        }
+    }
+    Stepper(const Stepper&) = delete;
+    Stepper& operator=(const Stepper&) = delete;
+
+    ~Stepper()
+    {
+        if (fullSpeed_) {
+            try { LeaveFullSpeed(); } catch (...) {}
         }
     }
 
@@ -366,18 +406,38 @@ public:
     bool Step(uint64_t remaining)
     {
         ProcessDueInput();   // input takes effect at the start of the step (D10)
+        if (!realtime_) {
+            ExecuteStep(uint32_t((std::min)(uint64_t(period_), remaining)));
+            return WindowClosed();
+        }
+
+        const bool full = FullSpeedReasonBits() != 0;
+        if (full && !fullSpeed_)
+            EnterFullSpeed();
+        else if (!full && fullSpeed_)
+            LeaveFullSpeed();
+        if (g_fCurrentCLK6502 != clock_) {   // a speed change: the new rate from this step on
+            clock_ = g_fCurrentCLK6502;
+            budget_.emplace(clock_, std::chrono::milliseconds(1));
+        }
+        playback_.Set(!fullSpeed_ && g_dwSpeed == SPEED_NORMAL);
+
         uint64_t cycles;
-        if (realtime_) {
+        if (fullSpeed_) {
+            // Every full-speed step, as ContinueExecution does.
+            GetCardMgr().GetMockingboardCardMgr().MuteControl(true);
+            g_nCpuCyclesFeedback = 0;
+            cycles = budget_->Next();
+        } else {
+            GetCardMgr().GetMockingboardCardMgr().MuteControl(false);
             const int64_t feedback = g_audioOutput ? g_audioOutput->FeedbackCycles() : 0;
             const int64_t withFeedback = int64_t(budget_->Next()) + feedback;
             cycles = withFeedback > 0 ? uint64_t(withFeedback) : 0;
-        } else {
-            cycles = period_;
         }
         if (cycles > remaining)
             cycles = remaining;
-        ExecuteStep(uint32_t(cycles));
-        if (realtime_) {
+        ExecuteStep(uint32_t(cycles), fullSpeed_);
+        if (!fullSpeed_) {
             if (g_audioOutput)
                 g_audioOutput->Pump(Capture(), CaptureClock());
             pacer_->WaitForTick();
@@ -386,6 +446,26 @@ public:
     }
 
 private:
+    void EnterFullSpeed()
+    {
+        g_bFullSpeed = true;
+        fullSpeed_ = true;
+        GetFrame().VideoRedrawScreenDuringFullSpeed(0, true);   // init: starts the ~16 ms redraw interval
+        GetCardMgr().GetMockingboardCardMgr().MuteControl(true);
+        g_nCpuCyclesFeedback = 0;
+    }
+
+    void LeaveFullSpeed()
+    {
+        g_bFullSpeed = false;
+        fullSpeed_ = false;
+        GetFrame().VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame);   // resync the video clock, redraw, present
+        GetCardMgr().GetMockingboardCardMgr().MuteControl(false);
+        clock_ = g_fCurrentCLK6502;
+        budget_.emplace(clock_, std::chrono::milliseconds(1));
+        pacer_->Start();   // paced again from now: the unpaced time is not made up
+    }
+
     // Window-closed rule (spec): when windowed, pump the window's messages after every step; the run stops once the
     // window has been closed.
     static bool WindowClosed()
@@ -396,18 +476,19 @@ private:
         return g_window->Closed();
     }
 
-    // Sound rule (D14): AudioOutput plays only during a realtime run; SetPlaying(false) when the run ends or throws.
+    // Sound rule (D14, D11): AudioOutput plays only during a realtime run, and within it as Step decides;
+    // SetPlaying(false) when the run ends or throws.
     class Playback {
     public:
         Playback() = default;
         Playback(const Playback&) = delete;
         Playback& operator=(const Playback&) = delete;
-        void Start()
+        void Set(bool on)
         {
-            if (g_audioOutput) {
-                g_audioOutput->SetPlaying(true);
-                active_ = true;
-            }
+            if (on == active_ || !g_audioOutput)
+                return;
+            g_audioOutput->SetPlaying(on);
+            active_ = on;
         }
         ~Playback()
         {
@@ -421,9 +502,11 @@ private:
 
     bool realtime_;
     uint32_t period_;
+    double clock_ = 0.0;      // the clock budget_ was built for
+    bool fullSpeed_ = false;  // this run has set g_bFullSpeed
     std::optional<BurstBudget> budget_;
     std::optional<RealtimePacer> pacer_;
-    Playback playback_;   // last: stops playback first when the Stepper is destroyed
+    Playback playback_;   // stops playback when the Stepper is destroyed
 };
 
 // The open-ended realtime run of RunRealtimeStep (null when none is open).
@@ -539,6 +622,7 @@ void Emulator::Start(const EmulatorConfig& config)
     JoyInitialize();
     ClearInput();
     g_input.nextId = 1;
+    g_fullSpeedOverride = false;   // a new session; machine speed and enhance-disk come from the INI (LoadConfiguration)
     g_input.applied.clear();
     g_input.firstCycles.clear();
     ResetJoystick();
@@ -860,14 +944,63 @@ bool Emulator::SoundActive() const
     return g_started && g_audioOutput != nullptr;
 }
 
-// ---- Speed controls: stubs until M3 Part C Task 2 ----
-void Emulator::SetMachineSpeed(uint32_t) { throw std::logic_error("not implemented"); }
-void Emulator::UseClockMultiplier(double) { throw std::logic_error("not implemented"); }
-void Emulator::SetEnhanceDiskSpeed(bool) { throw std::logic_error("not implemented"); }
-void Emulator::SetFullSpeedOverride(bool) { throw std::logic_error("not implemented"); }
-SpeedSettings Emulator::Speed() const { throw std::logic_error("not implemented"); }
-double Emulator::EffectiveClockHz() const { throw std::logic_error("not implemented"); }
-std::vector<std::string> Emulator::FullSpeedReasons() const { throw std::logic_error("not implemented"); }
-bool Emulator::FullSpeedActive() const { throw std::logic_error("not implemented"); }
+// ---- Speed controls (D11): AppleWin's own calls. Session settings: PowerCycle (ResetMachineState) keeps them.
+void Emulator::SetMachineSpeed(uint32_t speed)
+{
+    RequireStarted();
+    if (speed > SPEED_MAX)
+        throw std::out_of_range("SetMachineSpeed: speed must be 0..40");
+    g_dwSpeed = speed;
+    SetCurrentCLK6502();
+}
+
+void Emulator::UseClockMultiplier(double multiplier)
+{
+    RequireStarted();
+    if (!std::isfinite(multiplier) || multiplier <= 0.0)
+        throw std::invalid_argument("UseClockMultiplier: the multiplier must be finite and above 0");
+    ::UseClockMultiplier(multiplier);
+}
+
+void Emulator::SetEnhanceDiskSpeed(bool enable)
+{
+    RequireStarted();
+    GetCardMgr().GetDisk2CardMgr().SetEnhanceDisk(enable);
+}
+
+void Emulator::SetFullSpeedOverride(bool enable)
+{
+    RequireStarted();
+    g_fullSpeedOverride = enable;
+}
+
+SpeedSettings Emulator::Speed() const
+{
+    RequireStarted();
+    return SpeedSettings{uint32_t(g_dwSpeed), GetCardMgr().GetDisk2CardMgr().GetEnhanceDisk(), g_fullSpeedOverride};
+}
+
+double Emulator::EffectiveClockHz() const
+{
+    RequireStarted();
+    return g_fCurrentCLK6502;
+}
+
+std::vector<std::string> Emulator::FullSpeedReasons() const
+{
+    RequireStarted();
+    const unsigned bits = FullSpeedReasonBits();
+    std::vector<std::string> reasons;
+    if (bits & 1u) reasons.emplace_back("machine_speed_max");
+    if (bits & 2u) reasons.emplace_back("override");
+    if (bits & 4u) reasons.emplace_back("disk_motor");
+    return reasons;
+}
+
+bool Emulator::FullSpeedActive() const
+{
+    RequireStarted();
+    return FullSpeedReasonBits() != 0;
+}
 
 }  // namespace harness

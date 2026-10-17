@@ -105,6 +105,13 @@ TEST_SUITE("realtime")
     TEST_CASE("emu: realtime rate")
     {
         auto& e = StartedEmulator();
+        // M3 Part C (D11): the fixture's empty drive keeps the boot ROM's motor on, which AppleWin runs at full speed
+        // while enhanced disk speed is on. Measure the paced rate with it off.
+        struct RestoreEnhance {
+            Emulator& e;
+            ~RestoreEnhance() { e.SetEnhanceDiskSpeed(true); }
+        } restore{e};
+        e.SetEnhanceDiskSpeed(false);
         auto c0 = e.EmulatedCycles();
         e.RunRealtime(2000ms);
         double d = double(e.EmulatedCycles() - c0);

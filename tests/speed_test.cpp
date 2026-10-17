@@ -53,6 +53,14 @@ struct EjectAndPowerCycle {
     }
 };
 
+// The fixture boots with an empty drive, so the Disk II boot ROM keeps the motor on; with enhanced disk speed that is
+// AppleWin's disk_motor full-speed condition. Rate tests turn enhancement off (RestoreSpeed turns it back on).
+void NoMotorFullSpeed(Emulator& e)
+{
+    e.SetEnhanceDiskSpeed(false);
+    REQUIRE(e.FullSpeedReasons().empty());
+}
+
 bool Contains(const std::vector<std::string>& v, const std::string& s)
 {
     return std::find(v.begin(), v.end(), s) != v.end();
@@ -242,6 +250,7 @@ TEST_SUITE("realtime")
     {
         auto& e = StartedEmulator();
         RestoreSpeed restore{e};
+        NoMotorFullSpeed(e);
         for (const uint32_t speed : {5u, 10u, 20u}) {
             CAPTURE(speed);
             e.SetMachineSpeed(speed);
@@ -258,6 +267,7 @@ TEST_SUITE("realtime")
     {
         auto& e = StartedEmulator();
         RestoreSpeed restore{e};
+        NoMotorFullSpeed(e);
         e.SetMachineSpeed(40);
         CHECK(e.FullSpeedActive());
         const double max = MeasureRate(e, 1000ms, 3000ms);
@@ -283,6 +293,7 @@ TEST_SUITE("realtime")
     {
         auto& e = StartedEmulator();
         RestoreSpeed restore{e};
+        NoMotorFullSpeed(e);
         e.SetMachineSpeed(10);
         REQUIRE(e.RunRealtime(1000ms));
         e.SetMachineSpeed(20);

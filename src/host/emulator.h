@@ -69,8 +69,10 @@ public:
     uint64_t EmulatedCycles() const;     // cycles since the last power-on (D10)
 
     // Runs exactly frames x NTSC_GetCyclesPerFrame() cycles (more only because of the last instruction), in steps of
-    // 1 ms or less. Realtime: BurstBudget + AudioOutput feedback per step, paced by RealtimePacer (D9, D14).
-    // AudioOutput plays only during a Realtime run. Returns false if the window was closed (checked after every step).
+    // 1 ms or less (stepped: at the base clock, whatever the speed). Realtime: BurstBudget at EffectiveClockHz() +
+    // AudioOutput feedback per step, paced by RealtimePacer (D9, D14); while FullSpeedActive(), unpaced steps of the same
+    // size with AppleWin's full-speed video redraws (D11). AudioOutput plays only during a Realtime run, at speed 10 and
+    // not at full speed. Returns false if the window was closed (checked after every step).
     bool RunFrames(uint32_t frames, Pacing pacing = Pacing::Stepped);
     bool RunRealtime(std::chrono::milliseconds wallTime);   // paced bursts; same feedback, playback and close rules
     // One open-ended realtime run, a step at a time (the server's Running state): each call runs one paced step of at

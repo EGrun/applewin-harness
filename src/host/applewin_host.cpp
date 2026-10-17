@@ -97,9 +97,9 @@ void SingleStep(bool /*bReinit*/)
 
 namespace harness {
 
-uint32_t ExecuteStep(uint32_t cycles)
+uint32_t ExecuteStep(uint32_t cycles, bool fullSpeed)
 {
-    const uint32_t executed = CpuExecute(cycles, true);
+    const uint32_t executed = CpuExecute(cycles, !fullSpeed);
     g_dwCyclesThisFrame += executed;
     GetCardMgr().Update(executed);
     SpkrUpdate(executed);
@@ -107,7 +107,10 @@ uint32_t ExecuteStep(uint32_t cycles)
     const UINT clksPerFrame = NTSC_GetCyclesPerFrame();
     if (g_dwCyclesThisFrame >= clksPerFrame && !GetVideo().VideoGetVblBarEx(g_dwCyclesThisFrame)) {
         g_dwCyclesThisFrame -= clksPerFrame;
-        GetFrame().VideoPresentScreen();
+        if (fullSpeed)
+            GetFrame().VideoRedrawScreenDuringFullSpeed(g_dwCyclesThisFrame);
+        else
+            GetFrame().VideoPresentScreen();
     }
     return executed;
 }

@@ -2,7 +2,7 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). See [project.md](project.md).
+**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). M4 is done: checkpoints (`checkpoint`, `restore_checkpoint`), `get_state_checksum`, `step_cycles` and disk export (`list_disks`, `export_disk`). See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
@@ -91,6 +91,24 @@ op.call("step_frames", frames=60)
 frame = agent.call("get_frame", format="PNG")   # frame["data"] is base64
 op.call("close_session")
 h.close()
+```
+
+Checkpoints (decision D5): `checkpoint` saves the machine and the working disks together, and `restore_checkpoint` brings both back. Restoring the same checkpoint and running the same script gives the same state checksum, frames and audio.
+
+Continuing a stepped session that has booted (as above, before `close_session`):
+
+```python
+cp = op.call("checkpoint", name="booted")["checkpoint_id"]      # "cp-1"
+
+def run_script():
+    op.call("restore_checkpoint", checkpoint_id=cp)
+    agent.call("type_text", text="CATALOG\n", inter_key_delay_ms=0)
+    op.call("step_cycles", cycles=500000)
+    op.call("step_frames", frames=60)
+    return op.call("get_state_checksum")["sha256"]
+
+assert run_script() == run_script()
+op.call("export_disk", slot=6, drive=1, dest_path=r"C:\out\dos33-result.dsk")   # keep the working disk
 ```
 
 Run the Python tests (build first; `HARNESS_EXE` defaults to `bin\x64\Debug\AppleWinHarness.exe`):

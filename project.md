@@ -43,7 +43,7 @@ See `docs/decisions.md` for the reasoning behind each choice.
 
 - Integration: the harness hosts the AppleWin core in-process (D2, confirmed in M1).
 - API: split into an agent API and an operator API (D4). The spec is in `docs/api_spec.md`.
-- State: checkpoints cover machine state and disks together (D5).
+- State: checkpoints cover machine state and disks together, and a restore leaves the machine and the harness depending only on the checkpoint (D5).
 - Display and sound: windowed with sound by default, headless (no window or sound) as an option. The window and sound are output only; they never change emulated state (D8).
 - Pacing: realtime mode runs 1 ms bursts of cycles paced by a high-resolution timer, plus audio-buffer feedback from the harness's own `AudioOutput` when sound is playing. Stepped mode runs exact cycle counts with no timer and no sound (D9).
 - Time: all API durations are in emulated milliseconds, and every input reports the cycle it was applied at (D10).
@@ -111,24 +111,31 @@ This milestone also adds `set_speed` and `get_speed` (D11), and agent audio: vir
 - The M2 human bell check still stands (a person listening to the windowed bell).
 - Parked for M4/M6: resampled windowed playback at non-authentic speeds, and PAL (`video_refresh: 50`).
 
-### M4 — Checkpoints, determinism
-Add `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `list_disks`, `export_disk` and `step_cycles`. (`create_session`, `close_session` and stepped run mode arrive in M3.)
+### M4 — Checkpoints, determinism ✅
+**Status:** Done. See `docs/specs/m4.md` and the checkpoint section of `docs/api_spec.md`. No AppleWin patches were needed.
 
-**Acceptance:**
-- The same input script, run twice from the same checkpoint in stepped mode, produces identical state checksums and frame checksums.
+Adds `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `delete_checkpoint`, `get_state_checksum`, `step_cycles`, `list_disks` and `export_disk`. (`create_session`, `close_session` and stepped run mode arrive in M3.) Restore purity (D5) resets every piece of machine and harness state that AppleWin's save state doesn't cover.
+
+**Acceptance (all pass, headless and windowed):**
+- The same input script, run twice from the same checkpoint in stepped mode, produces identical state checksums and frame checksums (ruling D4: both scripted runs start from a restore).
 - The checksums are also identical when the script runs at `machine_speed` 10 and at 40.
 - `get_audio` over the same cycle range returns byte-identical audio across those runs, and in both windowed and headless mode.
-- The original disk image's hash is unchanged.
-- SSI263 speech (Mockingboard) is covered by an end-to-end determinism test that runs an MB/SSI263 program in both display modes (D14 removed the old D8 exception).
-- Audio capture is split-independent if checkpoint replay steps in different chunks: today the same step partition is required (ruling B13); anchoring each voice by its own cumulative sample count is the planned fix.
+- The original disk image's hash is unchanged; a `SAVE` is exported with `export_disk`, and a restore to before it brings back the disk without the file.
+- SSI263 speech (Mockingboard, slot 4) is covered by an end-to-end determinism test that runs a BASIC program in both display modes and across restores (D14).
+- Frames after an in-process `PowerCycle` equal a fresh `Start`'s; the M1 and M2 goldens still pass.
 
-**Carried from the M3 Part C final review** (M4-1, speed in stepped runs, is resolved by ruling C7: stepped runs always use authentic speed and enhanced disk access):
-- M4-2: `m_enhanceDisk` is in AppleWin's Disk II save-state, so loading one overwrites the session's `enhance_disk_speed`. Re-apply the session's speed settings after a restore.
-- M4-3: the C runtime `rand()` stream (Disk II uses it) is outside AppleWin's save-state. Save and reseed it on restore.
-- M4-4: harness state outside AppleWin must be captured or cleared on restore: the input queue (pending events, held keys, applied map, next id), the `AudioCapture` ring and per-voice positions, the sound-event detector, and `g_cyclesAtPowerOn` (the cycle origin for capture and `input_applied`).
-- M4-5: speaker internals (remainder buffer, `g_nSpkrLastCycle`, quiet counters) aren't in AppleWin's save-state either; expect ±1 LSB audio differences after a restore unless the checksum covers frames and CPU state only. (Related: the video scanner's position in the frame, `g_dwCyclesThisFrame`, survives a power cycle, so frames sampled after a `PowerCycle` in one process are not comparable with a fresh boot's unless it is reset.)
-- M4-6: `frame_id` skips at full speed and gains one on leaving it, so checkpoints and replays should key on `emulated_cycles`.
-- M4-7: a checkpoint taken while Running must end the realtime run first, so `g_bFullSpeed` and the Mockingboard mute are cleared before the snapshot.
+**Carried from the M3 Part C final review** (M4-1, speed in stepped runs, is resolved by ruling C7):
+- M4-2 resolved: the session's speed settings are re-applied after a restore (D8).
+- M4-3 resolved: `srand(1)` again on restore (D13).
+- M4-4 resolved: the input queue, held keys, audio capture, sound detectors and cycle origin are cleared or restored (D5).
+- M4-5 resolved: the speaker internals, Mockingboard frame counter, clock, FLASH counter and the video scanner phase (also after `PowerCycle`) are reset (D5).
+- M4-6 resolved: checkpoints and replays key on `emulated_cycles`.
+- M4-7 resolved: a checkpoint ends any realtime run first.
+
+**Parked:**
+- Split-independent audio capture: replays must reuse the same step partition (ruling B13). Anchoring each voice by its own cumulative sample count is the planned fix.
+- D10 mitigation: checkpoints refuse non-ASCII working paths; inserting working copies through ASCII 8.3 short paths is parked to M6.
+- Minor findings from the M4 final review will be tracked separately.
 
 ### M5 — Agent adapter
 Build an MCP server that wraps the agent API, and an example agent task (for example, write and run a short BASIC program).

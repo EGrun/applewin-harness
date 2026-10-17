@@ -77,6 +77,26 @@ Restoring a checkpoint restores all three together.
 
 Original disk images are never written to. Sessions always run on working copies.
 
+### Restore purity (M4)
+`restore_checkpoint` must leave the machine and the harness in a state that depends only on the checkpoint. AppleWin's own `Snapshot_LoadState` is not enough, because several things that affect emulation or the captured output are not in the save state. After the load the harness resets each of them:
+
+- **Disks.** Both drives are ejected before the load so AppleWin releases the files. The checkpoint's copies are copied over the working copies, and the save state re-inserts them by path. The load refuses up front (so no file dialog can open) if an image is missing. A failure before the load rolls the disks back and leaves the session usable; a failure in or after it makes the session unusable until `close_session` (D7).
+- **Video scanner phase** (`g_dwCyclesThisFrame`). The save state restores it on a restore, but `PowerCycle` did not reset it, so frames after a power cycle differed from a fresh boot's. `Start` and `PowerCycle` now reset it.
+- **Text FLASH counter.** A static inside AppleWin's NTSC code, never saved and not reachable. It advances once per scanner wrap (period 32), so the harness counts wraps and moves the phase with a whole-screen redraw to `(emulated_cycles / 17030) mod 32`, the value a stepped run from power-on has.
+- **Speaker internals.** The level, the DC filter, the sample buffer and remainder, and the quiet counters are reset to a fresh start's values (`SpkrReset()` plus the harness's own steps). The DC filter is private to AppleWin, so it is driven to its fresh value by pushing samples through it.
+- **Mockingboard.** The manager's audio-frame counter is reset, and the mute is cleared.
+- **Clock.** AppleWin's clock goes back to the canonical authentic-speed value. The save state's load calls `SetCurrentCLK6502` with whatever speed was set.
+- **Enhanced disk speed.** The Disk II card saves it. The session's value is re-applied (D8): speed is a session setting.
+- **Random numbers.** `srand(1)` again (D13). The C runtime stream can't be saved, so it is reset deterministically.
+- **Harness state.** The input queue is emptied (each discarded input reports `discarded: true`), held keys and buttons are released, the joystick returns to its position at the checkpoint, the audio capture and the sound detectors are cleared, and the presented frame is re-rendered from the restored video memory.
+- **Cycle origin.** The power-on origin is stored in the checkpoint, so `emulated_cycles` continues from the checkpoint's value.
+
+Consequence (D2 of the M4 rulings): a replay is exact only between two restores of the same checkpoint, because capture placement and the random stream restart at the restore. A straight run is not comparable with a restored one for weak-bit disk reads.
+
+**D10 (M4): non-ASCII working paths.** AppleWin saves image paths as UTF-8 but loads them with the ANSI file API, so a checkpoint whose working copy has a non-ASCII path could never be restored. `checkpoint` refuses (`-32004`) when a working path's UTF-8 bytes differ from its ANSI bytes. Cost: a user whose `%TEMP%` path has non-ASCII characters cannot checkpoint. Parked mitigation (M6): insert working copies through their ASCII 8.3 short paths when those exist.
+
+**D11 (M4): startup sweep.** A killed server cannot delete its work directory. On start, the harness removes `%TEMP%\applewin-harness\<pid>` directories and `<pid>.ini` files whose process is no longer running. Entries of live processes are skipped, so a reused pid can leave a stale directory behind but never causes a live one to be deleted.
+
 ## D6 — Licensing
 **Status:** Open — must be decided before M1 code is published
 

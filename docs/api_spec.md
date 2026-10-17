@@ -1,6 +1,6 @@
 # AppleWin Harness — API & Protocol Specification
 
-**Version:** 0.3 (draft). M3 (server, sessions, input, frames, execution control, agent audio, speed controls) is implemented. Design reasoning lives in [decisions.md](decisions.md).
+**Version:** 0.3 (draft). M3 (server, sessions, input, frames, execution control, agent audio, speed controls) and M4 (checkpoints, state checksum, `step_cycles`, disks) are implemented. Design reasoning lives in [decisions.md](decisions.md).
 
 ## Overview
 The harness lets clients drive an AppleWin emulator that it hosts in-process. The API is split by role (D4):
@@ -68,6 +68,7 @@ Before a session exists, every agent method returns `-32002`.
 `type_text`, `press_key` and `set_joystick` reply straight away with `{ input_id, applied_at_cycle }`. They never wait for the input to take effect, because in stepped mode that only happens during a step, and a single-threaded client would deadlock.
 - Input takes effect at the start of the next step (D10). `applied_at_cycle` is the cycle at which it will take effect when that is already known: nothing is queued ahead of it and, for a key, the keyboard strobe is clear. Then it equals the current `emulated_cycles`. Otherwise it is `null`.
 - When an input has fully taken effect, that connection receives the notification `input_applied { input_id, first_cycle, last_cycle }`. For `type_text`, these are the cycles of the first and last key. For a held key or a joystick `duration_ms`, they are the press and the release.
+- An input that `restore_checkpoint` throws away (still queued, or waiting for a release) is reported once as `input_applied { input_id, first_cycle: null, last_cycle: null, discarded: true }` (D1). The `discarded` field appears only then.
 - Inputs are applied in order. A key also waits until the keyboard strobe is clear.
 - Auto-repeat on held keys is not implemented.
 
@@ -140,7 +141,7 @@ Returns `{ start_cycle, end_cycle, sample_rate: 44100, channels: 2, format, data
 
 ### Agent notifications
 - `frame_ready` `{ frame_id, emulated_cycles, width, height }` (shared-memory fields are planned)
-- `input_applied` `{ input_id, first_cycle, last_cycle }`
+- `input_applied` `{ input_id, first_cycle, last_cycle, discarded? }` (`discarded: true` with null cycles when `restore_checkpoint` dropped the input)
 - `sound_started` `{ start_cycle, emulated_ms }` (`emulated_ms` is milliseconds of emulated time since power-on)
 - `sound_stopped` `{ start_cycle, end_cycle, duration_ms, peak_db, dominant_hz }` (`peak_db` in dBFS, `dominant_hz` in Hz). Fetch the actual samples with `get_audio { from_cycle: start_cycle }`.
 
@@ -157,11 +158,13 @@ Returns `{ session_id }`.
 - **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `allow_text_screen: true`, `shared_memory_frames: true`, and `speed.video_refresh: 50` (PAL).
 - `speed` is `{ video_refresh?: 50 | 60 = 60, ...set_speed params }`. It is validated before anything starts (`-32602`), and applied right after the emulator starts. `video_refresh: 50` returns `-32006`.
 
-**`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and exits the process with code 0. It is also valid when no session exists. Use `export_disk` first to keep any results (M4).
+**`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and checkpoints and exits the process with code 0. It is also valid when no session exists, and when the session is unusable. Use `export_disk` first to keep any results.
 
-**`list_disks`** *(M4)* — returns `[ { slot, drive, original_path, working_path, write_protected, format } ]`
+**`list_disks`** `{}` — returns `[ { slot: 6, drive: 1|2, original_path, working_path, write_protected, format } ]`, with empty drives left out. `format` is the image type AppleWin reports (`"DO"`, `"PO"`, `"NIB"`, `"WOZ"`, ...). Before a session exists: `-32002`.
 
-**`export_disk`** *(M4)* `{ slot, drive, dest_path }` — copies a working image out of the session. It refuses to overwrite the original image.
+**`export_disk`** `{ slot: 6, drive: 1|2, dest_path }` — flushes the drive's current track, copies the working image to `dest_path` and replies `{}`.
+- `dest_path` must be absolute, must not exist, must not be any session's original image, must not be inside the harness work directory (`%TEMP%\applewin-harness`), and its directory must exist; otherwise `-32602`. Original images are never touched.
+- An empty drive is `-32005`. Any slot other than 6 is `-32602`. After a failed restore it returns `-32008`.
 
 ### Execution control
 Before a session exists, these return `-32002`.
@@ -169,7 +172,7 @@ Before a session exists, these return `-32002`.
 - **`resume`** `{}` — only valid in `realtime` mode (`-32008` in stepped mode). Replies `{}`. Realtime mode runs in 1 ms bursts, paced by a high-resolution timer (D9).
 - **`step_frames`** `{ frames: int }` — `frames` is 1 to 100000. Pauses first if the session is running, runs N video frames (17,030 cycles each at 60 Hz), then stays paused. Returns `{ emulated_cycles }`. Input queued while paused takes effect at the start of the next step, which keeps runs deterministic.
 - If the window is closed during `pause` or `step_frames`, the reply is `-32008` and the process then exits with 0.
-- **`step_cycles`** `{ cycles: int }` — *(planned for M4)* runs N CPU cycles.
+- **`step_cycles`** `{ cycles: int }` — `cycles` is 1 to 17,030,000. Like `step_frames` it pauses first if the session is running, runs in stepped mode (the last instruction may overshoot, by at most 7 cycles), and replies `{ emulated_cycles }`. Input, `input_applied` and sound events behave as for `step_frames`. Replays must use the same sequence of run commands: audio capture depends on how a run is split into steps (ruling B13).
 
 ### Speed (D11)
 These commands offer exactly the speed controls AppleWin has, with AppleWin's value ranges. The harness implements them by calling AppleWin's own functions (`SetCurrentCLK6502`, `UseClockMultiplier`, `SetEnhanceDisk`), so clamping and rounding match AppleWin exactly.
@@ -205,16 +208,47 @@ Any field left out keeps its current value. Returns the same result as `get_spee
 - **Stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only (D9, ruling C7).** In stepped mode the settings are stored and reported, and they can't change emulated results: frames, CPU state and captured audio are the same at every setting. (In a realtime run, `enhance_disk_speed` also changes AppleWin's disk timing, and the speed changes how many samples AppleWin's sound devices produce per cycle.)
 - **At full speed in realtime mode**, frames are redrawn the way AppleWin does it, and `frame_ready` notifications are limited to one per 16 ms of wall-clock time per subscription (about 62.5 per second). Extra presents are dropped; `frame_id` stays monotonic, so ids can skip. Expect one extra `frame_ready` when leaving full speed.
 - **Windowed playback follows speed.** The window plays sound only at `machine_speed` 10 and not at full speed. Agent audio capture (`get_audio`, `subscribe_audio`) is unaffected, but silent while a run is at full speed.
-- **Speed is a session setting.** `restore_checkpoint` doesn't change it.
+- **Speed is a session setting.** `restore_checkpoint` doesn't change it: the session's current settings are re-applied after the load, and the speed stored with a checkpoint is informational only (D8).
 
-### Checkpoints (D5) — M4
-- **`checkpoint`** `{ name }` — pauses the emulator if it's running, flushes the disk buffers, writes a save state, and copies the working disks. Returns `{ checkpoint_id }`.
-- **`restore_checkpoint`** `{ checkpoint_id }` — restores the save state and the disks together, and leaves the emulator paused.
-- **`list_checkpoints`** — returns `[ { checkpoint_id, name, created_at, emulated_ms } ]`
-- **`delete_checkpoint`** `{ checkpoint_id }`
+### Checkpoints (D5)
+A checkpoint is an AppleWin save state plus copies of the working disks, stored under `<work>/checkpoints/<checkpoint_id>/`. Checkpoints live and die with the session's work directory: they do not survive the process.
 
-### Test helpers (M4)
-**`get_state_checksum`** — returns `{ sha256 }`, a hash of main and aux RAM, the CPU registers and the memory soft-switch state. The exact list of fields is fixed during M4 and recorded here. Wall-clock time is never included.
+**`checkpoint`** `{ name?: string }` — returns `{ checkpoint_id, emulated_cycles }`.
+- If the session is running, it first pauses at the next present and ends the realtime run (full speed and the Mockingboard mute are cleared). It then writes the save state, flushes the disk buffers and copies the working disks. The session is left paused.
+- `checkpoint_id` is `cp-<n>`, counting up from 1. `name` is up to 64 printable characters (`-32602` otherwise); `list_checkpoints` reports `null` if it was omitted.
+- Errors: `-32004` with the cause on any failure, and when there are already 256 checkpoints.
+- **Non-ASCII working paths (D10):** AppleWin stores image paths as UTF-8 but loads them through the ANSI file API. If a working copy's path would not survive that round trip (for example a `%TEMP%` path with non-ASCII characters), `checkpoint` returns `-32004` and writes nothing.
+
+**`restore_checkpoint`** `{ checkpoint_id }` — returns `{ emulated_cycles }`. It restores the save state and the disks together, and leaves the session paused in both run modes (use `resume` to start a realtime run). An unknown id is `-32602`.
+- After a restore, everything observable depends only on the checkpoint (see D5): the machine, the disks, the video scanner position, the speaker, the random stream and the harness's own queues. Running the same script from the same checkpoint always gives the same state checksum, frames and audio, whatever happened before the restore.
+- `emulated_cycles` continues from the checkpoint's value. Input still queued is discarded and reported with `discarded: true` (see Input replies), held keys and joystick buttons are released, and the joystick returns to the position it had at the checkpoint.
+- The audio capture is cleared: `get_audio` for audio from before the restore returns `-32009`. `subscribe_audio` detectors restart at the restored cycle. `get_frame` straight after a restore shows the restored screen.
+- The session's current speed settings are kept (D8).
+- **Failure before the load** (for example a missing checkpoint disk copy): `-32004`. The session stays usable and unchanged: the working disks are rolled back and re-inserted, and `get_state_checksum` equals its value before the call (D7).
+- **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum` and `export_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
+
+**`list_checkpoints`** `{}` — returns `[ { checkpoint_id, name, created_at, emulated_cycles } ]`, oldest first. `created_at` is ISO 8601 UTC; `name` may be `null`.
+
+**`delete_checkpoint`** `{ checkpoint_id }` — returns `{}`. An unknown id is `-32602`.
+
+**Startup sweep (D11).** A killed server cannot clean up after itself. On start, the harness removes stale `%TEMP%\applewin-harness\<pid>` directories and `<pid>.ini` files whose process is no longer running. A live process's entries are never touched.
+
+### Test helpers
+**`get_state_checksum`** `{}` — returns `{ sha256, emulated_cycles }`. It is an operator method.
+
+`sha256` is the lowercase hex SHA-256 of the byte string below, little-endian throughout. It never includes wall-clock time, paths or harness bookkeeping. It is computed at any time, and gives the same value after a restore as when the checkpoint was made.
+
+| # | Size in bytes | Content |
+|---|---|---|
+| 1 | 1+1+1+1+2+2 | CPU registers A, X, Y, P, then S and PC as 16-bit values (S is AppleWin's 16-bit `0x01xx` stack pointer) |
+| 2 | 4 | the memory mode (`GetMemMode()`), uint32 |
+| 3 | 65,536 | main RAM, including the language-card banks, taken as the save state takes it (dirty shadow pages flushed first) |
+| 4 | 1 | the auxiliary card type (AppleWin's `SS_CARDTYPE` value) |
+| 5 | varies | the aux RAM as the save state takes it: for an 80-column card the text page ($400-$7FF of the aux bank, 1,024 bytes); for the Extended 80-column card the 64 KiB aux bank; for a RamWorks III every bank; nothing if there is no aux card |
+| 6 | 1 | the keyboard latch and strobe (`KeybReadData()`) |
+| 7 | 4+1 | the video soft-switch mode (uint32), then the alternate-charset switch (0 or 1) |
+| 8 | 1+1+2×(4+4), or 1 | the Disk II controller in slot 6: motor (0 or 1), current drive (0 or 1), then for drive 1 and drive 2 the phase (the bit pattern of a 32-bit float) and the track (uint32). If slot 6 has no Disk II, the single byte `0xFF` |
+| 9 | 1+1+1+1+1 | input state (D6): the //e any-key-down flag ($C010 bit 7), joystick buttons 0 and 1, paddle positions 0 (x) and 1 (y) |
 
 ### Operator notifications
 - `disk_written` `{ slot, drive }`
@@ -243,11 +277,11 @@ Harness-specific codes:
 | -32001 | Unauthorized: bad token, or method not allowed for this role |
 | -32002 | No session (agent or operator method that needs one, before `create_session`) |
 | -32003 | Resource locked |
-| -32004 | Checkpoint failed |
+| -32004 | Checkpoint or restore failed |
 | -32005 | Disk not found |
 | -32006 | Not supported (by this model or build, or not yet implemented) |
 | -32007 | Busy, try again |
-| -32008 | Invalid state (e.g. `resume` in stepped mode, a second `create_session`, window closed during a step) |
+| -32008 | Invalid state (e.g. `resume` in stepped mode, a second `create_session`, window closed during a step, run/input/checkpoint/export calls after a failed restore) |
 | -32009 | Audio no longer buffered |
 
 Error objects look like `{ code, message, data? }`. `-32603` carries the C++ exception's `what()` in `message`.

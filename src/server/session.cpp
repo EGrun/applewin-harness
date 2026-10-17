@@ -594,7 +594,10 @@ json Session::GetTextScreen(const json&)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
     if (!allowTextScreen_) throw RpcError{kNotSupported, "get_text_screen needs a session created with allow_text_screen"};
-    throw RpcError{kInternalError, "get_text_screen is not implemented"};   // M5 Task 2
+    const TextScreen t = emulator_.ReadTextScreen();
+    json lines = json::array();
+    for (const std::string& l : t.lines) lines.push_back(l);
+    return json{{"mode", t.mode}, {"lines", lines}, {"emulated_cycles", t.emulatedCycles}};
 }
 
 json Session::GetFrame(const json& params)

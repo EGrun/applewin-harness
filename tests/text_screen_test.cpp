@@ -59,14 +59,20 @@ void ClearPages()
     for (WORD page : {WORD(0x400), WORD(0x800)}) {
         std::memset(MemGetMainPtr(page), 0xA0, 0x400);
         std::memset(MemGetAuxPtr(page), 0xA0, 0x400);
+        std::memset(MemGetBankPtr(0) + page, 0xA0, 0x400);   // backing banks too (see PutRow)
+        std::memset(MemGetBankPtr(1) + page, 0xA0, 0x400);
     }
 }
 
 // Normal-video text (high bit set) at the start of `row` in the page (main or aux).
 void PutRow(WORD page, int row, const std::string& text, bool aux = false)
 {
-    BYTE* p = aux ? MemGetAuxPtr(RowAddr(page, row)) : MemGetMainPtr(RowAddr(page, row));
-    for (size_t i = 0; i < text.size(); ++i) p[i] = BYTE(text[i] | 0x80);
+    const WORD addr = RowAddr(page, row);
+    BYTE* p = aux ? MemGetAuxPtr(addr) : MemGetMainPtr(addr);
+    // Also write the backing bank: a poke through MemGetMainPtr lands in AppleWin's paged 'mem' copy without marking the
+    // page dirty, so it would be lost when 80STORE + PAGE2 repoints the page at aux RAM.
+    BYTE* bank = MemGetBankPtr(aux ? 1 : 0) + addr;
+    for (size_t i = 0; i < text.size(); ++i) p[i] = bank[i] = BYTE(text[i] | 0x80);
 }
 
 std::string Row(const std::string& text, size_t width = 40)

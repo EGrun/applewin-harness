@@ -1176,10 +1176,59 @@ std::string Emulator::ReadTextRow(int row) const
     return s;
 }
 
+namespace {
+// Maps a text-page byte to printable ASCII 0x20-0x7E (docs/specs/m5.md): inverse, flashing and MouseText glyphs map to
+// their base character, MouseText to a space. In the primary set the inverse/flashing range $00-$7F has no lowercase
+// ($60-$7F is flashing $20-$3F); normal video ($80-$FF) maps to the ASCII the program wrote, lowercase included.
+char TextCodeToAscii(BYTE code, bool altCharSet)
+{
+    const int v = code & 0x7F;
+    int c;
+    if (altCharSet) {
+        if (code < 0x80 && v >= 0x40 && v < 0x60) return ' ';   // MouseText
+        c = v < 0x20 ? v + 0x40 : v;
+    } else {
+        c = v < 0x20 ? v + 0x40 : (code < 0x80 && v >= 0x60 ? v - 0x40 : v);
+    }
+    return (c < 0x20 || c > 0x7E) ? ' ' : char(c);
+}
+}  // namespace
+
 TextScreen Emulator::ReadTextScreen() const
 {
     RequireStarted();
-    throw std::logic_error("Emulator::ReadTextScreen: not implemented");   // M5 Task 2
+    const Video& video = GetVideo();
+    const bool text = video.VideoGetSWTEXT();
+    const bool mixed = video.VideoGetSWMIXED();
+    const bool col80 = video.VideoGetSW80COL();
+    const bool alt = video.VideoGetSWAltCharSet();
+    // With 80STORE on, PAGE2 switches memory banks rather than the displayed page: the display stays on page 1.
+    const WORD page = (video.VideoGetSWPAGE2() && !video.VideoGetSW80STORE()) ? 0x800 : 0x400;
+
+    TextScreen ts;
+    ts.emulatedCycles = EmulatedCycles();
+    ts.mode = text ? (col80 ? "80col" : "40col") : (mixed ? (col80 ? "mixed80" : "mixed40") : "graphics");
+    if (!text && !mixed)
+        return ts;   // 24 empty lines
+    for (int row = text ? 0 : 20; row < 24; ++row) {
+        const WORD addr = WORD(page + 0x80 * (row % 8) + 0x28 * (row / 8));
+        // These return the live main / aux contents even when 80STORE + PAGE2 has swapped the pages in the CPU's view.
+        const BYTE* mainRow = MemGetMainPtr(addr);
+        const BYTE* auxRow = col80 ? MemGetAuxPtr(addr) : nullptr;
+        std::string& line = ts.lines[size_t(row)];
+        if (!col80) {
+            line.resize(40);
+            for (int i = 0; i < 40; ++i)
+                line[size_t(i)] = TextCodeToAscii(mainRow[i], alt);
+        } else {
+            line.assign(80, ' ');
+            for (int i = 0; i < 40; ++i) {
+                if (auxRow) line[size_t(2 * i)] = TextCodeToAscii(auxRow[i], alt);
+                line[size_t(2 * i + 1)] = TextCodeToAscii(mainRow[i], alt);
+            }
+        }
+    }
+    return ts;
 }
 
 const std::vector<std::string>& Emulator::Messages() const

@@ -913,7 +913,9 @@ class TextScreenTest(PipeTestCase):
         self.assertEqual(len(screen["lines"]), 24)
         self.assertTrue(all(len(line) == 40 for line in screen["lines"]), screen["lines"])
         self.assertEqual(screen["lines"][0], "HELLO".ljust(40))
-        self.assertEqual(screen["lines"][1], "]".ljust(40))
+        # Applesoft leaves a blank line between the PRINT output and the next prompt.
+        self.assertEqual(screen["lines"][1], " " * 40)
+        self.assertEqual(screen["lines"][2], "]".ljust(40))
         self.assertEqual(screen["emulated_cycles"], op.call("get_state_checksum")["emulated_cycles"])
         for line in screen["lines"]:
             self.assertTrue(all(0x20 <= ord(c) <= 0x7E for c in line), line)

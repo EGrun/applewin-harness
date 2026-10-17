@@ -268,6 +268,7 @@ void Session::Dispatch(const Command& command)
         else if (m == "resume") result = Resume(params);
         else if (m == "step_frames") result = StepFrames(params);
         else if (m == "get_frame") result = GetFrame(params);
+        else if (m == "get_text_screen") result = GetTextScreen(params);
         else if (m == "subscribe_frames") result = SubscribeFrames(conn, params);
         else if (m == "type_text") result = TypeText(conn, params);
         else if (m == "press_key") result = PressKey(conn, params);
@@ -392,8 +393,7 @@ json Session::CreateSession(const json& params)
     if (speed) ValidateSpeed(*speed, true);
     const std::string model = GetString(params, "model", std::string("apple2ee"));
     if (model != "apple2ee") throw RpcError{kNotSupported, "model " + model + " is not supported"};
-    if (GetBool(params, "allow_text_screen", false))
-        throw RpcError{kNotSupported, "allow_text_screen is not supported"};
+    const bool allowTextScreen = GetBool(params, "allow_text_screen", false);
     if (GetBool(params, "shared_memory_frames", false))
         throw RpcError{kNotSupported, "shared_memory_frames is not supported"};
     if (Field(params, "hard_disks")) throw RpcError{kNotSupported, "hard disks are not supported"};
@@ -463,6 +463,7 @@ json Session::CreateSession(const json& params)
     originals_[1] = images[1];
     checkpoints_ = std::make_unique<CheckpointStore>(workDir_);
     unusable_ = false;
+    allowTextScreen_ = allowTextScreen;
     audioFloor_ = 0;
     realtime_ = runMode == "realtime";
     state_ = realtime_ ? State::Running : State::Paused;
@@ -587,6 +588,13 @@ json Session::GetSpeed(const json&)
                 {"full_speed_override", s.fullSpeedOverride},
                 {"full_speed_active", state_ == State::Running && emulator_.FullSpeedStepping()},
                 {"full_speed_reasons", reasons}};
+}
+
+json Session::GetTextScreen(const json&)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    if (!allowTextScreen_) throw RpcError{kNotSupported, "get_text_screen needs a session created with allow_text_screen"};
+    throw RpcError{kInternalError, "get_text_screen is not implemented"};   // M5 Task 2
 }
 
 json Session::GetFrame(const json& params)

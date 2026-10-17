@@ -95,6 +95,7 @@ private:
 
     // Agent methods (-32002 before a session exists).
     nlohmann::json GetFrame(const nlohmann::json& params);
+    nlohmann::json GetTextScreen(const nlohmann::json& params);
     nlohmann::json SubscribeFrames(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json TypeText(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json PressKey(const ConnectionPtr& connection, const nlohmann::json& params);
@@ -129,6 +130,7 @@ private:
 
     State state_ = State::NoSession;
     bool realtime_ = false;
+    bool allowTextScreen_ = false;   // create_session allow_text_screen (docs/specs/m5.md)
     bool exitRequested_ = false;
     std::function<std::string()> fatalError_;
     std::filesystem::path workDir_;   // %TEMP%\applewin-harness\<pid>

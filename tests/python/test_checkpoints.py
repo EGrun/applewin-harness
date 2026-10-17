@@ -15,7 +15,11 @@ import threading
 import time
 import unittest
 
-from harness_client import REPO_ROOT, Harness
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "adapter"))   # applewin_mcp.harness_client
+
+from applewin_mcp.harness_client import REPO_ROOT, Harness
 from test_pipe import (CYCLES_PER_FRAME, BASE_CLOCK_HZ, DOS_IMAGE, WINDOWED, PipeTestCase, dos_disks, ms_to_cycles,
                        mono_ac_rms_db, text_row_band)
 

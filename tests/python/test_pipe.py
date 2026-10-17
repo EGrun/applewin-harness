@@ -17,7 +17,11 @@ import time
 import unittest
 import zlib
 
-from harness_client import REPO_ROOT, Harness, RpcError
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "adapter"))   # applewin_mcp.harness_client
+
+from applewin_mcp.harness_client import REPO_ROOT, Harness, RpcError
 
 CYCLES_PER_FRAME = 17030
 BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC
@@ -329,7 +333,7 @@ class SessionTest(PipeTestCase):
                             disks=[{"slot": 6, "drive": 1, "path": "dos33.dsk"}])
 
     def test_deferred_options_get_32006(self):
-        cases = [{"allow_text_screen": True}, {"shared_memory_frames": True}, {"model": "apple2"}]
+        cases = [{"shared_memory_frames": True}, {"model": "apple2"}]
         for extra in cases:
             with self.subTest(**{k: json.dumps(v) for k, v in extra.items()}):
                 h = self.launch()
@@ -880,12 +884,47 @@ sys.stdout.flush()
 '''
 
 
+# ---- M5 pass condition 2: get_text_screen (docs/specs/m5.md) ----
+
+class TextScreenTest(PipeTestCase):
+    def test_without_allow_text_screen_gets_32006(self):
+        h = self.launch()
+        self.stepped_session(h)
+        agent = h.connect("agent")
+        self.assertRpcError(-32006, agent, "get_text_screen")
+
+    def test_explicit_false_gets_32006(self):
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", run_mode="stepped", allow_text_screen=False)
+        self.assertRpcError(-32006, h.connect("agent"), "get_text_screen")
+
+    def test_40col_after_dos_boot_shows_prompt_row(self):
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", timeout=30.0, run_mode="stepped", allow_text_screen=True, disks=dos_disks())
+        op.call("step_frames", frames=720)
+        agent = h.connect("agent")
+        agent.call("type_text", text='HOME:PRINT "HELLO"\n', inter_key_delay_ms=0)
+        op.call("step_frames", frames=120)
+        screen = agent.call("get_text_screen")
+        self.assertEqual(sorted(screen), ["emulated_cycles", "lines", "mode"])
+        self.assertEqual(screen["mode"], "40col")
+        self.assertEqual(len(screen["lines"]), 24)
+        self.assertTrue(all(len(line) == 40 for line in screen["lines"]), screen["lines"])
+        self.assertEqual(screen["lines"][0], "HELLO".ljust(40))
+        self.assertEqual(screen["lines"][1], "]".ljust(40))
+        self.assertEqual(screen["emulated_cycles"], op.call("get_state_checksum")["emulated_cycles"])
+        for line in screen["lines"]:
+            self.assertTrue(all(0x20 <= ord(c) <= 0x7E for c in line), line)
+
+
 class OrphanTest(unittest.TestCase):
     def test_server_exits_when_its_launcher_exits(self):
         import subprocess
         import sys
         import tempfile
-        from harness_client import exe_path
+        from applewin_mcp.harness_client import exe_path
         env = dict(os.environ, HARNESS_EXE=exe_path())
         out = subprocess.run([sys.executable, "-c", LAUNCHER], env=env, stdout=subprocess.PIPE, timeout=30).stdout
         announcement = json.loads(out.decode("utf-8"))

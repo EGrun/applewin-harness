@@ -1176,6 +1176,12 @@ std::string Emulator::ReadTextRow(int row) const
     return s;
 }
 
+TextScreen Emulator::ReadTextScreen() const
+{
+    RequireStarted();
+    throw std::logic_error("Emulator::ReadTextScreen: not implemented");   // M5 Task 2
+}
+
 const std::vector<std::string>& Emulator::Messages() const
 {
     RequireStarted();

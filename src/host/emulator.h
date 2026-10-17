@@ -1,5 +1,6 @@
 #pragma once
 #include "core/frame_view.h"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -14,6 +15,14 @@
 namespace harness {
 
 class AudioCapture;
+
+// docs/specs/m5.md get_text_screen: mode is "40col", "80col", "mixed40", "mixed80" or "graphics"; always 24 lines, each
+// exactly 40 (or 80) printable ASCII characters; mixed modes leave lines 0-19 empty, graphics leaves all 24 empty.
+struct TextScreen {
+    std::string mode;
+    std::array<std::string, 24> lines;
+    uint64_t emulatedCycles = 0;
+};
 
 enum class DisplayMode { Windowed, Headless };
 enum class Pacing { Stepped, Realtime };
@@ -151,6 +160,9 @@ public:
     uint64_t PresentedFrames() const;
     FrameView Frame(bool borders = false) const;   // the last presented frame (HarnessFrame::PresentedFrame)
     std::string ReadTextRow(int row) const;  // 40-column text page 1 row 0..23, each byte & 0x7F, as ASCII
+    // The text on screen decoded from the video soft switches and the text pages in main and aux memory (M5; Task 1
+    // stub: throws std::logic_error("not implemented")).
+    TextScreen ReadTextScreen() const;
     const std::vector<std::string>& Messages() const;  // FrameMessageBox calls so far
 
     // The agent-audio timeline (D14): every sound voice, mixed, by emulated cycle since power-on; cleared by Start and

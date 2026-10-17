@@ -37,11 +37,11 @@ Put this in `.mcp.json` in your project (or add it with `claude mcp add`):
       "command": "<PYTHON>",
       "args": [
         "-m", "applewin_mcp",
-        "--exe", "<REPO>\bin\x64\Release\AppleWinHarness.exe",
-        "--disk", "<REPO>\external\AppleWin\bin\DOS 3.3 System Master - 680-0210-A.dsk",
+        "--exe", "<REPO>\\bin\\x64\\Release\\AppleWinHarness.exe",
+        "--disk", "<REPO>\\external\\AppleWin\\bin\\DOS 3.3 System Master - 680-0210-A.dsk",
         "--text-screen"
       ],
-      "env": { "PYTHONPATH": "<REPO>\adapter" }
+      "env": { "PYTHONPATH": "<REPO>\\adapter" }
     }
   }
 }
@@ -57,11 +57,11 @@ Put this in `claude_desktop_config.json` (Settings, Developer, Edit Config), the
       "command": "<PYTHON>",
       "args": [
         "-m", "applewin_mcp",
-        "--exe", "<REPO>\bin\x64\Release\AppleWinHarness.exe",
-        "--disk", "<REPO>\external\AppleWin\bin\DOS 3.3 System Master - 680-0210-A.dsk",
+        "--exe", "<REPO>\\bin\\x64\\Release\\AppleWinHarness.exe",
+        "--disk", "<REPO>\\external\\AppleWin\\bin\\DOS 3.3 System Master - 680-0210-A.dsk",
         "--text-screen"
       ],
-      "env": { "PYTHONPATH": "<REPO>\adapter" }
+      "env": { "PYTHONPATH": "<REPO>\\adapter" }
     }
   }
 }

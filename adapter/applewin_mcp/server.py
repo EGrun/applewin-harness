@@ -247,7 +247,7 @@ def build_server(args, machine):
     if args.text_screen:
         @mcp.tool()
         async def read_screen() -> str:
-            """Read the text on the screen: the video mode (40col, 80col or graphics), then 24 lines."""
+            """Read the text on the screen: the video mode (40col, 80col, mixed40, mixed80 or graphics), then 24 lines."""
             return await asyncio.to_thread(machine.read_screen)
 
     @mcp.tool()

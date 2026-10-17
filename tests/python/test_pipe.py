@@ -511,6 +511,7 @@ class SpeedTest(PipeTestCase):
         op.call("create_session", run_mode="realtime", speed={"machine_speed": "max"})
         agent = h.connect("agent")
         agent.call("subscribe_frames", every_n_frames=1)
+        first_cycles = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
         start = time.monotonic()
         count = 0
         while time.monotonic() - start < 2.0:
@@ -521,7 +522,13 @@ class SpeedTest(PipeTestCase):
             if note.get("method") == "frame_ready":
                 count += 1
         elapsed = time.monotonic() - start
-        self.assertLessEqual(count, 60 * elapsed + 3, "{} frame_ready in {:.2f} s".format(count, elapsed))
+        last_cycles = agent.call("get_frame", format="BGRA32")["emulated_cycles"]
+        # Cap: at most one frame_ready per 16 ms of wall time (ruling C4, the full-speed redraw interval) = 62.5/s,
+        # plus 3 for the window edges.
+        self.assertLessEqual(count, 62.5 * elapsed + 3, "{} frame_ready in {:.2f} s".format(count, elapsed))
+        # Full speed really ran: far more than 2x authentic emulated cycles per wall second.
+        rate = (last_cycles - first_cycles) / elapsed
+        self.assertGreater(rate, 2 * BASE_CLOCK_HZ, "max ran at {:.0f} cycles/s".format(rate))
         self.assertGreater(count, 20, "frame_ready stopped arriving at max")
 
 

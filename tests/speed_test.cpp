@@ -93,12 +93,15 @@ bool InCanonicalOrder(const std::vector<std::string>& reasons)
     return true;
 }
 
-std::string BootAndPrintHash(Emulator& e)
+// PowerCycle must keep the speed settings (they belong to the session), so the speed is checked after it and at the end.
+std::string BootAndPrintHash(Emulator& e, uint32_t expectedSpeed)
 {
     e.PowerCycle();
+    CHECK(e.Speed().machineSpeed == expectedSpeed);
     REQUIRE(e.RunFrames(720));
     REQUIRE(e.TypeText("PRINT 2+2\r"));
     REQUIRE(e.RunFrames(60));
+    CHECK(e.Speed().machineSpeed == expectedSpeed);
     return FrameHash(e.Frame());
 }
 
@@ -220,14 +223,14 @@ TEST_CASE("speed: stepped RunFrames gives the same hash at speeds 5 and 40 and w
     EjectAndPowerCycle ejector{e};   // declared after copy: ejects before the copy is deleted
 
     e.SetMachineSpeed(5);
-    const std::string at5 = BootAndPrintHash(e);
+    const std::string at5 = BootAndPrintHash(e, 5);
     const uint64_t cycles5 = e.EmulatedCycles();
     e.SetMachineSpeed(40);
-    const std::string at40 = BootAndPrintHash(e);
+    const std::string at40 = BootAndPrintHash(e, 40);
     const uint64_t cycles40 = e.EmulatedCycles();
     e.SetMachineSpeed(10);
     e.SetFullSpeedOverride(true);
-    const std::string withOverride = BootAndPrintHash(e);
+    const std::string withOverride = BootAndPrintHash(e, 10);
     CHECK(at5 == at40);
     CHECK(at5 == withOverride);
     CHECK(cycles5 == cycles40);
@@ -321,11 +324,14 @@ TEST_SUITE("realtime")
         // enhance_disk_speed off: the motor is no longer a reason.
         e.SetEnhanceDiskSpeed(false);
         e.PowerCycle();
+        // Positive control: run until DOS has booted from the disk (so the motor really ran) and check every slice.
         bool sawMotorWhileOff = false;
-        for (int i = 0; i < 100; ++i) {
+        const auto offDeadline = std::chrono::steady_clock::now() + 40s;
+        while (std::chrono::steady_clock::now() < offDeadline && !AtPrompt(e)) {
             REQUIRE(e.RunRealtime(20ms));
             if (Contains(e.FullSpeedReasons(), "disk_motor")) sawMotorWhileOff = true;
         }
+        CHECK(AtPrompt(e));   // the boot read the disk, so the motor was on
         CHECK_FALSE(sawMotorWhileOff);
     }
 

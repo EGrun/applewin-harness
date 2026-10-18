@@ -32,7 +32,7 @@ AppleWinHarness.exe --serve [--headless]
 - **Pipe:** a Windows named pipe, `\\.\pipe\applewin-harness-<id>`, in byte mode with overlapped I/O. It allows at most 8 simultaneous connections. Remote clients are rejected (`PIPE_REJECT_REMOTE_CLIENTS`).
 - **ACL:** the DACL has exactly one ACE, an allow ACE for the SID of the user who launched the harness.
 - **Messages:** JSON-RPC 2.0, encoded as UTF-8, with one JSON object per message. Each message is prefixed with its length as a 4-byte little-endian integer.
-- **Framing:** a length of 0 or more than 16 MiB closes the connection. So does a connection that closes mid-message. The server keeps running.
+- **Framing:** a length of 0 closes the connection, as does a length over 1 MiB on a request (before the body is read; see Limits) or over 16 MiB on a reply. So does a connection that closes mid-message. The server keeps running.
 - **Send backlog:** replies and notifications are queued per connection and never block emulation. If a connection's unsent backlog passes 64 MiB, the server closes it.
 - **Notifications:** JSON-RPC notifications (no `id`) are used for events. Notifications sent by clients are ignored.
 - **Frames:** raw frames through shared memory are planned (see below) and not yet available.
@@ -76,7 +76,7 @@ Before a session exists, every agent method returns `-32002`.
 The Apple II keyboard sends 7-bit ASCII and has no separate modifier keys, so keys are given as characters or named specials, not PC scan codes.
 
 **`type_text`** `{ text: string, inter_key_delay_ms?: int = 30 }`
-Sends each character as one keypress. `text` may contain only characters 0x20 to 0x7E and `\n`, and is at most 4,096 characters; otherwise `-32602`. Newlines (`\n`) become RETURN. Lowercase is sent as-is (the //e is the only supported model).
+Sends each character as one keypress. `text` may contain only characters 0x20 to 0x7E and `\n`, and is at most 4,096 characters; `inter_key_delay_ms` is 0 to 1,000; otherwise `-32602`. Each character counts as one pending input event (`-32010` if they do not all fit; see Limits). Newlines (`\n`) become RETURN. Lowercase is sent as-is (the //e is the only supported model).
 - Key *i* is applied at the later of the previous key's applied cycle plus `inter_key_delay_ms` (at the base clock) and the moment the strobe clears. With `inter_key_delay_ms: 0` this is the fastest the keyboard can take the keys.
 
 **`press_key`** `{ key: string | int, hold_ms?: int = 50 }`
@@ -84,7 +84,7 @@ Presses a single key.
 - `key` is either one character from 0x20 to 0x7E, an ASCII code from 0 to 127, or one of these names: `RETURN` (0x0D), `ESC` (0x1B), `TAB` (0x09), `DELETE` (0x7F), `LEFT`, `RIGHT`, `UP`, `DOWN`, `CTRL-A` to `CTRL-Z` (0x01 to 0x1A), `RESET`. Anything else is `-32602`.
 - `RESET` sends CTRL-RESET. It does not wait for the strobe.
 - `hold_ms` sets how long the //e any-key-down flag ($C010 bit 7) stays set.
-- There is no upper limit on `hold_ms` yet (planned for M6).
+- `hold_ms` is 0 to 10,000, otherwise `-32602`. A key counts as one pending input event (`-32010` when the queue is full).
 
 The Open-Apple and Solid-Apple keys are joystick buttons 0 and 1; use `set_joystick` for them.
 
@@ -92,7 +92,7 @@ The Open-Apple and Solid-Apple keys are joystick buttons 0 and 1; use `set_joyst
 **`set_joystick`** `{ joystick?: 0 = 0, x?: 0..255, y?: 0..255, buttons?: { "0"?: bool, "1"?: bool }, duration_ms?: int }`
 - These are the native paddle values; 127 is centre. Positions start at 127.
 - Any field left out keeps its current value.
-- If `duration_ms` is set, the joystick returns to its previous state after that long. There is no upper limit yet (planned for M6).
+- If `duration_ms` is set, the joystick returns to its previous state after that long. `duration_ms` is 0 to 60,000, otherwise `-32602`. A change counts as one pending input event, and as two with a `duration_ms` above 0 (the change and its release); `-32010` when they do not fit.
 - `joystick: 1` and button `"2"` return `-32006` (not yet supported).
 
 ### Screen
@@ -303,14 +303,17 @@ Harness-specific codes:
 | -32007 | Busy, try again |
 | -32008 | Invalid state (e.g. `resume` in stepped mode, a second `create_session`, window closed during a step, run/input/checkpoint/export calls after a failed restore) |
 | -32009 | Audio no longer buffered |
+| -32010 | Input queue full: `data` is `{ pending, limit }` |
 
 Error objects look like `{ code, message, data? }`. `-32603` carries the C++ exception's `what()` in `message`.
 
 ## Limits
-- Message size: 16 MiB per request or response (framing). A larger length prefix closes the connection.
+- Request size: 1 MiB. A length prefix above that on an incoming request closes the connection before the body is read, and logs one warning. Replies and notifications keep a 16 MiB frame limit (`get_frame` BGRA32 needs it); a larger length prefix closes the connection.
 - Send backlog: 64 MiB of unsent data per connection; beyond that the server closes it.
 - Connections: at most 8 at once.
-- Not limited yet (M6): input rate (planned: 200 events per emulated second), `inter_key_delay_ms`, `hold_ms` and `duration_ms` values, and request sizes below 16 MiB. A client can therefore schedule events arbitrarily far ahead.
+- Input values: `hold_ms` 0 to 10,000; `duration_ms` 0 to 60,000; `inter_key_delay_ms` 0 to 1,000; `text` 4,096 characters. Each is `-32602` outside its range.
+- Strings: any string parameter, at any depth, is at most 32,767 UTF-16 code units (`-32602`).
+- Pending input events: 4,096 per session. A key counts 1; a joystick change counts 1, or 2 with a `duration_ms` above 0; a `type_text` of *n* characters counts *n*. A request that would take the queue past 4,096 is rejected whole with `-32010` "Input queue full" and `data { pending, limit }`, and nothing from it is queued. `restore_checkpoint` empties the queue. There is no limit per emulated second: in stepped mode a client queues while emulated time stands still.
 - Paths: disk paths must be absolute.
 
 ## Example: the M2 scenario over the API

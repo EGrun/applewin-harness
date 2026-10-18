@@ -554,8 +554,13 @@ struct PipeServer::Impl {
                 const ULONGLONG deadline = authed ? 0 : helloDeadline;
                 std::array<uint8_t, 4> prefix{};
                 if (!conn->ReadExact(prefix.data(), prefix.size(), readEvent.h, deadline)) break;
-                const auto len = ParseLengthPrefix(std::span<const uint8_t, 4>(prefix));
-                if (!len) break;
+                const auto len = ParseLengthPrefix(std::span<const uint8_t, 4>(prefix), kMaxRequestBytes);
+                if (!len) {
+                    // Over 1 MiB: close before the body is read. (A zero length also closes, without a log line.)
+                    if (prefix != std::array<uint8_t, 4>{})
+                        log::Warning(log::Component::Server, "request larger than 1 MiB: connection closed", conn->id());
+                    break;
+                }
                 body.resize(*len);
                 if (!conn->ReadExact(reinterpret_cast<uint8_t*>(body.data()), body.size(), readEvent.h, deadline)) break;
                 const bool keepOpen = HandleMessage(conn, body, authed);

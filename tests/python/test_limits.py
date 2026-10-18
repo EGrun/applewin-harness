@@ -9,6 +9,7 @@ import json
 import os
 import struct
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "adapter"))   # applewin_mcp.harness_client
@@ -254,6 +255,27 @@ class LogStormTest(LimitTestCase):
         suppressed = [n for n in notes if "suppressed" in n["params"]["message"].lower()]
         self.assertTrue(suppressed, "no log line reports a suppressed count: {}".format(notes))
         self.assertRegex(suppressed[0]["params"]["message"], r"\d+")
+
+    def test_a_client_that_reconnects_in_a_loop_gives_a_bounded_stderr(self):
+        """Each failed hello is a new connection, so a per-connection limit alone would not bound the output: the
+        logger also caps warning/error records at 20 per second across all keys."""
+        h = self.launch()
+        time.sleep(0.5)
+        before = len([l for l in h.stderr.decode("utf-8", "replace").splitlines() if l.strip()])
+        started = time.monotonic()
+        for _ in range(50):
+            conn = h.open_raw()
+            conn.send({"jsonrpc": "2.0", "id": 1, "method": "hello",
+                       "params": {"protocol_version": "0.3", "role": "agent", "token": "wrong"}})
+            conn.wait_closed(5.0)
+        elapsed = time.monotonic() - started
+        time.sleep(0.5)
+        lines = [l for l in h.stderr.decode("utf-8", "replace").splitlines() if l.strip()]
+        added = len(lines) - before
+        bound = 20 * (int(elapsed) + 2) + 2
+        self.assertGreaterEqual(added, 1, "the first failure must be logged")
+        self.assertLessEqual(added, bound, "{} stderr lines for 50 failed hellos in {:.1f}s".format(added, elapsed))
+        self.assertLess(added, 50, "the cap did not suppress anything: {}".format(lines[-5:]))
 
 
 if __name__ == "__main__":

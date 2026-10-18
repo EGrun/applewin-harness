@@ -14,7 +14,8 @@ namespace harness::log {
 namespace {
 
 constexpr std::chrono::seconds kWindow{1};
-constexpr size_t kMaxKeys = 256;   // bounds the rate-limit table: older entries are dropped when it grows past this
+constexpr size_t kMaxKeys = 256;   // bounds the rate-limit table: the oldest entries are evicted to stay within this
+constexpr uint32_t kGlobalPerWindow = 20;   // records per second across all keys, separately for warning/error and the rest
 
 struct Key {
     Level level;
@@ -35,6 +36,12 @@ struct Entry {
 std::mutex g_mutex;   // the rate-limit table, the format and the stderr write
 Format g_format = Format::Text;
 std::map<Key, Entry> g_entries;
+struct Bucket {   // the global cap: a fixed one-second window
+    std::chrono::steady_clock::time_point windowStart{};
+    uint32_t count = 0;
+    uint64_t suppressed = 0;
+};
+Bucket g_buckets[2];   // [0] debug/info, [1] warning/error
 std::shared_ptr<const OperatorSink> g_sink;   // guarded by g_mutex
 std::atomic<double> g_emulatedMs{0.0};
 
@@ -116,6 +123,18 @@ void Write(Level level, Component component, std::string_view messageView, uint6
             ++it->second.suppressed;
             return;
         }
+        // The global cap: a client that reconnects in a loop makes a new key every time, so keys alone do not bound
+        // the output. Records over the cap are counted and reported by the next one that passes.
+        Bucket& bucket = g_buckets[level == Level::Warning || level == Level::Error ? 1 : 0];
+        if (now - bucket.windowStart >= kWindow) {
+            bucket.windowStart = now;
+            bucket.count = 0;
+        }
+        if (bucket.count >= kGlobalPerWindow) {
+            ++bucket.suppressed;
+            return;
+        }
+        ++bucket.count;
         uint64_t suppressed = 0;
         if (it != g_entries.end()) {
             suppressed = it->second.suppressed;
@@ -124,9 +143,19 @@ void Write(Level level, Component component, std::string_view messageView, uint6
             if (g_entries.size() >= kMaxKeys)
                 for (auto e = g_entries.begin(); e != g_entries.end();)
                     e = now - e->second.windowStart >= kWindow ? g_entries.erase(e) : std::next(e);
+            while (g_entries.size() >= kMaxKeys) {   // all still live: evict the oldest
+                auto oldest = g_entries.begin();
+                for (auto e = g_entries.begin(); e != g_entries.end(); ++e)
+                    if (e->second.windowStart < oldest->second.windowStart) oldest = e;
+                g_entries.erase(oldest);
+            }
             g_entries.emplace(std::move(key), Entry{now, 0});
         }
         if (suppressed) message += " (" + std::to_string(suppressed) + " similar suppressed)";
+        if (bucket.suppressed) {
+            message += " (" + std::to_string(bucket.suppressed) + " suppressed by the rate limit)";
+            bucket.suppressed = 0;
+        }
 
         std::string line;
         if (g_format == Format::Json) {
@@ -138,7 +167,13 @@ void Write(Level level, Component component, std::string_view messageView, uint6
             if (connection) j["connection"] = connection;
             line = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
         } else {
-            line = std::string(LevelName(level)) + ": " + message;
+            std::string one;   // one line per record: a newline in the message is written as \n
+            for (const char c : message) {
+                if (c == '\n') one += "\\n";
+                else if (c == '\r') one += "\\r";
+                else one.push_back(c);
+            }
+            line = std::string(LevelName(level)) + ": " + one;
         }
         line.push_back('\n');
         std::fwrite(line.data(), 1, line.size(), stderr);

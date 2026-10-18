@@ -31,7 +31,11 @@ constexpr uint32_t kDefaultHoldMs = 50;
 constexpr uint32_t kMaxStepFrames = 100000;
 constexpr uint32_t kMaxEveryNFrames = 600;
 constexpr DWORD kIdleWaitMs = 50;
-constexpr uint64_t kMaxMs = UINT32_MAX;   // inter_key_delay_ms, hold_ms, duration_ms
+constexpr uint64_t kMaxHoldMs = 10000;            // press_key.hold_ms
+constexpr uint64_t kMaxDurationMs = 60000;        // set_joystick.duration_ms
+constexpr uint64_t kMaxInterKeyDelayMs = 1000;    // type_text.inter_key_delay_ms
+constexpr uint64_t kMaxPendingInputEvents = 4096;
+constexpr size_t kMaxStringUnits = 32767;         // any string parameter, in UTF-16 code units
 
 [[noreturn]] void InvalidParams(const std::string& message)
 {
@@ -72,6 +76,29 @@ uint64_t GetUint(const json& params, const char* name, uint64_t lo, uint64_t hi,
         InvalidParams(std::string(name) + " must be an integer");
     }
     InvalidParams(std::string(name) + " must be in " + std::to_string(lo) + ".." + std::to_string(hi));
+}
+
+// The length of a UTF-8 string in UTF-16 code units: a 4-byte sequence is a surrogate pair, any other lead byte is one.
+size_t Utf16Units(const std::string& s)
+{
+    size_t n = 0;
+    for (const char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if ((u & 0xC0) == 0x80) continue;   // continuation byte
+        n += u >= 0xF0 ? 2 : 1;
+    }
+    return n;
+}
+
+// Every string in the params, at any depth, is at most kMaxStringUnits UTF-16 code units (-32602).
+void CheckStringLengths(const json& v)
+{
+    if (v.is_string()) {
+        if (Utf16Units(v.get_ref<const std::string&>()) > kMaxStringUnits)
+            InvalidParams("a string parameter is limited to 32767 UTF-16 code units");
+    } else if (v.is_structured()) {
+        for (const json& child : v) CheckStringLengths(child);
+    }
 }
 
 std::string GetString(const json& params, const char* name, std::optional<std::string> fallback)
@@ -288,12 +315,12 @@ void LogSuccess(const std::string& method)
 // state, unknown method) are the client's to handle, not logged. Rate limited per connection by the logger.
 void LogFailure(const std::string& method, int code, uint64_t connection)
 {
-    const bool invalid = code == kInvalidParams, internal = code == kInternalError;
-    if (!invalid && !internal) return;
+    const bool invalid = code == kInvalidParams, full = code == kInputQueueFull, internal = code == kInternalError;
+    if (!invalid && !full && !internal) return;
     const std::string what = IsKnownMethod(method) ? method : "request";
-    const std::string text = what + (invalid ? " rejected: invalid params (" : " failed: internal error (") +
+    const std::string text = what + (invalid ? " rejected: invalid params (" : full ? " rejected: input queue full (" : " failed: internal error (") +
                              std::to_string(code) + ")";
-    if (invalid) log::Warning(log::Component::Session, text, connection);
+    if (invalid || full) log::Warning(log::Component::Session, text, connection);
     else log::Error(log::Component::Session, text, connection);
 }
 
@@ -309,6 +336,7 @@ void Session::Dispatch(const Command& command)
         if (!command.params.is_null() && !command.params.is_object())
             throw RpcError{kInvalidParams, "params must be an object"};
         const json params = command.params.is_object() ? command.params : json::object();
+        CheckStringLengths(params);
         const std::string& m = command.method;
         json result;
         if (m == "create_session") result = CreateSession(params);
@@ -342,7 +370,7 @@ void Session::Dispatch(const Command& command)
         reply = MakeResult(command.id, std::move(result));
         LogSuccess(command.method);
     } catch (const RpcError& e) {
-        reply = MakeError(command.id, e.code, e.message);
+        reply = MakeError(command.id, e.code, e.message, e.data);
         LogFailure(command.method, e.code, connId);
     } catch (const std::exception& e) {
         reply = MakeError(command.id, kInternalError, e.what());
@@ -696,6 +724,14 @@ json Session::SubscribeFrames(const ConnectionPtr& connection, const json& param
     return json::object();
 }
 
+// All or nothing: throws -32010 unless `events` more input events fit in the queue.
+void Session::RequireInputRoom(uint64_t events)
+{
+    const uint64_t pending = emulator_.PendingInputEvents();
+    if (pending + events > kMaxPendingInputEvents)
+        throw RpcError{kInputQueueFull, "Input queue full", json{{"pending", pending}, {"limit", kMaxPendingInputEvents}}};
+}
+
 json Session::TypeText(const ConnectionPtr& connection, const json& params)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
@@ -707,8 +743,8 @@ json Session::TypeText(const ConnectionPtr& connection, const json& params)
         else if (u < 0x20 || u > 0x7E) InvalidParams("text may only contain 0x20-0x7E and \\n");
     }
     if (text.size() > kMaxTextChars) InvalidParams("text is limited to 4096 characters");
-    const uint64_t delay = GetUint(params, "inter_key_delay_ms", 0, kMaxMs,
-                                   kDefaultInterKeyDelayMs);
+    const uint64_t delay = GetUint(params, "inter_key_delay_ms", 0, kMaxInterKeyDelayMs, kDefaultInterKeyDelayMs);
+    RequireInputRoom(text.size());
     const uint64_t id = emulator_.QueueText(text, uint32_t(delay));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
@@ -719,7 +755,8 @@ json Session::PressKey(const ConnectionPtr& connection, const json& params)
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
     RequireUsable();
     const KeySpec key = ParseKey(params);
-    const uint64_t hold = GetUint(params, "hold_ms", 0, kMaxMs, kDefaultHoldMs);
+    const uint64_t hold = GetUint(params, "hold_ms", 0, kMaxHoldMs, kDefaultHoldMs);
+    RequireInputRoom(1);
     const uint64_t id = emulator_.QueueKey(key, uint32_t(hold));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
@@ -744,7 +781,8 @@ json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
             (name == "0" ? change.button0 : change.button1) = value.get<bool>();
         }
     }
-    const uint64_t duration = GetUint(params, "duration_ms", 0, kMaxMs, 0);
+    const uint64_t duration = GetUint(params, "duration_ms", 0, kMaxDurationMs, 0);
+    RequireInputRoom(duration > 0 ? 2 : 1);
     const uint64_t id = emulator_.QueueJoystick(change, uint32_t(duration));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));

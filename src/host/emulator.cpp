@@ -1099,6 +1099,22 @@ uint64_t Emulator::QueueJoystick(JoystickChange change, uint32_t durationMs)
     return g_input.fifo.back().id;
 }
 
+uint64_t Emulator::PendingInputEvents() const
+{
+    RequireStarted();
+    uint64_t n = 0;
+    for (const QueuedOp& op : g_input.fifo) {
+        switch (op.kind) {
+        case QueuedOp::Kind::Text: n += op.text.size() - op.next; break;
+        case QueuedOp::Kind::Key: n += 1; break;
+        case QueuedOp::Kind::Joy: n += op.durationCycles > 0 ? 2 : 1; break;
+        }
+    }
+    for (const TimedOp& t : g_input.timed)
+        if (t.kind == TimedOp::Kind::JoyRestore) ++n;
+    return n;
+}
+
 std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t inputId) const
 {
     RequireStarted();

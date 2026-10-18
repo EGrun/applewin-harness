@@ -98,6 +98,7 @@ private:
     nlohmann::json GetFrame(const nlohmann::json& params);
     nlohmann::json GetTextScreen(const nlohmann::json& params);
     nlohmann::json SubscribeFrames(const ConnectionPtr& connection, const nlohmann::json& params);
+    void RequireInputRoom(uint64_t events);   // -32010 unless that many more input events fit (4,096 pending)
     nlohmann::json TypeText(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json PressKey(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json SetJoystick(const ConnectionPtr& connection, const nlohmann::json& params);

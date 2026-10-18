@@ -697,7 +697,8 @@ class AgentMethodsTest(PipeTestCase):
             with self.subTest(key=key):
                 result = agent.call("press_key", key=key, hold_ms=0)
                 self.assertIn("input_id", result)
-        self.assertIn("input_id", agent.call("type_text", text="x" * 4095 + "\n"))
+        # (a 4,096-character text is covered in test_limits; after the 16 keys above it would pass the queue cap)
+        self.assertIn("input_id", agent.call("type_text", text="x" * 4000 + "\n"))
 
 
 # ---- Part B: agent audio (pass conditions 7 and 8; Review Focus 3 and 4) ----

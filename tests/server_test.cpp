@@ -324,10 +324,11 @@ TEST_CASE("server: a client that never reads does not block the server and is cl
     Server s = StartServer();
     auto other = Connect(s, "operator");
     auto stalled = Connect(s, "agent");
-    // Each invalid request echoes its 1 MiB string id in a -32600 reply, which this client never reads. A server
-    // whose sends block stops reading after the first reply fills the pipe, and these writes then time out.
+    // Each invalid request echoes its (just under 1 MiB, the request limit) string id in a -32600 reply, which this
+    // client never reads. A server whose sends block stops reading after the first reply fills the pipe, and these
+    // writes then time out.
     const std::vector<uint8_t> frame =
-        PipeClient::Frame(json{{"jsonrpc", "2.0"}, {"id", std::string(1024 * 1024, 'x')}}.dump());
+        PipeClient::Frame(json{{"jsonrpc", "2.0"}, {"id", std::string(1000 * 1000, 'x')}}.dump());
     enum class W { Ok, Timeout, Closed };
     const auto write = [&](std::chrono::milliseconds timeout) {
         HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);

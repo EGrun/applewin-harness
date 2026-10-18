@@ -41,8 +41,10 @@ TEST_CASE("protocol: error codes match api_spec.md")
     CHECK(kBusy == -32007);
     CHECK(kInvalidState == -32008);
     CHECK(kAudioNotBuffered == -32009);
+    CHECK(kInputQueueFull == -32010);
     CHECK(std::string(kProtocolVersion) == "0.3");
     CHECK(kMaxMessageBytes == 16777216u);
+    CHECK(kMaxRequestBytes == 1048576u);
 }
 
 TEST_CASE("protocol: length prefix is little-endian and rejects 0 and over 16 MiB")
@@ -53,6 +55,20 @@ TEST_CASE("protocol: length prefix is little-endian and rejects 0 and over 16 Mi
     CHECK(Parse(0) == std::nullopt);
     CHECK(Parse(16777217) == std::nullopt);
     CHECK(Parse(0xFFFFFFFFu) == std::nullopt);
+}
+
+TEST_CASE("protocol: the request limit is 1 MiB and an error can carry data")
+{
+    const auto parse = [](uint32_t v) {
+        const auto bytes = Le32(v);
+        return ParseLengthPrefix(std::span<const uint8_t, 4>(bytes), kMaxRequestBytes);
+    };
+    CHECK(parse(1048576) == std::optional<uint32_t>(1048576));
+    CHECK(parse(1048577) == std::nullopt);
+    CHECK(parse(0) == std::nullopt);
+    CHECK(MakeError(1, kInputQueueFull, "Input queue full", json{{"pending", 4090}, {"limit", 4096}}) ==
+          json{{"jsonrpc", "2.0"}, {"id", 1},
+               {"error", {{"code", -32010}, {"message", "Input queue full"}, {"data", {{"pending", 4090}, {"limit", 4096}}}}}});
 }
 
 TEST_CASE("protocol: message builders")

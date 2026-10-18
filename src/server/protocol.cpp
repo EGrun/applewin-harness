@@ -9,9 +9,11 @@ nlohmann::json MakeResult(const nlohmann::json& id, nlohmann::json result)
     return nlohmann::json{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
 
-nlohmann::json MakeError(const nlohmann::json& id, int code, std::string message)
+nlohmann::json MakeError(const nlohmann::json& id, int code, std::string message, nlohmann::json data)
 {
-    return nlohmann::json{{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", std::move(message)}}}};
+    nlohmann::json error{{"code", code}, {"message", std::move(message)}};
+    if (!data.is_null()) error["data"] = std::move(data);
+    return nlohmann::json{{"jsonrpc", "2.0"}, {"id", id}, {"error", std::move(error)}};
 }
 
 nlohmann::json MakeNotification(std::string method, nlohmann::json params)
@@ -19,11 +21,11 @@ nlohmann::json MakeNotification(std::string method, nlohmann::json params)
     return nlohmann::json{{"jsonrpc", "2.0"}, {"method", std::move(method)}, {"params", std::move(params)}};
 }
 
-std::optional<uint32_t> ParseLengthPrefix(std::span<const uint8_t, 4> prefix)
+std::optional<uint32_t> ParseLengthPrefix(std::span<const uint8_t, 4> prefix, uint32_t maxBytes)
 {
     const uint32_t n = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) | (uint32_t(prefix[2]) << 16) |
                        (uint32_t(prefix[3]) << 24);
-    if (n == 0 || n > kMaxMessageBytes) return std::nullopt;
+    if (n == 0 || n > maxBytes) return std::nullopt;
     return n;
 }
 

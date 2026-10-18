@@ -2,7 +2,7 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). M4 is done: checkpoints (`checkpoint`, `restore_checkpoint`), `get_state_checksum`, `step_cycles` and disk export (`list_disks`, `export_disk`). M5 is implemented and awaiting human acceptance: an MCP agent adapter (`adapter/`) and `get_text_screen`. See [project.md](project.md).
+**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). M4 is done: checkpoints (`checkpoint`, `restore_checkpoint`), `get_state_checksum`, `step_cycles` and disk export (`list_disks`, `export_disk`). M5 is implemented and awaiting human acceptance: an MCP agent adapter (`adapter/`) and `get_text_screen`. M6 is implemented: input and request limits, structured logging (`--log-format json`), `disk_written` notifications, ASCII short paths for non-ASCII work directories, MIT/GPL licensing, and the portable release zip. See [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
@@ -25,6 +25,34 @@ If you already cloned without it, run:
 ```
 git submodule update --init
 ```
+
+## Install from the release zip
+The release zip `applewin-harness-<version>-win64.zip` holds the harness exe and the MCP adapter, so no build is needed. You need Windows 10/11 x64 and Python 3.12+.
+
+1. Unzip it. The folder you get is `<BUNDLE>` below.
+2. Install the adapter's one dependency: `pip install -r <BUNDLE>\adapter\requirements.txt`.
+3. Get a DOS 3.3 System Master disk image. The zip contains no disk images. Download `DOS 3.3 System Master - 680-0210-A.dsk` from the AppleWin repository's [`bin/` directory](https://github.com/AppleWin/AppleWin/tree/master/bin) and note its path (`<DISK>` below). The harness works on a copy, so the original is never changed.
+4. Add the server to your MCP client. For Claude Code, put this in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "applewin": {
+      "type": "stdio",
+      "command": "<PYTHON>",
+      "args": [
+        "-m", "applewin_mcp",
+        "--exe", "<BUNDLE>\AppleWinHarness.exe",
+        "--disk", "<DISK>",
+        "--text-screen"
+      ],
+      "env": { "PYTHONPATH": "<BUNDLE>\adapter" }
+    }
+  }
+}
+```
+
+Replace `<PYTHON>`, `<BUNDLE>` and `<DISK>` with absolute paths (backslashes doubled in JSON). [adapter/examples/basic_count.md](adapter/examples/basic_count.md) has the Claude Desktop form and an example task. `AppleWinHarness.exe --version` prints the version. The zip is built by `tools\make_release.ps1` after a Release build; CI builds it, runs the adapter end-to-end test from the extracted zip, and uploads it as an artifact.
 
 ## Build
 Open `AppleWinHarness.sln` in Visual Studio, or build from a Developer Command Prompt:

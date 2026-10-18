@@ -18,6 +18,7 @@ AppleWinHarness.exe --serve [--headless]
 | `--serve` | off | Serves this API on a named pipe. It cannot be combined with `--realtime`, `--disk1`, `--png` or any step (usage error, exit 2). |
 | *(no `--headless`)* | windowed | Opens a view-only window showing the live Apple screen and plays the Apple's sound (D8). Sound plays only in realtime mode. |
 | `--headless` | off | No window and no sound. Use it for CI, batch runs, and machines without a desktop. |
+| `--version` | | Used alone (`AppleWinHarness.exe --version`): prints the harness version (the root `VERSION` file) and exits 0. |
 
 - **Announcement.** On start the server prints exactly one line to stdout and flushes it. Nothing else is ever written to stdout:
   `{"pipe":"\\\\.\\pipe\\applewin-harness-<id>","agent_token":"<64 hex>","operator_token":"<64 hex>","pid":<n>}`

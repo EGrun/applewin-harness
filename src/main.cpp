@@ -339,6 +339,10 @@ int Serve(const Args& a)
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 2 && std::wstring(argv[1]) == L"--version") {   // used by tools/make_release.ps1
+        std::cout << harness::Version() << std::endl;
+        return kExitOk;
+    }
     Args a;
     if (!ParseArgs(argc, argv, a)) return Usage();
     harness::log::SetFormat(a.logFormat);

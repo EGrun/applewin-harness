@@ -56,6 +56,44 @@ jobs:
           python -m unittest discover -s tests/adapter -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Build the release bundle
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          ./tools/make_release.ps1
+          $version = (Get-Content VERSION -Raw).Trim()
+          "BUNDLE_ZIP=$env:GITHUB_WORKSPACE\dist\applewin-harness-$version-win64.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Extract the bundle outside the repository
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'bundle'
+          Expand-Archive -LiteralPath $env:BUNDLE_ZIP -DestinationPath $dest -Force
+          $root = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
+          "HARNESS_BUNDLE_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Bundle tests (smoke test and layout checks, run from outside the repository)
+        if: matrix.config == 'Release'
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $tests = Join-Path $env:GITHUB_WORKSPACE 'tests'
+          Set-Location $env:RUNNER_TEMP
+          python -m unittest discover -s "$tests\adapter" -p test_mcp.py -k BundleSmokeTest -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s "$tests\python" -p test_licensing.py -k BundleTest -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the release bundle
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: applewin-harness-win64
+          path: ${{ env.BUNDLE_ZIP }}
+          if-no-files-found: error
+
       - name: Upload harness temp files on failure
         if: failure()
         uses: actions/upload-artifact@v7.0.2

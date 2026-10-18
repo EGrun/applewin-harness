@@ -78,7 +78,7 @@ Link the AppleWin core into the harness. Implement a minimal headless `FrameBase
 
 **Exit criteria:**
 - If the core can't be separated from Win32 with a small patch set, revisit D2 (fallback: plugin inside AppleWin.exe).
-- Resolve D6 (licensing) before publishing.
+- D6 (licensing) is resolved: MIT for the harness code, GPL-2.0-or-later for the binaries.
 
 ### M2 — Vertical slice, in-process ✅
 Add keyboard input and frame capture. Add the windowed presenter with sound, which is the default, and the `--headless` option (D8). Mount a DOS 3.3 disk as a working copy. Add a C++ test and CI.
@@ -151,7 +151,7 @@ Build an MCP server that wraps the agent API, and an example agent task (for exa
 
 **Acceptance:** an MCP-capable agent such as Claude completes the example task end to end.
 
-### M6 — Hardening and release
+### M6 — Hardening and release (implemented, awaiting final review)
 Add input rate limits, request size limits, structured logging, and a portable release bundle. Run the end-to-end scenario in CI.
 
 ### Later (optional)
@@ -161,6 +161,7 @@ Session record/replay, batch experiment orchestration, sector-level disk access.
 - **The core may be coupled to Win32** (DirectSound, DirectInput, registry, the window message loop). Mitigation: the M1 spike, and the D2 fallback.
 - **Maintaining a patch set against AppleWin upstream.** Mitigation: keep patches minimal and apply them on top of the pinned submodule commit (D7).
 - **GPL-2.0 obligations** (D6).
+- **ROM images in the exe and the release bundle.** AppleWin compiles Apple II ROM images into the exe as resources, and the harness does the same. The bundle ships them on the same terms as AppleWin's own releases, and `NOTICE.txt` says so. The copyright position of those ROMs is not ours to settle; if it becomes a problem, the bundle would have to be built without them or the user asked to supply them.
 - **Hidden sources of non-determinism**, such as the real-time clock, the no-slot clock, random memory initialisation, and AppleWin's speaker feedback (which changes how many cycles each burst runs, depending on the host audio buffer). Mitigation: speaker feedback only runs in windowed realtime mode, stepped mode has no feedback and pins or disables the rest (D9), and M4 tests for it.
 - **The replacement DXSoundBuffer TU must track AppleWin's interface** on submodule updates (D14). Mitigation: it is one small file, and the audio tests fail loudly if the interface drifts.
 - **Realtime input timing depends on when clients send input.** Mitigation: every input reports `applied_at_cycle` (D10). Use stepped mode when a run must be reproducible.

@@ -24,7 +24,7 @@ LICENSE_FILES = ("LICENSE", "LICENSE-GPL-2.0.txt", "NOTICE.txt", "THIRD-PARTY-NO
 THIRD_PARTY = ("AppleWin", "zlib", "minizip", "libyaml", "nlohmann", "mcp")
 FORBIDDEN_IN_BUNDLE = (".dsk", ".do", ".po", ".nib", ".woz", ".pdb", ".lib", ".obj", ".idb", ".ilk")
 BUNDLE_FILES = {
-    "AppleWinHarness.exe", "adapter/requirements.txt", "adapter/README.md", "adapter/examples/basic_count.md",
+    "AppleWinHarness.exe", "adapter/requirements.txt", "adapter/README.md", "adapter/VERSION", "adapter/examples/basic_count.md",
     "docs/api_spec.md", "README.md", "LICENSE", "LICENSE-GPL-2.0.txt", "NOTICE.txt", "THIRD-PARTY-NOTICES.txt",
 }
 BUNDLE_ADAPTER_FILES = {"adapter/applewin_mcp/" + n for n in
@@ -155,7 +155,18 @@ class BundleTest(unittest.TestCase):
         root = bundle_dir()
         for name in LICENSE_FILES:
             with self.subTest(file=name):
-                self.assertEqual(read_text(os.path.join(root, name)), read_text(os.path.join(REPO_ROOT, name)))
+                got = read_text(os.path.join(root, name))
+                want = read_text(os.path.join(REPO_ROOT, name))
+                if name == "NOTICE.txt":   # the bundle records the release commit in place of the placeholder
+                    self.assertNotIn("{{", got)
+                    head, tail = want.split("{{RELEASE_COMMIT}}")
+                    self.assertRegex(got, "^" + re.escape(head) + r"[0-9a-f]{40}( \(tag [^)]+\))?" + re.escape(tail) + "$")
+                else:
+                    self.assertEqual(got, want)
+
+    def test_the_bundle_version_file_matches_the_repository(self):
+        self.assertEqual(read_text(os.path.join(bundle_dir(), "adapter", "VERSION")).strip(),
+                         read_text(os.path.join(REPO_ROOT, "VERSION")).strip())
 
     def test_the_example_config_points_into_the_bundle(self):
         text = read_text(os.path.join(bundle_dir(), "adapter", "examples", "basic_count.md"))

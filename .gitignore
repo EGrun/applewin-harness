@@ -15,3 +15,6 @@ notes.txt
 
 # Python
 __pycache__/
+
+# Release bundles
+dist/

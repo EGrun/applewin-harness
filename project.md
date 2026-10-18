@@ -137,12 +137,19 @@ Adds `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `delete_checkpoint`
 - D10 mitigation: checkpoints refuse non-ASCII working paths; inserting working copies through ASCII 8.3 short paths is parked to M6.
 - Minor findings from the M4 final review will be tracked separately.
 
-### M5 — Agent adapter
+### M5 — Agent adapter ✅
+**Status:** Done. See `docs/specs/m5.md`. The work covers:
+- the `adapter/applewin_mcp` MCP server;
+- the harness's `get_text_screen`;
+- floppy swapping while the server runs, through `insert_disk` and `eject_disk`;
+- the example task `adapter/examples/basic_count.md`;
+- CI.
+
+Human acceptance passed on 2026-10-17: Claude completed the example task through the documented config.
+
 Build an MCP server that wraps the agent API, and an example agent task (for example, write and run a short BASIC program).
 
 **Acceptance:** an MCP-capable agent such as Claude completes the example task end to end.
-
-**Status:** implemented (the `adapter/applewin_mcp` MCP server, the harness `get_text_screen`, the example task `adapter/examples/basic_count.md` and CI), awaiting human acceptance: a person points Claude Code or Claude Desktop at the server and checks that the agent completes the example task (spec: `docs/specs/m5.md`).
 
 ### M6 — Hardening and release
 Add input rate limits, request size limits, structured logging, and a portable release bundle. Run the end-to-end scenario in CI.

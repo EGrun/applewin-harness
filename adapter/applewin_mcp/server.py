@@ -1,7 +1,7 @@
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
-and as agent (to type, look, listen), and serves seven tools over MCP stdio.
+and as agent (to type, look, listen), and serves nine tools over MCP stdio.
 
 stdout carries MCP frames only: the harness child's stdout is a pipe that harness_client drains, and all logging goes
 to stderr. The adapter writes the line "harness pid <N>" to stderr once the harness is running.
@@ -198,6 +198,18 @@ class Machine:
                     p.get("duration_ms"), p.get("peak_db"), p.get("dominant_hz")))
         return "\n".join(lines)
 
+    def insert_disk(self, drive, path, write_protected):
+        path = os.path.abspath(path)   # relative paths are taken against the adapter's working directory
+        with self.lock:
+            self.rpc(self.operator, "insert_disk", slot=6, drive=drive, path=path,
+                     write_protected=write_protected)
+        return "inserted {} in drive {}".format(path, drive)
+
+    def eject_disk(self, drive):
+        with self.lock:
+            self.rpc(self.operator, "eject_disk", slot=6, drive=drive)
+        return "ejected the disk from drive {}".format(drive)
+
     def shutdown(self):
         """close_session, then wait for the process to exit (Harness.close waits 5 s, then kills it)."""
         try:
@@ -259,14 +271,19 @@ def build_server(args, machine):
 
     @mcp.tool()
     async def insert_disk(drive: int, path: str, write_protected: bool = False) -> str:
-        """Put a floppy disk image in slot 6, drive 1 or 2, replacing any disk already there. The machine keeps
-        running and is not rebooted."""
-        raise NotImplementedError("insert_disk")
+        """Put a floppy disk image in the disk drive (drive 1 or 2; drives are numbered 1 and 2), replacing any disk
+        already there. The machine keeps running and is NOT rebooted: the program on the screen does not notice
+        until it reads the disk. After a swap, DOS needs a command such as CATALOG (or CATALOG,D2 for drive 2) to
+        see the new disk. path is a disk image file (a relative path is taken from the server's working
+        directory). The original file is never written to; the machine works on a copy. Set write_protected to
+        stop the machine writing to the disk."""
+        return await asyncio.to_thread(machine.insert_disk, drive, path, write_protected)
 
     @mcp.tool()
     async def eject_disk(drive: int) -> str:
-        """Take the floppy out of slot 6, drive 1 or 2. An empty drive is an error."""
-        raise NotImplementedError("eject_disk")
+        """Take the floppy out of the disk drive (drive 1 or 2; drives are numbered 1 and 2). The machine keeps
+        running and is not rebooted. Ejecting from an empty drive is an error."""
+        return await asyncio.to_thread(machine.eject_disk, drive)
 
     return mcp
 

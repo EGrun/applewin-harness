@@ -276,7 +276,7 @@ class DiskSwapTest(AdapterTestCase):
             async with mcp_session(self.errlog) as s:
                 missing = await call(s, "insert_disk", drive=2, path=os.path.join(FIXTURE_DIR, "missing.dsk"))
                 self.assertTrue(missing.is_error)
-                self.assertNotIn("Error executing tool", text_of(missing))   # the harness's message, not the opaque stub text
+                self.assertIn("disk not found", text_of(missing))   # the harness's message (the SDK prefixes ToolError text), not an opaque failure
                 bad_drive = await call(s, "insert_disk", drive=3, path=FIXTURE_DISK)
                 self.assertTrue(bad_drive.is_error)
         self.run_async(go)

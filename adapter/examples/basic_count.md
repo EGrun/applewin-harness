@@ -71,3 +71,6 @@ Put this in `claude_desktop_config.json` (Settings, Developer, Edit Config), the
 1. The agent calls `wait` (about 12000 ms) so the disk boots, then `look` or `read_screen` to see the `]` prompt.
 2. It types the program with `type_text` (`\n` is RETURN), then types `RUN`.
 3. It calls `wait` briefly, then `read_screen` or `look` and sees 1 to 10.
+
+## Swapping disks
+The agent can also change floppies while the machine runs, with `insert_disk` (`drive` 1 or 2, `path`, optional `write_protected`) and `eject_disk` (`drive`). The machine is not rebooted, so after a swap the agent types `CATALOG` (or `CATALOG,D2` for drive 2) and waits to see the new disk. The harness works on a copy; the original image is never written.

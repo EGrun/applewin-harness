@@ -1,6 +1,6 @@
 # applewin_mcp: an MCP server for the Apple II harness
 
-`applewin_mcp` lets an LLM agent use an emulated Apple //e through AppleWin Harness. It is an MCP server over stdio. It offers only what a person at the machine could do: type, press keys, move the joystick, look at the screen, listen, and let time pass. Operator concerns (the disk, the run mode, checkpoints) are not tools; they are set at launch (decision D4 in [docs/decisions.md](../docs/decisions.md)). The spec is [docs/specs/m5.md](../docs/specs/m5.md).
+`applewin_mcp` lets an LLM agent use an emulated Apple //e through AppleWin Harness. It is an MCP server over stdio. It offers only what a person at the machine could do: type, press keys, move the joystick, look at the screen, listen, let time pass, and swap floppy disks. Other operator concerns (the disk loaded at launch, the run mode, export, checkpoints) are not tools; they are set at launch (decision D4 in [docs/decisions.md](../docs/decisions.md)). The spec is [docs/specs/m5.md](../docs/specs/m5.md).
 
 ## Install
 You need Python 3.12 or later and a built `AppleWinHarness.exe` (see the [main README](../README.md)).
@@ -39,14 +39,17 @@ The server starts the harness (`--serve`), creates the session and serves MCP on
 | `look` | none | Returns the screen as a 560x384 PNG image. |
 | `read_screen` | none | Returns the video mode, then 24 lines of text. Listed only with `--text-screen`. Character mapping: see `get_text_screen` in [docs/api_spec.md](../docs/api_spec.md). |
 | `listen` | `ms?` (0-60000, default 0) | Lets `ms` of time pass first (if above 0), then returns the `sound_started` and `sound_stopped` events (with duration and dominant frequency) since the last `listen`. |
+| `insert_disk` | `drive` (1 or 2), `path`, `write_protected?` | Puts a floppy image in slot 6 drive 1 or 2, replacing any disk there. A relative `path` is taken from the server's working directory. The harness works on a copy; the original is never written. |
+| `eject_disk` | `drive` (1 or 2) | Takes the floppy out of the drive. An empty drive is an error. |
 
-No operator method (sessions, disks, checkpoints, speed, stepping) is reachable through the server.
+No other operator method (sessions, checkpoints, export, speed, stepping) is reachable through the server.
 
 ## Behaviour notes
 - **Time.** The default is stepped mode: the emulator is paused, and time passes only through `wait` (and the short stretch `type_text` and `press_key` need, and `listen` with `ms`). A program does not run while the agent is thinking. With `--realtime` the emulator runs on the wall clock, and `wait` sleeps.
 - **Booting.** Nothing happens until time passes. After launching with a DOS 3.3 disk, call `wait` for about 12000 ms (720 frames) to let the disk boot.
 - **Typing.** `type_text` and `press_key` block until the Apple has read the keys, plus a few frames for the program to echo them, so a `look` straight afterwards shows the result. If the keyboard isn't read within 600 frames beyond the time the typing itself takes, the tool returns an error (the program may be busy or not reading keys). Call `wait`, then look.
 - **Sound.** The server subscribes to audio at launch, so `listen` reports sound from launch onwards, not only from the previous `listen`. `listen` with no events reports "no sound events since the last listen".
+- **Swapping disks.** `insert_disk` and `eject_disk` do not reboot the machine or pause it. After a swap, DOS needs a command such as `CATALOG` (or `CATALOG,D2`) to see the new disk. Drives are numbered 1 and 2.
 - **Errors.** A harness error comes back as an MCP tool error with the harness message.
 
 ## Tests

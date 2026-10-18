@@ -49,6 +49,7 @@ int Usage()
 {
     std::cerr << "usage: AppleWinHarness.exe [--headless] [--realtime] [--disk1 <image>] [--png <path>] [step ...]\n"
                  "       AppleWinHarness.exe --serve [--headless] [--log-format text|json]\n"
+                 "       AppleWinHarness.exe --version\n"
                  "step: --frames <n> | --type <text>\n"
                  "  --type escapes: \\r and \\n = Return, \\\\ = backslash; text is 0x20-0x7E.\n"
                  "  --headless needs at least one step; without steps a window runs until closed.\n";

@@ -184,7 +184,7 @@ Returns `{ session_id }`.
 
 **`subscribe_disk_writes`** `{}` / **`unsubscribe_disk_writes`** `{}` — operator only (an agent gets `-32001`). The first makes this connection receive `disk_written` notifications and replies `{}`; the second stops them and replies `{}`. Only writes after the subscribe are reported. Subscribing again changes nothing. Before a session exists they return `-32002`; after a failed restore, `subscribe_disk_writes` returns `-32008`. The subscription lasts until the connection unsubscribes or closes.
 
-Both: after a failed restore they return `-32008`. Before a session exists they return `-32002`. `list_disks` and `export_disk` reflect every swap. `checkpoint` records the drives as they are, including empty ones, and `restore_checkpoint` puts back the checkpointed drive contents (a disk swapped in or out since, or an empty drive, included).
+`insert_disk` and `eject_disk`: after a failed restore they return `-32008`. Before a session exists they return `-32002`. `list_disks` and `export_disk` reflect every swap. `checkpoint` records the drives as they are, including empty ones, and `restore_checkpoint` puts back the checkpointed drive contents (a disk swapped in or out since, or an empty drive, included).
 
 ### Execution control
 Before a session exists, these return `-32002`.

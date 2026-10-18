@@ -42,11 +42,11 @@ The release zip `applewin-harness-<version>-win64.zip` holds the harness exe and
       "command": "<PYTHON>",
       "args": [
         "-m", "applewin_mcp",
-        "--exe", "<BUNDLE>\AppleWinHarness.exe",
+        "--exe", "<BUNDLE>\\AppleWinHarness.exe",
         "--disk", "<DISK>",
         "--text-screen"
       ],
-      "env": { "PYTHONPATH": "<BUNDLE>\adapter" }
+      "env": { "PYTHONPATH": "<BUNDLE>\\adapter" }
     }
   }
 }

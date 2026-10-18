@@ -285,10 +285,10 @@ def short_path(path):
 
 
 class NonAsciiWorkPathTest(LoggingTestCase):
-    def test_checkpoint_and_restore_work_when_temp_has_a_short_ascii_name(self):
+    def check_checkpoint_and_restore(self, dirname):
         base = tempfile.mkdtemp(prefix="awh-m6-")
         self.addCleanup(shutil.rmtree, base, True)
-        temp = os.path.join(base, "témp-üñ-å")
+        temp = os.path.join(base, dirname)
         os.mkdir(temp)
         short = short_path(temp)
         if not short or not short.isascii() or short.lower() == temp.lower():
@@ -306,6 +306,14 @@ class NonAsciiWorkPathTest(LoggingTestCase):
         op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"])
         self.assertEqual(op.call("get_state_checksum")["sha256"], before)
         self.assertEqual(op.call("list_disks")[0]["working_path"], listed[0]["working_path"])
+
+    def test_checkpoint_and_restore_work_when_temp_has_a_short_ascii_name(self):
+        self.check_checkpoint_and_restore("témp-üñ-å")
+
+    def test_checkpoint_and_restore_work_when_temp_is_cjk_with_a_short_name(self):
+        # Not representable in cp1252: before the ASCII path, create_session failed with "No mapping for the Unicode
+        # character". The long directory name must be long enough to get a short one.
+        self.check_checkpoint_and_restore("测试目录-checkpoint")
 
 
 if __name__ == "__main__":

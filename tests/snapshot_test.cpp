@@ -659,6 +659,49 @@ TEST_CASE("ckpt: a non-ASCII disk path is refused at checkpoint, or restores; a 
     }
 }
 
+// D10 (M6): with no ASCII short path for a non-ANSI-safe working path (8.3 names off), the checkpoint is still refused,
+// with the D10 reason, writes nothing and leaves the machine alone. The seam forces that on every machine.
+TEST_CASE("ckpt: with no ASCII short path a non-ANSI-safe disk path is refused at checkpoint (D10 seam)")
+{
+    auto& e = StartedEmulator();
+    struct Seam {
+        Seam() { Emulator::SetShortPathsDisabledForTest(true); }
+        ~Seam() { Emulator::SetShortPathsDisabledForTest(false); }
+    } seam;
+    const fs::path dir = fs::temp_directory_path() / (L"awh-d10-café-" + std::to_wstring(GetCurrentProcessId()));
+    struct RemoveDir {
+        fs::path p;
+        ~RemoveDir() { std::error_code ec; fs::remove_all(p, ec); }
+    } removeDir{dir};
+    fs::create_directories(dir);
+    if (GetACP() == CP_UTF8) {
+        MESSAGE("ANSI code page is UTF-8: every path survives the save state, nothing to refuse");
+        return;
+    }
+    BOOL usedDefault = FALSE;
+    const std::wstring w = dir.wstring();
+    REQUIRE(WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), -1, nullptr, 0, nullptr, &usedDefault) > 0);
+    REQUIRE_FALSE(usedDefault);
+
+    WorkingCopy copy(DosMasterImage(), dir / "disk");
+    e.InsertDisk(0, copy.Path());
+    EjectAndPowerCycle guard{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(30));
+    const std::string before = e.StateChecksum();
+    ScratchDir out("d10seam");
+    const fs::path state = out.path / "state.yaml";
+    try {
+        e.SaveSnapshot(state);
+        FAIL("the checkpoint should have been refused");
+    } catch (const std::runtime_error& ex) {
+        CHECK_MESSAGE(std::string(ex.what()).find("cannot bring back") != std::string::npos, ex.what());
+    }
+    CHECK_FALSE(fs::exists(state));
+    CHECK(e.StateChecksum() == before);
+    REQUIRE(e.RunFrames(2));
+}
+
 // ---- Pass condition 6 ----
 
 TEST_CASE("ckpt: frames after PowerCycle equal a fresh process's through the DOS boot")

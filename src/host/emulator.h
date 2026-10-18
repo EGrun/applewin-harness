@@ -212,6 +212,9 @@ public:
     // names as UTF-8 and loads them as ANSI, so any non-ASCII path unless the ANSI code page is UTF-8). InsertDisk
     // (D10, M6) hands AppleWin the file's ASCII 8.3 short path when its long path is not ANSI-safe, so only a
     // non-ASCII path with no short name is refused here.
+    // Test seam, not reachable from the pipe: true makes the ASCII short-path lookup (D10) find nothing, as on a volume
+    // with 8.3 names disabled.
+    static void SetShortPathsDisabledForTest(bool disabled);
     SnapshotMeta SaveSnapshot(const std::filesystem::path& stateFile);
     // Snapshot_LoadState from stateFile, then restore purity in the spec's order: the session's CURRENT speed settings
     // re-applied (ruling D8; enhance-disk included, meta.speed is not used), srand(1), speaker internals reset to a

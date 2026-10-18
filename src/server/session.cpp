@@ -538,7 +538,7 @@ json Session::CreateSession(const json& params)
         // Name the user's images, not the working copies, and leave nothing behind.
         std::string what = e.what();
         for (int i = 0; i < 2; ++i)
-            if (!copyPaths[i].empty()) ReplaceAll(what, copyPaths[i].string(), images[i].string());
+            if (!copyPaths[i].empty()) ReplaceAll(what, PathUtf8(copyPaths[i]), PathUtf8(images[i]));
         copies_.clear();   // Start and the drive-2 insert shut the emulator down on failure
         std::error_code ec;
         fs::remove_all(workDir_, ec);
@@ -1287,7 +1287,7 @@ json Session::InsertDisk(const json& params)
     } catch (const std::exception& e) {
         // AppleWin's own image-open result said no: leave the drive as it was and name the user's image.
         std::string what = e.what();
-        ReplaceAll(what, copy->Path().string(), original.string());
+        ReplaceAll(what, PathUtf8(copy->Path()), PathUtf8(original));
         if (previous) {
             try {
                 emulator_.InsertDisk(drive, previous->workingPath, previous->writeProtected);

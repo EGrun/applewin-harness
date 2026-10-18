@@ -60,6 +60,8 @@ namespace harness {
 
 namespace {
 
+std::string StatePathForAppleWin(const std::filesystem::path& file);   // D10: an ANSI-safe string for a path
+
 bool g_started = false;
 bool g_dsInitialized = false;   // DSInit() (D14: the harness's own, opens no device) succeeded; DSUninit() pending
 std::unique_ptr<Window> g_window;   // windowed mode only
@@ -826,7 +828,7 @@ void Emulator::Start(const EmulatorConfig& config)
     const std::string exeDir = ExeDirWithSeparator();
     g_sStartDir = exeDir;
     g_sProgramDir = exeDir;
-    g_sConfigFile = config.configIni.string();
+    g_sConfigFile = StatePathForAppleWin(config.configIni);   // D10: ANSI-safe even under a non-ASCII %TEMP%
     g_nMemoryClearType = MIP_ZERO;
     // Any exception out of Start leaves the emulator stopped (failures after g_started go through Shutdown()); this
     // also releases a window and the sound system set up before the failure.
@@ -1166,6 +1168,8 @@ bool SurvivesSaveState(const std::string& ansi)
 // load reads them with the ANSI file API, so a path that is not ANSI-safe could never be restored. Such a path is
 // replaced by its ASCII 8.3 short path (GetShortPathNameW; the file must exist) when one exists. A path with no ASCII
 // form is passed on as ANSI (SaveSnapshot then refuses it); one that has no ANSI form at all is an error here.
+bool g_noShortPathsForTest = false;   // test seam (SetShortPathsDisabledForTest): behave as if 8.3 names were off
+
 std::string ImagePathForAppleWin(const std::filesystem::path& image)
 {
     const std::wstring& wide = image.native();
@@ -1182,7 +1186,7 @@ std::string ImagePathForAppleWin(const std::filesystem::path& image)
             return ansi;
     }
     std::wstring shortPath(MAX_PATH, L'\0');
-    DWORD n = GetShortPathNameW(image.c_str(), shortPath.data(), DWORD(shortPath.size()));
+    DWORD n = g_noShortPathsForTest ? 0 : GetShortPathNameW(image.c_str(), shortPath.data(), DWORD(shortPath.size()));
     if (n >= shortPath.size()) {
         shortPath.resize(n);
         n = GetShortPathNameW(image.c_str(), shortPath.data(), DWORD(shortPath.size()));
@@ -1198,7 +1202,7 @@ std::string ImagePathForAppleWin(const std::filesystem::path& image)
         }
     }
     if (ansi.empty())
-        throw std::runtime_error("Emulator: the disk image path has characters the ANSI code page cannot represent and "
+        throw std::runtime_error("Emulator: a path has characters the ANSI code page cannot represent and "
                                  "no ASCII short (8.3) path exists for it");
     return ansi;
 }
@@ -1215,7 +1219,30 @@ std::string UpperAscii(std::string s)
     return s;
 }
 
+// The save state file as AppleWin gets it (Snapshot_SetFilename takes ANSI): its directory through
+// ImagePathForAppleWin (the file itself need not exist yet), then the file name, which must be ANSI-safe.
+std::string StatePathForAppleWin(const std::filesystem::path& stateFile)
+{
+    const std::filesystem::path dir = stateFile.parent_path();
+    const std::string name = ImagePathForAppleWin(stateFile.filename());   // no short form for a bare name: ANSI or error
+    if (dir.empty())
+        return name;
+    std::string out = ImagePathForAppleWin(dir);
+    if (!out.empty() && out.back() != '\\' && out.back() != '/')
+        out += '\\';
+    return out + name;
+}
+
+// For messages: UTF-8, never a failed ANSI conversion.
+std::string Shown(const std::filesystem::path& p)
+{
+    const std::u8string u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+
 }  // namespace
+
+void Emulator::SetShortPathsDisabledForTest(bool disabled) { g_noShortPathsForTest = disabled; }
 
 void Emulator::InsertDisk(int drive, const std::filesystem::path& image, bool writeProtected)
 {
@@ -1232,7 +1259,7 @@ void Emulator::InsertDisk(int drive, const std::filesystem::path& image, bool wr
         // InsertDisk() itself reports nothing; the Win32 UI calls this separately. It routes AppleWin's human-readable
         // text through FrameMessageBox, which HarnessFrame records.
         card.NotifyInvalidImage(drive, path, err);
-        std::string what = "Emulator: cannot insert " + path + " (image error " + std::to_string(int(err)) + ")";
+        std::string what = "Emulator: cannot insert " + Shown(image) + " (image error " + std::to_string(int(err)) + ")";
         const auto& msgs = HostFrame().messages();
         for (size_t i = before; i < msgs.size(); ++i)
             what += "\n  " + msgs[i];
@@ -1545,7 +1572,7 @@ std::vector<NamedImage> ImagesNamedBy(const std::filesystem::path& stateFile)
 {
     std::ifstream in(stateFile, std::ios::binary);
     if (!in)
-        throw std::runtime_error("LoadSnapshot: cannot read " + stateFile.string());
+        throw std::runtime_error("LoadSnapshot: cannot read " + Shown(stateFile));
     std::vector<NamedImage> images;
     std::string line;
     static const std::string kFilename = "Filename:", kAbsolute = "Absolute Path:";
@@ -1654,7 +1681,7 @@ public:
             throw std::runtime_error("LoadSnapshot: cannot read the current directory");
         previous_.resize(got);
         if (!SetCurrentDirectoryW(dir.c_str()))
-            throw std::runtime_error("LoadSnapshot: cannot make " + dir.string() + " the current directory (error " +
+            throw std::runtime_error("LoadSnapshot: cannot make " + Shown(dir) + " the current directory (error " +
                                      std::to_string(GetLastError()) + ")");
     }
     ~ScopedCurrentDirectory() { SetCurrentDirectoryW(previous_.c_str()); }
@@ -1672,7 +1699,7 @@ void PreLoadChecks(const std::filesystem::path& stateFile, const std::vector<std
     try {
         std::error_code ec;
         if (!std::filesystem::is_regular_file(stateFile, ec))
-            throw SnapshotPreLoadError("LoadSnapshot: no save state at " + stateFile.string());
+            throw SnapshotPreLoadError("LoadSnapshot: no save state at " + Shown(stateFile));
         CheckImagesExist(stateFile, expected);
     } catch (const SnapshotPreLoadError&) {
         throw;
@@ -1688,7 +1715,7 @@ std::filesystem::path AbsoluteStateFile(const std::filesystem::path& stateFile)
     std::error_code ec;
     std::filesystem::path p = std::filesystem::absolute(stateFile, ec);
     if (ec)
-        throw SnapshotPreLoadError("LoadSnapshot: cannot make " + stateFile.string() + " absolute: " + ec.message());
+        throw SnapshotPreLoadError("LoadSnapshot: cannot make " + Shown(stateFile) + " absolute: " + ec.message());
     return p.make_preferred();
 }
 
@@ -1767,9 +1794,9 @@ SnapshotMeta Emulator::SaveSnapshot(const std::filesystem::path& stateFile)
     }
 
     const size_t before = HostFrame().messages().size();
-    Snapshot_SetFilename(std::filesystem::path(stateFile).make_preferred().string());
+    Snapshot_SetFilename(StatePathForAppleWin(std::filesystem::path(stateFile).make_preferred()));
     Snapshot_SaveState();
-    ThrowIfNewMessages(before, "Emulator::SaveSnapshot: AppleWin could not save " + stateFile.string() + ":");
+    ThrowIfNewMessages(before, "Emulator::SaveSnapshot: AppleWin could not save " + Shown(stateFile) + ":");
     return meta;
 }
 
@@ -1796,7 +1823,7 @@ void Emulator::LoadSnapshot(const std::filesystem::path& stateFile, const Snapsh
     {
         const auto cwd = EnterStateDirectory(state);
         PreLoadChecks(state, nullptr);
-        Snapshot_SetFilename(state.string());
+        Snapshot_SetFilename(StatePathForAppleWin(state));
         Snapshot_LoadState();
     }
     g_nAppMode = MODE_RUNNING;   // as before the load (AppleWin's own load leaves it; a failed one may not)
@@ -1806,7 +1833,7 @@ void Emulator::LoadSnapshot(const std::filesystem::path& stateFile, const Snapsh
         // back so that InsertDisk and PowerCycle work; the machine state is undefined until PowerCycle.
         try { RestoreCards(cards); } catch (...) {}
         DiscardInput();
-        ThrowIfNewMessages(before, "Emulator::LoadSnapshot: AppleWin could not load " + stateFile.string() + ":");
+        ThrowIfNewMessages(before, "Emulator::LoadSnapshot: AppleWin could not load " + Shown(stateFile) + ":");
     }
 
     // Cycle origin: EmulatedCycles() continues from the checkpoint's (the save state restores g_nCumulativeCycles).

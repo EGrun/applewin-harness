@@ -39,7 +39,7 @@ The server starts the harness (`--serve`), creates the session and serves MCP on
 | `look` | none | Returns the screen as a 560x384 PNG image. |
 | `read_screen` | none | Returns the video mode, then 24 lines of text. Listed only with `--text-screen`. Character mapping: see `get_text_screen` in [docs/api_spec.md](../docs/api_spec.md). |
 | `listen` | `ms?` (0-60000, default 0) | Lets `ms` of time pass first (if above 0), then returns the `sound_started` and `sound_stopped` events (with duration and dominant frequency) since the last `listen`. |
-| `insert_disk` | `drive` (1 or 2), `path`, `write_protected?` | Puts a floppy image in slot 6 drive 1 or 2, replacing any disk there. A relative `path` is taken from the server's working directory. The harness works on a copy; the original is never written. |
+| `insert_disk` | `drive` (1 or 2), `path`, `write_protected?` | Puts a floppy image in slot 6 drive 1 or 2, replacing any disk there. A relative `path` is taken from the server's working directory. The harness works on a copy; the original is never written. Paths starting with `\` or `//` (UNC shares, `\?\` and `\.\` device paths) are rejected. |
 | `eject_disk` | `drive` (1 or 2) | Takes the floppy out of the drive. An empty drive is an error. |
 
 No other operator method (sessions, checkpoints, export, speed, stepping) is reachable through the server.

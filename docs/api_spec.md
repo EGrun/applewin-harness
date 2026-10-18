@@ -173,10 +173,11 @@ Returns `{ session_id }`.
 
 **`insert_disk`** `{ slot: 6, drive: 1|2, path, write_protected?: bool = false }` — puts a floppy in the drive and replies `{}`.
 - `path` must be absolute (`-32602`), and a missing file is `-32005`. Any slot other than 6 is `-32602`.
-- Like `create_session`, it copies the image into the work directory and mounts the copy. The original is never opened for writing (D5). Each insert gets a working copy of its own (`%TEMP%pplewin-harness\<pid>\insert-<n>\`), so the same image inserted twice, or in both drives, never collides.
+- Like `create_session`, it copies the image into the work directory and mounts the copy. The original is never opened for writing (D5). Each insert gets a working copy of its own (`%TEMP%\applewin-harness\<pid>\insert-<n>\`), so the same image inserted twice, or in both drives, never collides.
 - A disk already in the drive is flushed and ejected first. Its working copy is kept until `close_session`.
 - It works in both run modes and takes effect between frames, on the emulator thread; it doesn't pause or reset the machine, and in a stepped session no time passes.
 - An image AppleWin can't mount (for example a file whose format is not recognized) is `-32005` with AppleWin's reason, and the drive is left as it was. Putting the previous disk back may reset the drive's rotational position.
+- If the new image fails to mount and putting the previous disk back also fails, the drive is left empty. The reply is `-32005`, with a message ending in `putting the previous disk back failed: <reason>`. The session stays usable.
 
 **`eject_disk`** `{ slot: 6, drive: 1|2 }` — flushes the drive's current track, unmounts it and replies `{}`. An empty drive is `-32005`. Any slot other than 6 is `-32602`. The working copy is kept until `close_session`.
 

@@ -200,6 +200,8 @@ class Machine:
 
     def insert_disk(self, drive, path, write_protected):
         path = os.path.abspath(path)   # relative paths are taken against the adapter's working directory
+        if path.startswith(("\\\\", "//")):   # UNC shares and device paths (\?\, \.\): the agent is the untrusted side
+            raise ToolError("UNC and device paths (starting with \\ or //) are not allowed; use a local path")
         with self.lock:
             self.rpc(self.operator, "insert_disk", slot=6, drive=drive, path=path,
                      write_protected=write_protected)
@@ -275,7 +277,7 @@ def build_server(args, machine):
         already there. The machine keeps running and is NOT rebooted: the program on the screen does not notice
         until it reads the disk. After a swap, DOS needs a command such as CATALOG (or CATALOG,D2 for drive 2) to
         see the new disk. path is a disk image file (a relative path is taken from the server's working
-        directory). The original file is never written to; the machine works on a copy. Set write_protected to
+        directory; paths starting with two backslashes or two slashes are rejected). The original file is never written to; the machine works on a copy. Set write_protected to
         stop the machine writing to the disk."""
         return await asyncio.to_thread(machine.insert_disk, drive, path, write_protected)
 

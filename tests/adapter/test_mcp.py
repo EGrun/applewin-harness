@@ -279,6 +279,9 @@ class DiskSwapTest(AdapterTestCase):
                 self.assertIn("disk not found", text_of(missing))   # the harness's message (the SDK prefixes ToolError text), not an opaque failure
                 bad_drive = await call(s, "insert_disk", drive=3, path=FIXTURE_DISK)
                 self.assertTrue(bad_drive.is_error)
+                unc = await call(s, "insert_disk", drive=1, path="\\\\server\\share\\x.dsk")
+                self.assertTrue(unc.is_error)
+                self.assertIn("not allowed", text_of(unc))   # rejected by the adapter, never sent to the harness
         self.run_async(go)
 
 

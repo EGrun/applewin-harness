@@ -99,6 +99,15 @@ class LicenseFilesTest(unittest.TestCase):
         self.assertIn(commit, notice)
         self.assertIn("GPL", notice)
 
+    def test_the_repository_tracks_no_disk_images(self):
+        out = subprocess.run(["git", "-C", REPO_ROOT, "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=60).stdout
+        files = [p for p in out.decode("utf-8").split(chr(0)) if p]
+        self.assertTrue(files)
+        images = [p for p in files if p.lower().endswith((".dsk", ".do", ".po", ".nib", ".woz"))
+                  and not p.replace("\\", "/").startswith("external/")]
+        self.assertEqual(images, [], "disk images in the repository")
+
     def test_version_file(self):
         self.assertEqual(read_text(os.path.join(REPO_ROOT, "VERSION")).strip(), "0.1.0")
 

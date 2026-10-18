@@ -131,14 +131,20 @@ class QueueLimitTest(LimitTestCase):
     def drain(self, op, agent, input_ids):
         """Steps until input_applied has arrived for every id."""
         waiting = set(input_ids)
-        for _ in range(80):
+        stepped = 0
+        seen = 0
+        for _ in range(160):   # 48,000 frames: twice the 24,000 estimated for 4,096 keys; exits early on success
             op.call("step_frames", frames=300, timeout=60.0)
+            stepped += 300
             for note in agent.drain_notifications(quiet=0.05, limit=2.0):
                 if note.get("method") == "input_applied":
+                    seen += 1
                     waiting.discard(note["params"]["input_id"])
             if not waiting:
                 return
-        self.fail("inputs {} were never applied".format(sorted(waiting)))
+        self.fail("inputs {} were never applied after {} frames ({} input_applied notifications seen; input_applied "
+                  "covers a whole type_text, so none of its up to {} keys is reported as applied before the last)"
+                  .format(sorted(waiting), stepped, seen, QUEUE_LIMIT))
 
     def test_a_full_queue_rejects_one_more_key_and_drains_normally(self):
         h = self.launch()

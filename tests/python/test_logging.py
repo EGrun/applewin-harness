@@ -199,11 +199,12 @@ class DiskWrittenTest(LoggingTestCase):
         op.call("step_frames", frames=120, timeout=60.0)
         self.assertEqual([n["params"] for n in self.written(op)], [{"slot": 6, "drive": 1}])   # a second burst
 
-    def burst_ended_early_by(self, name, make_call):
+    def burst_ended_early_by(self, name, make_call, other_drive=False):
         """SAVE in stepped mode and stop 6-frame steps at the third change of the working copy: the head has moved
         off the last track written, so the burst is still open (the last write is under 1 emulated second old) and
         the SAVE has no more writes to come. `make_call(op, dest)` is the early end; it must report exactly one
-        disk_written before its reply, and the quiet period after it must report none."""
+        disk_written before its reply, and the quiet period after it must report none. With other_drive, `make_call`
+        only touches drive 2: drive 1's burst goes on and ends once, at its quiet period, and drive 2 reports nothing."""
         h = self.launch()
         op, agent = self.booted(h)
         op.call("subscribe_disk_writes")
@@ -223,6 +224,12 @@ class DiskWrittenTest(LoggingTestCase):
         make_call(op, os.path.join(self.tmp_dir(), name + ".dsk"))
         # The reader queues a notification before the reply that followed it on the wire, so one that was sent before
         # the reply is already here; none may arrive later.
+        if other_drive:
+            with self.assertRaises(TimeoutError):
+                op.next_notification(timeout=0)
+            op.call("step_frames", frames=120, timeout=60.0)
+            self.assertEqual([n["params"] for n in self.written(op)], [{"slot": 6, "drive": 1}])
+            return
         first = op.next_notification(timeout=0)
         self.assertEqual((first["method"], first["params"]), ("disk_written", {"slot": 6, "drive": 1}))
         op.call("step_frames", frames=120, timeout=60.0)   # more than 1 emulated second of quiet
@@ -238,6 +245,12 @@ class DiskWrittenTest(LoggingTestCase):
 
     def test_checkpoint_ends_the_burst_before_its_reply(self):
         self.burst_ended_early_by("cp", lambda op, dest: op.call("checkpoint", name="early"))
+
+    def test_insert_and_eject_on_the_other_drive_leave_an_open_burst_alone(self):
+        def swap(op, dest):
+            op.call("insert_disk", slot=6, drive=2, path=DOS_IMAGE)
+            op.call("eject_disk", slot=6, drive=2)
+        self.burst_ended_early_by("other", swap, other_drive=True)
 
     def test_eject_disk_ends_the_burst_before_its_reply(self):
         self.burst_ended_early_by("eject", lambda op, dest: op.call("eject_disk", slot=6, drive=1))

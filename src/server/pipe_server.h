@@ -27,6 +27,7 @@ struct Connection {
     // (a client that does not read) closes the connection. Throws std::length_error for a message over 16 MiB.
     virtual void Send(const nlohmann::json& message) = 0;
     virtual uint64_t id() const = 0;   // unique within the process; never 0
+    virtual bool closed() const = 0;   // true once the connection has closed (any thread)
 };
 using ConnectionPtr = std::shared_ptr<Connection>;
 

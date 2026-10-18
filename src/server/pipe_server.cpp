@@ -110,6 +110,7 @@ public:
 
     Role role() const override { return role_.load(); }
     uint64_t id() const override { return id_; }
+    bool closed() const override { return closed_.load(); }
 
     // Queues one whole message and returns at once. A backlog over kMaxBacklogBytes closes the connection (the client
     // is not reading). Throws std::length_error for a message over 16 MiB (EncodeMessage).

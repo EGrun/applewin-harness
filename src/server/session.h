@@ -86,7 +86,7 @@ private:
     // disk_written: samples each drive's write light and sends one notification per write burst. `endOpen` ends every
     // open burst now (or just `onlyDrive`'s, 0 or 1); ResetDiskBursts forgets them without a notification.
     void SampleDiskWrites(bool endOpen = false, int onlyDrive = -1);
-    void ResetDiskBursts();
+    void ResetDiskBursts(int onlyDrive = -1);   // all drives, or just 0 / 1
     void SendFrameReady();                   // frame_ready to the subscribers that are due (the present observer)
     bool PauseRunning();                     // Running: run until the next present, then Paused; false if the window closed
     void Cleanup() noexcept;                 // emulator shut down, working copies, work dir and INI removed

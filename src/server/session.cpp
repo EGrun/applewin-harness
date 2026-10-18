@@ -911,6 +911,7 @@ json Session::SubscribeDiskWrites(const ConnectionPtr& connection)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
     RequireUsable();
+    std::erase_if(diskWriteSubscribers_, [](const auto& s) { return s.second->closed(); });   // dead connections
     if (diskWriteSubscribers_.empty()) ResetDiskBursts();   // only writes from now on are reported
     diskWriteSubscribers_[connection->id()] = connection;
     return json::object();
@@ -923,11 +924,12 @@ json Session::UnsubscribeDiskWrites(const ConnectionPtr& connection)
     return json::object();
 }
 
-void Session::ResetDiskBursts()
+void Session::ResetDiskBursts(int onlyDrive)
 {
     try {
         for (int drive = 0; drive < 2; ++drive)
-            diskBursts_[drive] = DiskBurst{false, emulator_.DiskWriteLight(drive)};
+            if (onlyDrive < 0 || drive == onlyDrive)
+                diskBursts_[drive] = DiskBurst{false, emulator_.DiskWriteLight(drive)};
     } catch (...) {
     }
 }
@@ -936,6 +938,7 @@ void Session::SampleDiskWrites(bool endOpen, int onlyDrive)
 {
     // Also called from the present observer inside a run: must not throw.
     try {
+        std::erase_if(diskWriteSubscribers_, [](const auto& s) { return s.second->closed(); });
         if (diskWriteSubscribers_.empty() || state_ == State::NoSession) return;
         for (int drive = 0; drive < 2; ++drive) {
             if (onlyDrive >= 0 && drive != onlyDrive) continue;
@@ -1280,7 +1283,7 @@ json Session::InsertDisk(const json& params)
         SampleDiskWrites(true, drive);   // the disk being replaced: its write burst ends
         if (previous) emulator_.EjectDisk(drive);   // flushes the track first
         emulator_.InsertDisk(drive, copy->Path(), writeProtected);
-        ResetDiskBursts();
+        ResetDiskBursts(drive);
     } catch (const std::exception& e) {
         // AppleWin's own image-open result said no: leave the drive as it was and name the user's image.
         std::string what = e.what();
@@ -1312,7 +1315,7 @@ json Session::EjectDisk(const json& params)
     if (!occupied) throw RpcError{kDiskNotFound, "drive " + std::to_string(drive + 1) + " is empty"};
     SampleDiskWrites(true, drive);   // an open write burst ends at eject_disk
     emulator_.EjectDisk(drive);   // flushes the track first; the working copy stays until close_session
-    ResetDiskBursts();
+    ResetDiskBursts(drive);
     return json::object();
 }
 

@@ -32,6 +32,10 @@
     <ClCompile Include="..\src\core\base64.cpp" />
     <ClCompile Include="..\src\core\pacing.cpp" />
     <ClCompile Include="..\src\host\emulator.cpp" />
+    <ClCompile Include="..\src\host\log.cpp" />
+    <ClCompile Include="..\src\host\harness_version.cpp">
+      <PreprocessorDefinitions>HARNESS_VERSION="$(HarnessVersion)";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="..\src\host\harness_frame.cpp" />
     <ClCompile Include="..\src\host\applewin_host.cpp" />
     <ClCompile Include="..\src\core\working_copy.cpp" />

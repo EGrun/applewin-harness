@@ -46,7 +46,7 @@ The first message on every connection must be `hello`:
 ```
 
 - The harness creates one token per role when it starts. It passes them to whoever launched it in the announcement line on stdout, and never writes them to disk.
-- The response is `{ protocol_version: "0.3", role, display_mode: "windowed" | "headless" }`.
+- The response is `{ protocol_version: "0.3", role, display_mode: "windowed" | "headless", server_version }`. `server_version` is the harness version (the root `VERSION` file, for example `"0.1.0"`).
 - A `protocol_version` other than `"0.3"` returns `-32600` and the server closes the connection.
 - A wrong token or role, or any method other than `hello` as the first message, returns `-32001` and the server closes the connection. So does malformed JSON or an invalid request as the first message (the error reply is sent first).
 - A connection that has not completed `hello` within 10 seconds is closed, which frees its slot.

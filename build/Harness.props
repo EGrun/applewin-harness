@@ -3,6 +3,8 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <HarnessRoot>$(MSBuildThisFileDirectory)..\</HarnessRoot>
+    <!-- The single source of the version: the root VERSION file (harness_version.cpp is the only user; it recompiles when this changes). -->
+    <HarnessVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION').Trim())</HarnessVersion>
     <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
   </PropertyGroup>

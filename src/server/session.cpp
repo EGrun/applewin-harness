@@ -1,4 +1,5 @@
 #include "server/session.h"
+#include "host/log.h"
 #include "server/protocol.h"
 #include "core/audio_capture.h"
 #include "core/base64.h"
@@ -206,7 +207,7 @@ int Session::RunMainLoop()
             if (fatalError_) {
                 const std::string fatal = fatalError_();
                 if (!fatal.empty()) {
-                    std::cerr << "error: " << fatal << std::endl;
+                    log::Error(log::Component::Session, fatal);
                     rc = 1;
                     break;
                 }
@@ -230,10 +231,10 @@ int Session::RunMainLoop()
             if (!DrainCommands()) break;
         }
     } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << std::endl;
+        log::Error(log::Component::Session, e.what());
         rc = 1;
     } catch (...) {
-        std::cerr << "error: unknown exception" << std::endl;
+        log::Error(log::Component::Session, "unknown exception");
         rc = 1;
     }
     Cleanup();
@@ -254,10 +255,56 @@ bool Session::DrainCommands()
     return true;
 }
 
+namespace {
+
+// Method names are logged only when this dispatcher knows them: a client-chosen name is client text, and is never logged.
+bool IsKnownMethod(const std::string& m)
+{
+    static const char* const kNames[] = {
+        "create_session", "close_session", "pause", "resume", "step_frames", "get_frame", "get_text_screen",
+        "subscribe_frames", "type_text", "press_key", "set_joystick", "set_speed", "get_speed", "get_audio",
+        "subscribe_audio", "checkpoint", "restore_checkpoint", "list_checkpoints", "delete_checkpoint",
+        "get_state_checksum", "step_cycles", "list_disks", "export_disk", "insert_disk", "eject_disk",
+        "subscribe_disk_writes", "unsubscribe_disk_writes"};
+    for (const char* n : kNames)
+        if (m == n) return true;
+    return false;
+}
+
+// The info lines the spec lists: session create/close, checkpoint/restore, disk insert/eject/export. Only the method
+// is named; no parameter (a path, a name, typed text) is ever part of a log line.
+void LogSuccess(const std::string& method)
+{
+    if (method == "create_session") log::Info(log::Component::Session, "session created");
+    else if (method == "close_session") log::Info(log::Component::Session, "session closed");
+    else if (method == "checkpoint") log::Info(log::Component::Session, "checkpoint saved");
+    else if (method == "restore_checkpoint") log::Info(log::Component::Session, "checkpoint restored");
+    else if (method == "insert_disk") log::Info(log::Component::Session, "disk inserted");
+    else if (method == "eject_disk") log::Info(log::Component::Session, "disk ejected");
+    else if (method == "export_disk") log::Info(log::Component::Session, "disk exported");
+}
+
+// A rejected request (-32602, -32010: warning) or a failed one (-32603: error). Other errors (no session yet, wrong
+// state, unknown method) are the client's to handle, not logged. Rate limited per connection by the logger.
+void LogFailure(const std::string& method, int code, uint64_t connection)
+{
+    const bool invalid = code == kInvalidParams, internal = code == kInternalError;
+    if (!invalid && !internal) return;
+    const std::string what = IsKnownMethod(method) ? method : "request";
+    const std::string text = what + (invalid ? " rejected: invalid params (" : " failed: internal error (") +
+                             std::to_string(code) + ")";
+    if (invalid) log::Warning(log::Component::Session, text, connection);
+    else log::Error(log::Component::Session, text, connection);
+}
+
+}  // namespace
+
 void Session::Dispatch(const Command& command)
 {
     const ConnectionPtr& conn = command.connection;
+    const uint64_t connId = conn ? conn->id() : 0;
     json reply;
+    if (state_ != State::NoSession) log::SetEmulatedMs(double(emulator_.EmulatedCycles()) * 1000.0 / kAudioBaseClockHz);
     try {
         if (!command.params.is_null() && !command.params.is_object())
             throw RpcError{kInvalidParams, "params must be an object"};
@@ -293,10 +340,13 @@ void Session::Dispatch(const Command& command)
             throw RpcError{kInternalError, "not implemented"};   // stub until M6 Task 4
         else throw RpcError{kMethodNotFound, "method not found: " + m};
         reply = MakeResult(command.id, std::move(result));
+        LogSuccess(command.method);
     } catch (const RpcError& e) {
         reply = MakeError(command.id, e.code, e.message);
+        LogFailure(command.method, e.code, connId);
     } catch (const std::exception& e) {
         reply = MakeError(command.id, kInternalError, e.what());
+        LogFailure(command.method, kInternalError, connId);
     }
     try {
         conn->Send(reply);
@@ -799,10 +849,10 @@ void Session::SendSoundEvents()
         }
     } catch (const std::exception& e) {
         static bool logged = false;
-        if (!logged) { logged = true; std::cerr << "warning: sound events: " << e.what() << std::endl; }
+        if (!logged) { logged = true; log::Warning(log::Component::Audio, std::string("sound events: ") + e.what()); }
     } catch (...) {
         static bool logged = false;
-        if (!logged) { logged = true; std::cerr << "warning: sound events: unknown exception" << std::endl; }
+        if (!logged) { logged = true; log::Warning(log::Component::Audio, "sound events: unknown exception"); }
     }
 }
 

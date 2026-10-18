@@ -1,4 +1,6 @@
 #include "server/pipe_server.h"
+#include "host/log.h"
+#include "host/harness_version.h"
 #include "server/protocol.h"
 #include <windows.h>
 #include <aclapi.h>
@@ -540,6 +542,7 @@ struct PipeServer::Impl {
         constexpr DWORD kDrainMs = 2000;
         constexpr DWORD kHelloTimeoutMs = 10000;
         std::thread writer;
+        bool authedAtEnd = false;
         try {
             writer = std::thread([conn] { conn->WriterLoop(); });
             Handle readEvent(NewEvent());
@@ -555,7 +558,9 @@ struct PipeServer::Impl {
                 if (!len) break;
                 body.resize(*len);
                 if (!conn->ReadExact(reinterpret_cast<uint8_t*>(body.data()), body.size(), readEvent.h, deadline)) break;
-                if (!HandleMessage(conn, body, authed)) break;
+                const bool keepOpen = HandleMessage(conn, body, authed);
+                authedAtEnd = authed;
+                if (!keepOpen) break;
             }
         } catch (...) {
             // Out of memory or similar: drop just this connection.
@@ -565,6 +570,8 @@ struct PipeServer::Impl {
             if (WaitForSingleObject(writer.native_handle(), kDrainMs) != WAIT_OBJECT_0) conn->Cancel();
             writer.join();
         }
+        if (authedAtEnd)
+            log::Info(log::Component::Server, "connection " + std::to_string(conn->id()) + " closed", conn->id());
         conn->Finish();
         done.store(true);
         active.fetch_sub(1);
@@ -626,13 +633,18 @@ struct PipeServer::Impl {
             }
             if (!ok) {
                 conn->Send(MakeError(id, kUnauthorized, "unauthorized"));
+                log::Warning(log::Component::Server, "connection " + std::to_string(conn->id()) + " rejected: bad hello",
+                             conn->id());
                 return false;
             }
-            conn->SetRole(role);
             authed = true;
+            log::Info(log::Component::Server,
+                      "connection " + std::to_string(conn->id()) + " opened (" + roleName + ")", conn->id());
             conn->Send(MakeResult(id, json{{"protocol_version", kProtocolVersion},
                                            {"role", roleName},
+                                           {"server_version", Version()},
                                            {"display_mode", display == DisplayMode::Headless ? "headless" : "windowed"}}));
+            conn->SetRole(role);   // after the reply is queued: a `log` notification must never precede it
             return true;
         }
 
@@ -643,6 +655,10 @@ struct PipeServer::Impl {
         }
         if (conn->role() == Role::Agent && isOperatorOnly && isOperatorOnly(method)) {
             conn->Send(MakeError(id, kUnauthorized, "operator role required"));
+            // method is a known operator-only name here, never client text
+            log::Warning(log::Component::Server,
+                         "connection " + std::to_string(conn->id()) + ": agent called operator-only " + method,
+                         conn->id());
             return true;
         }
         try {
@@ -719,6 +735,22 @@ void PipeServer::Stop()
     for (auto& r : all) r.conn->Cancel();
     for (auto& r : all)
         if (r.thread.joinable()) r.thread.join();
+}
+
+void PipeServer::BroadcastToOperators(const nlohmann::json& message)
+{
+    std::vector<std::shared_ptr<PipeConnection>> operators;
+    {
+        std::lock_guard lock(impl_->recordsMutex);
+        for (auto& r : impl_->records)
+            if (r.conn->role() == Role::Operator) operators.push_back(r.conn);
+    }
+    for (auto& c : operators) {
+        try {
+            c->Send(message);
+        } catch (...) {
+        }
+    }
 }
 
 std::string PipeServer::FatalError() const

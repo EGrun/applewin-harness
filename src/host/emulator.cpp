@@ -1,4 +1,5 @@
 #include "host/emulator.h"
+#include "host/log.h"
 #include "host/applewin_host.h"
 #include "host/harness_frame.h"
 #include "host/window.h"
@@ -803,7 +804,7 @@ void StartWindow()
     HostFrame().g_hFrameWindow = g_window->Handle();
     g_audioOutput = AudioOutput::Open(g_window->Handle());
     if (!g_audioOutput)
-        std::cerr << "warning: no audio device; running without sound" << std::endl;
+        log::Warning(log::Component::Audio, "no audio device; running without sound");
 }
 
 }  // namespace

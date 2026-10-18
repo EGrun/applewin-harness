@@ -1,4 +1,5 @@
 // AppleWinHarness.exe --serve (spec: docs/specs/m3.md, Part A "Launch", "Transport", pass conditions 2, 3 and 6).
+#include "host/harness_version.h"
 #include "doctest/doctest.h"
 #include "support/golden.h"
 #include "support/paths.h"
@@ -190,10 +191,10 @@ TEST_CASE("server: hello replies with the protocol version, role and display mod
     const auto r1 = op.Call("hello", HelloParams("operator", s.announcement.operatorToken));
     const auto r2 = agent.Call("hello", HelloParams("agent", s.announcement.agentToken));
     CHECK(Dump(r1) == json({{"jsonrpc", "2.0"}, {"id", 1},
-                            {"result", {{"protocol_version", "0.3"}, {"role", "operator"}, {"display_mode", "headless"}}}})
+                            {"result", {{"protocol_version", "0.3"}, {"role", "operator"}, {"server_version", harness::Version()}, {"display_mode", "headless"}}}})
                           .dump());
     CHECK(Dump(r2) == json({{"jsonrpc", "2.0"}, {"id", 1},
-                            {"result", {{"protocol_version", "0.3"}, {"role", "agent"}, {"display_mode", "headless"}}}})
+                            {"result", {{"protocol_version", "0.3"}, {"role", "agent"}, {"server_version", harness::Version()}, {"display_mode", "headless"}}}})
                           .dump());
 }
 

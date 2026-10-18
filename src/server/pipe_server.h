@@ -35,7 +35,7 @@ using ConnectionPtr = std::shared_ptr<Connection>;
 // - framing: 4-byte little-endian length; 0 or over 16 MiB closes the connection; a truncated message closes it;
 // - the handshake: the first message must be hello { protocol_version: "0.3", role, token }. A wrong token or role,
 //   or any other method first: -32001 and close. Another protocol_version: -32600 and close. The reply is
-//   { protocol_version: "0.3", role, display_mode: "windowed" | "headless" };
+//   { protocol_version: "0.3", role, display_mode: "windowed" | "headless", server_version };
 // - parse errors: -32700; not a JSON-RPC 2.0 request object: -32600. After hello the connection stays open; before
 //   hello it closes after the reply (R10). Client notifications (no id) are ignored after hello;
 // - roles: an agent connection calling a method for which isOperatorOnly returns true gets -32001 and stays open.
@@ -62,6 +62,9 @@ public:
     // Empty while healthy. Otherwise the server has stopped accepting and closed every connection (for example a
     // later pipe instance turned out not to be ours: the name was taken over); the process should exit with 1.
     std::string FatalError() const;
+    // Queues the message on every authenticated operator connection's send queue (never blocks; thread-safe, callable
+    // from any thread). Used for `log` notifications. Does nothing before Start and after Stop.
+    void BroadcastToOperators(const nlohmann::json& message);
 
     static std::wstring RandomPipeName();   // \\.\pipe\applewin-harness-<32 random hex>
     static std::string RandomToken();       // 64 hex characters from 32 BCryptGenRandom bytes

@@ -112,7 +112,9 @@ class M2OverPipeTest(PipeTestCase):
     def run_m2_scenario(self, headless):
         h = self.launch(headless=headless)
         op = h.connect("operator")
-        self.assertEqual(op.hello_reply, {"protocol_version": "0.3", "role": "operator",
+        with open(os.path.join(REPO_ROOT, "VERSION"), encoding="ascii") as f:
+            version = f.read().strip()
+        self.assertEqual(op.hello_reply, {"protocol_version": "0.3", "role": "operator", "server_version": version,
                                           "display_mode": "headless" if headless else "windowed"})
         created = op.call("create_session", disks=dos_disks(), run_mode="stepped")
         self.assertIn("session_id", created)

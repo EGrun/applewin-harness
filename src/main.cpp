@@ -1,4 +1,6 @@
 #include "host/emulator.h"
+#include "host/log.h"
+#include "host/harness_version.h"
 #include "core/png_writer.h"
 #include "core/sha256.h"
 #include "core/working_copy.h"
@@ -36,7 +38,7 @@ struct Args {
     bool serve = false;
     bool headless = false;
     bool realtime = false;
-    std::string logFormat = "text";   // --log-format text|json (accepted; applied in M6 Task 2)
+    harness::log::Format logFormat = harness::log::Format::Text;   // --log-format text|json
     std::optional<std::filesystem::path> disk1;
     std::optional<std::filesystem::path> png;
     std::vector<Step> steps;
@@ -45,7 +47,7 @@ struct Args {
 int Usage()
 {
     std::cerr << "usage: AppleWinHarness.exe [--headless] [--realtime] [--disk1 <image>] [--png <path>] [step ...]\n"
-                 "       AppleWinHarness.exe --serve [--headless]\n"
+                 "       AppleWinHarness.exe --serve [--headless] [--log-format text|json]\n"
                  "step: --frames <n> | --type <text>\n"
                  "  --type escapes: \\r and \\n = Return, \\\\ = backslash; text is 0x20-0x7E.\n"
                  "  --headless needs at least one step; without steps a window runs until closed.\n";
@@ -99,8 +101,8 @@ bool ParseArgs(int argc, wchar_t** argv, Args& a)
         } else if (k == L"--log-format" && hasValue && !haveLogFormat) {
             haveLogFormat = true;
             const std::wstring v = argv[++i];
-            if (v == L"text") a.logFormat = "text";
-            else if (v == L"json") a.logFormat = "json";
+            if (v == L"text") a.logFormat = harness::log::Format::Text;
+            else if (v == L"json") a.logFormat = harness::log::Format::Json;
             else return false;
         } else if (k == L"--disk1" && hasValue && !a.disk1) {
             a.disk1 = std::filesystem::path(argv[++i]);
@@ -207,12 +209,12 @@ int Run(const Args& a)
                 // Windowed, no steps: run until the window is closed.
                 while (emu.RunRealtime(std::chrono::milliseconds(100))) {}
             } else if (!RunSteps(emu, a)) {
-                std::cerr << "error: window closed\n";
+                harness::log::Error(harness::log::Component::Main, "window closed");
                 rc = kExitFailure;
             } else {
                 harness::FrameView frame = emu.Frame();
                 if (a.png && !harness::WritePngFile(*a.png, frame)) {
-                    std::cerr << "error: cannot write " << a.png->string() << "\n";
+                    harness::log::Error(harness::log::Component::Main, "cannot write " + a.png->string());
                     rc = kExitFailure;
                 } else {
                     std::cout << "sha256 " << harness::FrameHash(frame) << "\n";
@@ -237,10 +239,10 @@ int Run(const Args& a)
         }
         ReleaseEmulator(emu);
     } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n";
+        harness::log::Error(harness::log::Component::Main, e.what());
         rc = kExitFailure;
     } catch (...) {
-        std::cerr << "error: unknown exception" << std::endl;
+        harness::log::Error(harness::log::Component::Main, "unknown exception");
         rc = kExitFailure;
     }
     std::error_code ec;
@@ -287,7 +289,7 @@ int Serve(const Args& a)
         // Exit (0, normal cleanup) when the launching process exits. Opened before the announcement, so a launcher
         // that exits right after reading it is still seen; without a handle there is no watch.
         HANDLE parent = OpenParentProcess();
-        if (!parent) std::cerr << "note: parent process not watched\n";
+        if (!parent) harness::log::Info(harness::log::Component::Main, "parent process not watched");
         const auto display = a.headless ? harness::DisplayMode::Headless : harness::DisplayMode::Windowed;
         const std::wstring pipe = harness::PipeServer::RandomPipeName();
         harness::Tokens tokens{harness::PipeServer::RandomToken(), harness::PipeServer::RandomToken()};
@@ -300,10 +302,21 @@ int Serve(const Args& a)
             [&session](harness::ConnectionPtr c, nlohmann::json request) { session.Post(std::move(c), std::move(request)); },
             &harness::Session::IsOperatorOnly, display);
         server.Start();
+        // `log` notifications: every warning and error, to the operator connections' send queues (never blocks).
+        namespace log = harness::log;
+        struct SinkGuard {   // declared after the server: removed before the server is destroyed
+            ~SinkGuard() { log::SetOperatorSink({}); }
+        } sinkGuard;
+        log::SetOperatorSink([&server](log::Level level, const std::string& message, double emulatedMs) {
+            server.BroadcastToOperators(harness::MakeNotification(
+                "log", nlohmann::json{{"level", log::LevelName(level)}, {"message", message}, {"emulated_ms", emulatedMs}}));
+        });
         // The announcement: exactly one line, keys in the spec's order (ruling R7).
         nlohmann::ordered_json line;
         std::string pipeUtf8;   // the name is ASCII
         for (wchar_t ch : pipe) pipeUtf8.push_back(static_cast<char>(ch));
+        log::Info(log::Component::Main, std::string("AppleWinHarness ") + harness::Version() + ", pipe " + pipeUtf8 +
+                                            ", display " + (a.headless ? "headless" : "windowed"));
         line["pipe"] = pipeUtf8;
         line["agent_token"] = agentToken;
         line["operator_token"] = operatorToken;
@@ -316,7 +329,7 @@ int Serve(const Args& a)
         server.Stop();   // after the last replies (close_session's {}) have been written
         return rc;
     } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n";
+        harness::log::Error(harness::log::Component::Main, e.what());
         return kExitFailure;
     }
 }
@@ -327,5 +340,6 @@ int wmain(int argc, wchar_t** argv)
 {
     Args a;
     if (!ParseArgs(argc, argv, a)) return Usage();
+    harness::log::SetFormat(a.logFormat);
     return a.serve ? Serve(a) : Run(a);
 }

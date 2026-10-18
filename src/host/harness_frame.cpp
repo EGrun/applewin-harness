@@ -1,4 +1,5 @@
 #include "host/harness_frame.h"
+#include "host/log.h"
 
 #pragma warning(push, 3)
 #include "Interface.h"
@@ -77,7 +78,7 @@ void HarnessFrame::SetPresentHook(std::function<void()> hook)
 int HarnessFrame::FrameMessageBox(LPCSTR lpText, LPCSTR lpCaption, UINT)
 {
     std::string msg = std::string(lpCaption ? lpCaption : "") + ": " + (lpText ? lpText : "");
-    std::fprintf(stderr, "%s\n", msg.c_str());
+    log::Warning(log::Component::Emulator, msg);   // AppleWin's own message box text
     messages_.push_back(std::move(msg));
     return IDOK;
 }

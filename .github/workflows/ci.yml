@@ -80,6 +80,8 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
           $tests = Join-Path $env:GITHUB_WORKSPACE 'tests'
+          # test_mcp's module fixture launches HARNESS_EXE (default: the Debug exe, which this job doesn't build).
+          $env:HARNESS_EXE = Join-Path $env:HARNESS_BUNDLE_DIR 'AppleWinHarness.exe'
           Set-Location $env:RUNNER_TEMP
           python -m unittest discover -s "$tests\adapter" -p test_mcp.py -k BundleSmokeTest -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

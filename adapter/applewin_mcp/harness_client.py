@@ -8,6 +8,7 @@ reader thread therefore polls PeekNamedPipe (through ctypes) and only reads byte
 blocks in ReadFile, so call() can always write.
 """
 
+import collections
 import ctypes
 import json
 import msvcrt
@@ -36,6 +37,9 @@ _GetNamedPipeServerProcessId.restype = wintypes.BOOL
 def exe_path():
     """HARNESS_EXE, or bin/x64/Debug/AppleWinHarness.exe in the repository."""
     return os.environ.get("HARNESS_EXE") or os.path.join(REPO_ROOT, "bin", "x64", "Debug", "AppleWinHarness.exe")
+
+
+STDERR_KEEP_LINES = 1000
 
 
 class RpcError(Exception):
@@ -218,21 +222,30 @@ class Harness:
         self.pid = announcement["pid"]
         self._connections = []
         self.stdout_rest = b""
-        self.stderr = b""
+        self._stderr_lines = collections.deque(maxlen=STDERR_KEEP_LINES)   # the most recent lines only
         self._drainers = [
             threading.Thread(target=self._drain, args=(process.stdout, "stdout_rest"), daemon=True),
-            threading.Thread(target=self._drain, args=(process.stderr, "stderr"), daemon=True),
+            threading.Thread(target=self._drain_stderr, daemon=True),
         ]
         for t in self._drainers:
             t.start()
 
+    @property
+    def stderr(self):
+        """The most recent STDERR_KEEP_LINES lines of the harness's stderr, as bytes."""
+        return b"".join(list(self._stderr_lines))
+
+    def _drain_stderr(self):
+        try:
+            for line in iter(self.process.stderr.readline, b""):
+                self._stderr_lines.append(line)
+                if self._stderr_line is not None:
+                    self._stderr_line(line)
+        except (OSError, ValueError):
+            pass
+
     def _drain(self, stream, attr):
         try:
-            if attr == "stderr" and self._stderr_line is not None:
-                for line in iter(stream.readline, b""):
-                    self.stderr += line
-                    self._stderr_line(line)
-                return
             for chunk in iter(lambda: stream.read1(4096) if hasattr(stream, "read1") else stream.read(4096), b""):
                 setattr(self, attr, getattr(self, attr) + chunk)
         except (OSError, ValueError):

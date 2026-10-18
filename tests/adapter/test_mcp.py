@@ -395,6 +395,44 @@ class AdapterLoggingTest(AdapterTestCase):
         self.assertEqual(r.stdout, b"")
 
 
+class StderrWriterTest(unittest.TestCase):
+    """A stderr that blocks must never stall a producer (the harness stderr forwarder, or a tool call that logs)."""
+
+    def test_a_blocked_stderr_drops_lines_instead_of_blocking_and_reports_the_count(self):
+        import threading
+        from applewin_mcp.server import StderrWriter
+        gate, got = threading.Event(), []
+
+        def target(data):
+            gate.wait(20)
+            got.append(data)
+
+        w = StderrWriter(maxsize=5, target=target)
+        t0 = time.monotonic()
+        for i in range(100):
+            w.write("line {}\n".format(i).encode())
+        self.assertLess(time.monotonic() - t0, 2.0, "write blocked on a blocked stderr")
+        gate.set()
+        w.close(timeout=5)
+        self.assertFalse(w.thread.is_alive())
+        text = b"".join(got).decode()
+        self.assertRegex(text, r"\d+ log lines dropped")
+        self.assertIn("line 0\n", text)
+        self.assertTrue(all(l.startswith(("line ", "warning")) for l in text.splitlines()), text)
+
+    def test_close_gives_up_when_stderr_stays_blocked(self):
+        import threading
+        from applewin_mcp.server import StderrWriter
+        gate = threading.Event()
+        w = StderrWriter(maxsize=1, target=lambda d: gate.wait(20))
+        w.write(b"a\n")
+        w.write(b"b\n")
+        t0 = time.monotonic()
+        w.close(timeout=0.3)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        gate.set()
+
+
 class VersionTest(unittest.TestCase):
     def test_the_adapter_version_is_the_version_file(self):
         import applewin_mcp

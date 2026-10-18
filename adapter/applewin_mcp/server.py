@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -33,7 +34,6 @@ WAIT_RANGE = (1, 60000)
 LISTEN_RANGE = (0, 60000)
 
 
-_stderr_lock = threading.Lock()   # the adapter's lines and the forwarded harness lines never interleave mid-line
 _logger = logging.getLogger("applewin_mcp")
 
 
@@ -76,14 +76,66 @@ class _StderrHandler(logging.Handler):
             self.handleError(record)
 
 
-def write_stderr(data):
-    """Writes whole bytes to stderr under the lock."""
-    with _stderr_lock:
+class StderrWriter:
+    """Every stderr line (forwarded harness lines and the adapter's own records) goes through one bounded queue to a
+    single daemon thread, so lines stay whole, and a slow or full stderr never blocks a producer: the line is dropped
+    and counted instead. The next line the thread reaches is preceded by one warning saying how many were dropped."""
+
+    def __init__(self, maxsize=10000, target=None):
+        self.queue = queue.Queue(maxsize)
+        self.target = target or self._write_stderr
+        self.dropped = 0
+        self.dropped_line = lambda n: "warning: {} log lines dropped\n".format(n).encode("ascii")
+        self._lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _write_stderr(data):
         try:
             sys.stderr.buffer.write(data)
             sys.stderr.buffer.flush()
         except (AttributeError, ValueError, OSError):
             pass
+
+    def write(self, data):
+        try:
+            self.queue.put_nowait(data)
+        except queue.Full:
+            with self._lock:
+                self.dropped += 1
+
+    def _run(self):
+        while True:
+            data = self.queue.get()
+            if data is None:
+                self.queue.task_done()
+                return
+            with self._lock:
+                dropped, self.dropped = self.dropped, 0
+            try:
+                if dropped:
+                    self.target(self.dropped_line(dropped))
+                self.target(data)
+            except Exception:
+                pass
+            self.queue.task_done()
+
+    def close(self, timeout=2.0):
+        """Drains what is queued, waiting at most timeout seconds (stderr may be blocked)."""
+        try:
+            self.queue.put(None, timeout=timeout)
+        except queue.Full:
+            return
+        self.thread.join(timeout)
+
+
+_writer = StderrWriter()
+
+
+def write_stderr(data):
+    """Queues one complete line (bytes) for stderr; never blocks."""
+    _writer.write(data)
 
 
 def configure_logging(log_format):
@@ -92,6 +144,10 @@ def configure_logging(log_format):
     root = logging.getLogger()
     root.handlers[:] = [handler]   # the MCP SDK's own records go through the same formatter
     root.setLevel(logging.INFO)
+    def dropped_line(n):   # a warning record in the active format
+        record = logging.LogRecord("applewin_mcp", logging.WARNING, "", 0, "{} log lines dropped".format(n), None, None)
+        return (handler.format(record) + "\n").encode("utf-8")
+    _writer.dropped_line = dropped_line
 
 
 def log(message):
@@ -372,4 +428,5 @@ def main(argv=None):
         build_server(args, machine).run("stdio")
     finally:
         machine.shutdown()
+        _writer.close()
     return 0

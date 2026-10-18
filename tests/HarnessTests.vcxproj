@@ -38,6 +38,7 @@
     <ClCompile Include="window_test.cpp" />
     <ClCompile Include="working_copy_test.cpp" />
     <ClCompile Include="input_queue_test.cpp" />
+    <ClCompile Include="log_test.cpp" />
     <ClCompile Include="protocol_test.cpp" />
     <ClCompile Include="server_test.cpp" />
     <ClCompile Include="audio_capture_test.cpp" />

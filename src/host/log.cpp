@@ -15,7 +15,7 @@ namespace {
 
 constexpr std::chrono::seconds kWindow{1};
 constexpr size_t kMaxKeys = 256;   // bounds the rate-limit table: the oldest entries are evicted to stay within this
-constexpr uint32_t kGlobalPerWindow = 20;   // records per second across all keys, separately for warning/error and the rest
+uint32_t g_globalPerWindow = 20;   // records per second across all keys, separately for warning/error and the rest
 
 struct Key {
     Level level;
@@ -105,6 +105,18 @@ void SetOperatorSink(OperatorSink sink)
     g_sink = std::move(p);
 }
 
+void SetGlobalCapForTest(uint32_t perSecond)
+{
+    std::lock_guard lock(g_mutex);
+    g_globalPerWindow = perSecond;
+}
+
+size_t KeyCountForTest()
+{
+    std::lock_guard lock(g_mutex);
+    return g_entries.size();
+}
+
 void SetEmulatedMs(double ms)
 {
     g_emulatedMs.store(ms);
@@ -130,7 +142,7 @@ void Write(Level level, Component component, std::string_view messageView, uint6
             bucket.windowStart = now;
             bucket.count = 0;
         }
-        if (bucket.count >= kGlobalPerWindow) {
+        if (bucket.count >= g_globalPerWindow) {
             ++bucket.suppressed;
             return;
         }

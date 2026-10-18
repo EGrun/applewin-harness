@@ -744,7 +744,7 @@ json Session::TypeText(const ConnectionPtr& connection, const json& params)
     }
     if (text.size() > kMaxTextChars) InvalidParams("text is limited to 4096 characters");
     const uint64_t delay = GetUint(params, "inter_key_delay_ms", 0, kMaxInterKeyDelayMs, kDefaultInterKeyDelayMs);
-    RequireInputRoom(text.size());
+    RequireInputRoom(std::max<size_t>(1, text.size()));   // an empty text still occupies a slot
     const uint64_t id = emulator_.QueueText(text, uint32_t(delay));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));

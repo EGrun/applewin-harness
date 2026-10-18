@@ -1105,7 +1105,7 @@ uint64_t Emulator::PendingInputEvents() const
     uint64_t n = 0;
     for (const QueuedOp& op : g_input.fifo) {
         switch (op.kind) {
-        case QueuedOp::Kind::Text: n += op.text.size() - op.next; break;
+        case QueuedOp::Kind::Text: n += std::max<size_t>(1, op.text.size() - op.next); break;   // an empty text still occupies a slot
         case QueuedOp::Kind::Key: n += 1; break;
         case QueuedOp::Kind::Joy: n += op.durationCycles > 0 ? 2 : 1; break;
         }

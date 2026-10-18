@@ -148,7 +148,7 @@ public:
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);
     // The input events still pending (M6 queue cap): each queued key is 1, each key of a queued text still to be
-    // applied is 1, a queued joystick change is 1 plus 1 more when it has a duration, and an applied joystick
+    // applied is 1 (an empty text counts 1), a queued joystick change is 1 plus 1 more when it has a duration, and an applied joystick
     // change's restore still pending is 1. A key's release is not counted.
     uint64_t PendingInputEvents() const;
     // The cycle at which the input takes effect when that is already known: once applied, its first cycle; before

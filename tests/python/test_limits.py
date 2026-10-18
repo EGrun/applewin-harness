@@ -178,6 +178,15 @@ class QueueLimitTest(LimitTestCase):
         self.assertIn("input_id", agent.call("set_joystick", x=1))                # a plain change: 1
         self.assertQueueFull(agent, QUEUE_LIMIT, "set_joystick", x=2)
 
+    def test_an_empty_type_text_uses_a_slot(self):
+        """An empty text is valid but is a queued operation: it counts as one event, so it cannot be queued without
+        bound while the front of the queue waits."""
+        h = self.launch()
+        _, agent = self.stepped(h)
+        self.assertIn("input_id", agent.call("type_text", text="", inter_key_delay_ms=0))   # valid, uses 1 slot
+        agent.call("type_text", text=" " * (QUEUE_LIMIT - 1), inter_key_delay_ms=0)
+        self.assertQueueFull(agent, QUEUE_LIMIT, "type_text", text="", inter_key_delay_ms=0)
+
     def test_restore_checkpoint_empties_the_queue(self):
         h = self.launch()
         op, agent = self.stepped(h, boot=True)

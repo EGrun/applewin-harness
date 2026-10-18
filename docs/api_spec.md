@@ -76,7 +76,7 @@ Before a session exists, every agent method returns `-32002`.
 The Apple II keyboard sends 7-bit ASCII and has no separate modifier keys, so keys are given as characters or named specials, not PC scan codes.
 
 **`type_text`** `{ text: string, inter_key_delay_ms?: int = 30 }`
-Sends each character as one keypress. `text` may contain only characters 0x20 to 0x7E and `\n`, and is at most 4,096 characters; `inter_key_delay_ms` is 0 to 1,000; otherwise `-32602`. Each character counts as one pending input event (`-32010` if they do not all fit; see Limits). Newlines (`\n`) become RETURN. Lowercase is sent as-is (the //e is the only supported model).
+Sends each character as one keypress. `text` may contain only characters 0x20 to 0x7E and `\n`, and is at most 4,096 characters; `inter_key_delay_ms` is 0 to 1,000; otherwise `-32602`. Each character counts as one pending input event (an empty `text` counts as one) (`-32010` if they do not all fit; see Limits). Newlines (`\n`) become RETURN. Lowercase is sent as-is (the //e is the only supported model).
 - Key *i* is applied at the later of the previous key's applied cycle plus `inter_key_delay_ms` (at the base clock) and the moment the strobe clears. With `inter_key_delay_ms: 0` this is the fastest the keyboard can take the keys.
 
 **`press_key`** `{ key: string | int, hold_ms?: int = 50 }`
@@ -313,7 +313,7 @@ Error objects look like `{ code, message, data? }`. `-32603` carries the C++ exc
 - Connections: at most 8 at once.
 - Input values: `hold_ms` 0 to 10,000; `duration_ms` 0 to 60,000; `inter_key_delay_ms` 0 to 1,000; `text` 4,096 characters. Each is `-32602` outside its range.
 - Strings: any string parameter, at any depth, is at most 32,767 UTF-16 code units (`-32602`).
-- Pending input events: 4,096 per session. A key counts 1; a joystick change counts 1, or 2 with a `duration_ms` above 0; a `type_text` of *n* characters counts *n*. A request that would take the queue past 4,096 is rejected whole with `-32010` "Input queue full" and `data { pending, limit }`, and nothing from it is queued. `restore_checkpoint` empties the queue. There is no limit per emulated second: in stepped mode a client queues while emulated time stands still.
+- Pending input events: 4,096 per session. A key counts 1; a joystick change counts 1, or 2 with a `duration_ms` above 0; a `type_text` of *n* characters counts *n*, or 1 when `text` is empty. A request that would take the queue past 4,096 is rejected whole with `-32010` "Input queue full" and `data { pending, limit }`, and nothing from it is queued. `restore_checkpoint` empties the queue. There is no limit per emulated second: in stepped mode a client queues while emulated time stands still.
 - Paths: disk paths must be absolute.
 
 ## Example: the M2 scenario over the API

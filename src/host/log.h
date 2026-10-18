@@ -7,6 +7,7 @@
 // Rate limit: for each distinct (level, component, connection, message) at most one line per second is written. The
 // others are counted, and the next line that passes carries " (N similar suppressed)". A client therefore cannot make
 // the server log (to stderr or to operators) without bound. Never pass a token or client-typed text as a message.
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -38,5 +39,9 @@ void SetOperatorSink(OperatorSink sink);
 void SetEmulatedMs(double ms);
 
 const char* LevelName(Level level);
+
+// Test hooks: the global per-second cap (default 20) and the number of live rate-limit keys.
+void SetGlobalCapForTest(uint32_t perSecond);
+size_t KeyCountForTest();
 
 }  // namespace harness::log

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace harness {
@@ -118,6 +119,13 @@ private:
     nlohmann::json ListDisks(const nlohmann::json& params);
     nlohmann::json ExportDisk(const nlohmann::json& params);
 
+    // M5 disk swapping (docs/specs/m5.md, "Disk swapping"). Dispatch runs on the emulator thread between frames, so
+    // the drives are never touched mid-frame.
+    nlohmann::json InsertDisk(const nlohmann::json& params);
+    nlohmann::json EjectDisk(const nlohmann::json& params);
+    // The user's image a working copy was made from; empty if the session did not make that file.
+    std::filesystem::path OriginalOf(const std::filesystem::path& workingCopy) const;
+
     void RequireUsable() const;   // -32008 once a restore has failed in or after the load
 
     DisplayMode display_;
@@ -136,7 +144,10 @@ private:
     std::filesystem::path workDir_;   // %TEMP%\applewin-harness\<pid>
     std::filesystem::path ini_;       // %TEMP%\applewin-harness\<pid>.ini
     std::vector<std::unique_ptr<WorkingCopy>> copies_;
-    std::filesystem::path originals_[2];   // the user's images, by drive (0 or 1); empty when the drive had none
+    // Every working copy the session has made (kept until close_session, even after its disk is replaced or ejected)
+    // with the user's image it came from. Not by drive: a swap or a restore changes which copy a drive holds.
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> originals_;   // {working copy, original}
+    unsigned swapCopies_ = 0;   // numbers the insert_disk work subdirectories, so copies never collide
     std::unique_ptr<CheckpointStore> checkpoints_;
     uint64_t audioFloor_ = 0;   // get_audio refuses cycles before this: the restored checkpoint's cycle
     bool unusable_ = false;   // a restore failed in or after Snapshot_LoadState: run commands reply -32008

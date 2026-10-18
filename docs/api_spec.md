@@ -171,6 +171,17 @@ Returns `{ session_id }`.
 - `dest_path` must be absolute, must not exist, must not be any session's original image, must not be inside the harness work directory (`%TEMP%\applewin-harness`), and its directory must exist; otherwise `-32602`. It must also name an ordinary file: no `\\?\` or `\\.\` prefix, no `:` after the drive letter (an NTFS alternate data stream), and no Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, `CONIN$`, `CONOUT$`, with or without an extension) in any path segment; otherwise `-32602`. Original images are never touched.
 - An empty drive is `-32005`. Any slot other than 6 is `-32602`. After a failed restore it returns `-32008`.
 
+**`insert_disk`** `{ slot: 6, drive: 1|2, path, write_protected?: bool = false }` — puts a floppy in the drive and replies `{}`.
+- `path` must be absolute (`-32602`), and a missing file is `-32005`. Any slot other than 6 is `-32602`.
+- Like `create_session`, it copies the image into the work directory and mounts the copy. The original is never opened for writing (D5). Each insert gets a working copy of its own (`%TEMP%pplewin-harness\<pid>\insert-<n>\`), so the same image inserted twice, or in both drives, never collides.
+- A disk already in the drive is flushed and ejected first. Its working copy is kept until `close_session`.
+- It works in both run modes and takes effect between frames, on the emulator thread; it doesn't pause or reset the machine, and in a stepped session no time passes.
+- An image AppleWin can't mount (for example a file whose format is not recognized) is `-32005` with AppleWin's reason, and the drive is left as it was. Putting the previous disk back may reset the drive's rotational position.
+
+**`eject_disk`** `{ slot: 6, drive: 1|2 }` — flushes the drive's current track, unmounts it and replies `{}`. An empty drive is `-32005`. Any slot other than 6 is `-32602`. The working copy is kept until `close_session`.
+
+Both: after a failed restore they return `-32008`. Before a session exists they return `-32002`. `list_disks` and `export_disk` reflect every swap. `checkpoint` records the drives as they are, including empty ones, and `restore_checkpoint` puts back the checkpointed drive contents (a disk swapped in or out since, or an empty drive, included).
+
 ### Execution control
 Before a session exists, these return `-32002`.
 - **`pause`** `{}` — in realtime mode it runs until the next present, then pauses, and replies `{ emulated_cycles }`. If already paused, it replies at once.
@@ -229,10 +240,11 @@ A checkpoint is an AppleWin save state plus copies of the working disks, stored 
 - `emulated_cycles` continues from the checkpoint's value. Input still queued is discarded and reported with `discarded: true` (see Input replies), held keys and joystick buttons are released, and the joystick returns to the position it had at the checkpoint.
 - The audio capture is cleared: `get_audio` for audio from before the restore returns `-32009`. `subscribe_audio` detectors restart at the restored cycle. `get_frame` straight after a restore shows the restored screen.
 - The session's current speed settings are kept (D8).
+- The drives end up as they were at the checkpoint, even if `insert_disk` or `eject_disk` changed them since: a disk inserted since is ejected, a drive that was empty is empty again, and a disk that was replaced or ejected comes back (its working copy is kept until `close_session`). Each checkpointed disk's contents are those of the checkpoint.
 - Frame ids and `frame_ready` cadence continue across a restore; they are not reset. `frame_id` only counts up: the re-rendered frame straight after a restore keeps the last id (its pixels are the restored screen), no `frame_ready` is sent for it, and the `every_n_frames` phase carries on from before the restore.
 - AppleWin looks each disk image up by its bare file name in the process's current directory before its absolute path. The harness makes the checkpoint's own directory current for the load and puts the previous one back, so the server's working directory may hold files of any name.
 - **Failure before the load** (for example a missing checkpoint disk copy): `-32004`. The session stays usable and unchanged: `get_state_checksum` equals its value before the call (D7). Every check that does not need the drives empty (the save state, the disk copies, the image names) runs before the drives are ejected, so those failures leave the drives untouched. A failure after ejecting (a disk copy that can't be read or written) rolls the working disks back and re-inserts them; such a failure may reset the drive's rotational position. If the working disks can't be put back or re-inserted, the reply is still `-32004` and the session is then unusable, as below.
-- **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum` and `export_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
+- **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `export_disk`, `insert_disk` and `eject_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
 
 **`list_checkpoints`** `{}` — returns `[ { checkpoint_id, name, created_at, emulated_cycles } ]`, oldest first. `created_at` is ISO 8601 UTC; `name` may be `null`.
 

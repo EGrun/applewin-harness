@@ -1123,14 +1123,14 @@ std::vector<InputApplied> Emulator::TakeAppliedInputs()
     return std::exchange(g_input.applied, {});
 }
 
-void Emulator::InsertDisk(int drive, const std::filesystem::path& image)
+void Emulator::InsertDisk(int drive, const std::filesystem::path& image, bool writeProtected)
 {
     RequireStarted();
     if (drive < 0 || drive > 1)
         throw std::out_of_range("Emulator: drive must be 0 or 1");
     Disk2InterfaceCard& card = Disk2Card();
     const size_t before = HostFrame().messages().size();
-    const ImageError_e err = card.InsertDisk(drive, image.string(), false, false);
+    const ImageError_e err = card.InsertDisk(drive, image.string(), writeProtected, false);
     if (err != eIMAGE_ERROR_NONE) {
         // InsertDisk() itself reports nothing; the Win32 UI calls this separately. It routes AppleWin's human-readable
         // text through FrameMessageBox, which HarnessFrame records.
@@ -1148,7 +1148,10 @@ void Emulator::EjectDisk(int drive)
     RequireStarted();
     if (drive < 0 || drive > 1)
         throw std::out_of_range("Emulator: drive must be 0 or 1");
-    Disk2Card().EjectDisk(drive);
+    Disk2InterfaceCard& card = Disk2Card();
+    if (!card.IsDriveEmpty(drive))
+        card.FlushCurrentTrack(drive);
+    card.EjectDisk(drive);
 }
 
 uint64_t Emulator::PresentedFrames() const

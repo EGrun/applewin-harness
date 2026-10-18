@@ -207,6 +207,19 @@ class SwapTest(DiskSwapTestCase):
         self.assertEqual(op.call("eject_disk", slot=6, drive=2), {})
         self.assertEqual(op.call("list_disks"), [])
 
+    def test_the_same_original_inserted_twice_gets_distinct_working_copies(self):
+        h = self.launch()
+        op, _ = self.booted(h)
+        op.call("insert_disk", slot=6, drive=1, path=FIXTURE)
+        op.call("insert_disk", slot=6, drive=2, path=FIXTURE)   # both drives
+        first = {d["drive"]: d["working_path"] for d in op.call("list_disks")}
+        self.assertNotEqual(os.path.normcase(first[1]), os.path.normcase(first[2]))
+        op.call("insert_disk", slot=6, drive=2, path=FIXTURE)   # again into the same drive
+        second = {d["drive"]: d["working_path"] for d in op.call("list_disks")}
+        self.assertNotIn(os.path.normcase(second[2]), [os.path.normcase(first[1]), os.path.normcase(first[2])])
+        for path in (first[1], first[2], second[2]):   # a replaced disk's copy stays until close_session
+            self.assertTrue(os.path.exists(path), path)
+
     def test_write_protected_is_reported(self):
         h = self.launch()
         op, _ = self.booted(h)

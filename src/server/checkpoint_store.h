@@ -56,19 +56,20 @@ public:
     std::vector<Entry> List() const;
     // Removes the entry and its directory. std::out_of_range for an unknown id.
     void Delete(const std::string& id);
-    // Review I-3: every disk check that needs no ejected drive, run BEFORE Emulator::EjectAll (current: the drives as
-    // they are now). The drives must hold exactly the entry's working copies, every disk copy must exist, and a stale
-    // <working copy>.restore-bak left by an earlier crash is deleted (so a rollback can never put it over a good disk).
+    // Review I-3: every disk check that needs no ejected drive, run BEFORE Emulator::EjectAll. The drives may hold other
+    // disks than the checkpoint did (insert_disk, eject_disk): the checkpoint's working copies stay on disk until
+    // close_session, so every disk copy must exist, and a stale <working copy>.restore-bak left by an earlier crash is
+    // deleted (so a rollback can never put it over a good disk).
     // Throws std::runtime_error naming the cause (the session's -32004); nothing is changed but stale backups.
-    void PrepareRestore(const Entry& entry, const std::vector<DiskInfo>& current);
-    // Copies each of the entry's disk copies over its working copy (current: as for PrepareRestore, now ejected by
-    // Emulator::EjectAll). Throws std::runtime_error naming the file if a copy is missing, a backup is in the way, or a
-    // copy can't be written (the session's -32004).
+    void PrepareRestore(const Entry& entry);
+    // Copies each of the entry's disk copies over its working copy (the drives are now ejected by Emulator::EjectAll).
+    // Throws std::runtime_error naming the file if a copy is missing, a backup is in the way, or a copy can't be written
+    // (the session's -32004).
     // Each working copy is first renamed to <name>.restore-bak. If anything fails the partial copies are deleted, the
     // backups renamed back (nothing is lost) and std::runtime_error thrown; if putting a backup back fails too,
     // RestoreRollbackError (the working copies are then not what the drives held). On success the backups are kept
     // until CommitRestore (the load worked) or RollbackRestore (it failed before touching the machine).
-    void RestoreDisks(const Entry& entry, const std::vector<DiskInfo>& current);
+    void RestoreDisks(const Entry& entry);
     void CommitRestore(const Entry& entry) noexcept;   // deletes the backups
     // Restores the working copies from the backups. Returns "" when every backup was put back, else what failed.
     [[nodiscard]] std::string RollbackRestore(const Entry& entry);

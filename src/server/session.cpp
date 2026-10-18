@@ -286,7 +286,8 @@ void Session::Dispatch(const Command& command)
         else if (m == "step_cycles") result = StepCycles(params);
         else if (m == "list_disks") result = ListDisks(params);
         else if (m == "export_disk") result = ExportDisk(params);
-        else if (m == "insert_disk" || m == "eject_disk") throw RpcError{kInternalError, "not implemented"};   // M5 Task 5 stub
+        else if (m == "insert_disk") result = InsertDisk(params);
+        else if (m == "eject_disk") result = EjectDisk(params);
         else throw RpcError{kMethodNotFound, "method not found: " + m};
         reply = MakeResult(command.id, std::move(result));
     } catch (const RpcError& e) {
@@ -461,8 +462,10 @@ json Session::CreateSession(const json& params)
         throw RpcError{kInternalError, what};
     }
 
-    originals_[0] = images[0];
-    originals_[1] = images[1];
+    originals_.clear();
+    swapCopies_ = 0;
+    for (int i = 0; i < 2; ++i)
+        if (!copyPaths[i].empty()) originals_.emplace_back(copyPaths[i], images[i]);
     checkpoints_ = std::make_unique<CheckpointStore>(workDir_);
     unusable_ = false;
     allowTextScreen_ = allowTextScreen;
@@ -931,9 +934,8 @@ json Session::RestoreCheckpoint(const json& params)
 
     // Before the load (ruling D7): a failure leaves the session usable with its machine state unchanged. Review I-3:
     // every check that needs no ejected drive runs before EjectAll, so those failures leave the drives untouched.
-    const std::vector<DiskInfo> current = emulator_.Disks();
     try {
-        checkpoints_->PrepareRestore(entry, current);
+        checkpoints_->PrepareRestore(entry);
         std::vector<fs::path> images;
         for (const CheckpointStore::DiskCopy& c : entry.disks) images.push_back(c.workingPath);
         emulator_.CheckSnapshot(entry.StateFile(), images);
@@ -959,7 +961,7 @@ json Session::RestoreCheckpoint(const json& params)
     };
     try {
         emulator_.EjectAll();
-        checkpoints_->RestoreDisks(entry, current);
+        checkpoints_->RestoreDisks(entry);
     } catch (const RestoreRollbackError& e) {
         throw abandon(e.what(), false);
     } catch (const std::exception& e) {
@@ -1046,7 +1048,7 @@ json Session::ListDisks(const json&)
     for (const DiskInfo& d : emulator_.Disks())
         list.push_back(json{{"slot", 6},
                             {"drive", d.drive + 1},
-                            {"original_path", PathUtf8(originals_[d.drive & 1])},
+                            {"original_path", PathUtf8(OriginalOf(d.workingPath))},
                             {"working_path", PathUtf8(d.workingPath)},
                             {"write_protected", d.writeProtected},
                             {"format", d.format}});
@@ -1065,8 +1067,8 @@ json Session::ExportDisk(const json& params)
     RequirePlainFilePath(dest);
     std::error_code ec;
     if (fs::exists(fs::symlink_status(dest, ec))) InvalidParams("dest_path already exists");
-    for (const fs::path& original : originals_)
-        if (!original.empty() && Canonical(original) == Canonical(dest))
+    for (const auto& [working, original] : originals_)
+        if (Canonical(original) == Canonical(dest))
             InvalidParams("dest_path is a session's original image");
     const fs::path harnessDir = workDir_.parent_path();   // %TEMP%\applewin-harness
     if (IsInside(dest, harnessDir)) InvalidParams("dest_path is inside the harness work directory");
@@ -1081,6 +1083,76 @@ json Session::ExportDisk(const json& params)
     emulator_.FlushDisks();
     fs::copy_file(found->workingPath, dest, fs::copy_options::none, ec);
     if (ec) throw RpcError{kInternalError, "cannot write " + PathUtf8(dest) + ": " + ec.message()};
+    return json::object();
+}
+
+// ---- M5: disk swapping (docs/specs/m5.md). ----
+
+fs::path Session::OriginalOf(const fs::path& workingCopy) const
+{
+    for (const auto& [working, original] : originals_)
+        if (_wcsicmp(working.c_str(), workingCopy.c_str()) == 0) return original;
+    return {};
+}
+
+json Session::InsertDisk(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    const uint64_t slot = GetUint(params, "slot", 0, 7, std::nullopt);
+    if (slot != 6) InvalidParams("slot must be 6");
+    const int drive = int(GetUint(params, "drive", 1, 2, std::nullopt)) - 1;
+    const fs::path original = Utf8Path(GetString(params, "path", std::nullopt));
+    if (!original.is_absolute()) InvalidParams("disk path must be absolute: " + PathUtf8(original));
+    const bool writeProtected = GetBool(params, "write_protected", false);
+    std::error_code ec;
+    if (!fs::is_regular_file(original, ec)) throw RpcError{kDiskNotFound, "disk not found: " + PathUtf8(original)};
+
+    // A copy of its own in a numbered subdirectory: the same image inserted twice, or in both drives, never collides,
+    // and a replaced disk's copy (which a checkpoint may name) stays until close_session.
+    std::unique_ptr<WorkingCopy> copy;
+    try {
+        copy = std::make_unique<WorkingCopy>(original, workDir_ / ("insert-" + std::to_string(++swapCopies_)));
+    } catch (const std::exception& e) {
+        throw RpcError{kInternalError, e.what()};
+    }
+
+    std::optional<DiskInfo> previous;
+    for (const DiskInfo& d : emulator_.Disks())
+        if (d.drive == drive) previous = d;
+    try {
+        if (previous) emulator_.EjectDisk(drive);   // flushes the track first
+        emulator_.InsertDisk(drive, copy->Path(), writeProtected);
+    } catch (const std::exception& e) {
+        // AppleWin's own image-open result said no: leave the drive as it was and name the user's image.
+        std::string what = e.what();
+        ReplaceAll(what, copy->Path().string(), original.string());
+        if (previous) {
+            try {
+                emulator_.InsertDisk(drive, previous->workingPath, previous->writeProtected);
+            } catch (const std::exception& e2) {
+                what += "; putting the previous disk back failed: " + std::string(e2.what());
+            }
+        }
+        throw RpcError{kDiskNotFound, what};   // the new copy is deleted as `copy` goes out of scope
+    }
+    originals_.emplace_back(copy->Path(), original);
+    copies_.push_back(std::move(copy));
+    return json::object();
+}
+
+json Session::EjectDisk(const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    const uint64_t slot = GetUint(params, "slot", 0, 7, std::nullopt);
+    if (slot != 6) InvalidParams("slot must be 6");
+    const int drive = int(GetUint(params, "drive", 1, 2, std::nullopt)) - 1;
+    bool occupied = false;
+    for (const DiskInfo& d : emulator_.Disks())
+        if (d.drive == drive) occupied = true;
+    if (!occupied) throw RpcError{kDiskNotFound, "drive " + std::to_string(drive + 1) + " is empty"};
+    emulator_.EjectDisk(drive);   // flushes the track first; the working copy stays until close_session
     return json::object();
 }
 

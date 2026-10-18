@@ -138,22 +138,12 @@ fs::path BackupOf(const fs::path& p)
 }
 }  // namespace
 
-void CheckpointStore::PrepareRestore(const Entry& entry, const std::vector<DiskInfo>& current)
+void CheckpointStore::PrepareRestore(const Entry& entry)
 {
     std::error_code ec;
-    if (entry.disks.size() != current.size())
-        throw std::runtime_error("checkpoint " + entry.id + ": it holds " + std::to_string(entry.disks.size()) +
-                                 " disk(s), the drives hold " + std::to_string(current.size()));
-    for (const DiskCopy& c : entry.disks) {
-        const bool inserted = std::any_of(current.begin(), current.end(), [&](const DiskInfo& d) {
-            return d.drive == c.drive && d.workingPath == c.workingPath;
-        });
-        if (!inserted)
-            throw std::runtime_error("checkpoint " + entry.id + ": drive " + std::to_string(c.drive + 1) +
-                                     " does not hold " + Utf8(c.workingPath));
+    for (const DiskCopy& c : entry.disks)   // the drives may hold other disks now: only the checkpoint's own files matter
         if (!fs::is_regular_file(c.copy, ec))
             throw std::runtime_error("checkpoint " + entry.id + ": disk copy missing: " + Utf8(c.copy));
-    }
     for (const DiskCopy& c : entry.disks) {   // a stale backup would be "rolled back" over a good working copy
         const fs::path bak = BackupOf(c.workingPath);
         fs::remove(bak, ec);
@@ -162,7 +152,7 @@ void CheckpointStore::PrepareRestore(const Entry& entry, const std::vector<DiskI
     }
 }
 
-void CheckpointStore::RestoreDisks(const Entry& entry, const std::vector<DiskInfo>&)
+void CheckpointStore::RestoreDisks(const Entry& entry)
 {
     std::error_code ec;
     for (const DiskCopy& c : entry.disks) {   // all present, no backup in the way, before anything is touched

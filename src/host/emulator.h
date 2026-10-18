@@ -154,7 +154,10 @@ public:
     // The inputs that have fully taken effect since the last call, in the order they completed.
     std::vector<InputApplied> TakeAppliedInputs();
     // Slot 6, drive 0 or 1 (std::out_of_range otherwise). Insert errors throw std::runtime_error with AppleWin's message.
-    void InsertDisk(int drive, const std::filesystem::path& image);
+    // writeProtected mounts the image read-only. A disk already in the drive is ejected by AppleWin first, and a failed
+    // insert leaves the drive empty (Session::InsertDisk puts the old disk back).
+    void InsertDisk(int drive, const std::filesystem::path& image, bool writeProtected = false);
+    // Flushes the drive's current track, then unmounts it (a no-op for an empty drive).
     void EjectDisk(int drive);
 
     uint64_t PresentedFrames() const;

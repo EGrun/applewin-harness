@@ -100,9 +100,23 @@ class DiskSwapTestCase(PipeTestCase):
         return "\n".join(agent.call("get_text_screen")["lines"])
 
     def catalog(self, op, agent, command="CATALOG", run_mode="stepped"):
+        """The screen after the whole disk has been listed. DOS 3.3 stops after 18 files and waits for a key (the
+        master has 19, the fixture 20), so a space is typed to reach the end of the listing. The last page still
+        shows HELLO at the top and ends with SLOT# (master) or QZXFIXTURE (fixture), which tells the disks apart."""
         agent.call("type_text", text="HOME\n" + command + "\n", inter_key_delay_ms=0)
         self.advance(op, TYPE_FRAMES, run_mode)
+        agent.call("type_text", text=" ", inter_key_delay_ms=0)
+        self.advance(op, TYPE_FRAMES // 2, run_mode)
         return self.screen(agent)
+
+    def assertMasterCatalog(self, screen):
+        self.assertIn("HELLO", screen)
+        self.assertIn("SLOT#", screen)   # the master's last file: a blank or stale screen fails
+        self.assertNotIn(UNIQUE_NAME, screen)
+
+    def assertFixtureCatalog(self, screen):
+        self.assertIn("HELLO", screen)
+        self.assertIn(UNIQUE_NAME, screen)
 
     def drives(self, op):
         """{drive: original_path} for the occupied drives."""
@@ -203,11 +217,11 @@ class SwapTest(DiskSwapTestCase):
     def test_insert_replaces_a_disk_already_in_the_drive(self):
         h = self.launch()
         op, agent = self.booted(h)
-        self.assertNotIn(UNIQUE_NAME, self.catalog(op, agent))
+        self.assertMasterCatalog(self.catalog(op, agent))
         self.assertEqual(op.call("insert_disk", slot=6, drive=1, path=FIXTURE), {})   # no eject first
         self.assertEqual(len(op.call("list_disks")), 1)
         self.assertSamePath(self.drives(op)[1], FIXTURE)
-        self.assertIn(UNIQUE_NAME, self.catalog(op, agent))
+        self.assertFixtureCatalog(self.catalog(op, agent))
 
     def test_export_disk_exports_the_disk_now_in_the_drive(self):
         h = self.launch()
@@ -248,7 +262,7 @@ class SwapTest(DiskSwapTestCase):
         drives = self.drives(op)
         self.assertEqual(sorted(drives), [1])
         self.assertSamePath(drives[1], FIXTURE)
-        self.assertIn(UNIQUE_NAME, self.catalog(op, agent, run_mode="realtime"))
+        self.assertFixtureCatalog(self.catalog(op, agent, run_mode="realtime"))
         self.assertGreater(op.call("get_state_checksum")["emulated_cycles"], 0)   # still answering
 
     def test_swap_in_a_stepped_session_does_not_pass_time(self):
@@ -274,7 +288,7 @@ class CheckpointAcrossSwapTest(DiskSwapTestCase):
         drives = self.drives(op)
         self.assertEqual(sorted(drives), [1])   # drive 2 is empty again
         self.assertSamePath(drives[1], DOS_IMAGE)
-        self.assertNotIn(UNIQUE_NAME, self.catalog(op, agent))
+        self.assertMasterCatalog(self.catalog(op, agent))   # the master, not a blank screen
         self.assertRpcError(-32005, op, "eject_disk", slot=6, drive=2)
 
     def test_restore_puts_back_a_disk_ejected_since_the_checkpoint(self):
@@ -287,7 +301,7 @@ class CheckpointAcrossSwapTest(DiskSwapTestCase):
         drives = self.drives(op)
         self.assertEqual(sorted(drives), [1, 2])
         self.assertSamePath(drives[2], FIXTURE)
-        self.assertIn(UNIQUE_NAME, self.catalog(op, agent, "CATALOG,D2"))
+        self.assertFixtureCatalog(self.catalog(op, agent, "CATALOG,D2"))
 
     def test_checkpoint_records_the_drives_as_they_are_after_a_swap(self):
         h = self.launch()
@@ -297,7 +311,7 @@ class CheckpointAcrossSwapTest(DiskSwapTestCase):
         op.call("insert_disk", slot=6, drive=1, path=DOS_IMAGE)
         op.call("restore_checkpoint", checkpoint_id=cp["checkpoint_id"])
         self.assertSamePath(self.drives(op)[1], FIXTURE)
-        self.assertIn(UNIQUE_NAME, self.catalog(op, agent))
+        self.assertFixtureCatalog(self.catalog(op, agent))
 
 
 if __name__ == "__main__":

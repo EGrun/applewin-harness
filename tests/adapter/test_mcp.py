@@ -237,20 +237,32 @@ class DiskSwapTest(AdapterTestCase):
             typed = await call(s, "type_text", text="HOME\n" + command + "\n")
             self.assertFalse(typed.is_error, text_of(typed))
             await call(s, "wait", ms=4000)
+            # DOS 3.3 stops after 18 files and waits for a key; a space shows the end of the listing (the last page
+            # still has HELLO at the top and ends with SLOT# on the master or QZXFIXTURE on the fixture).
+            typed = await call(s, "type_text", text=" ")
+            self.assertFalse(typed.is_error, text_of(typed))
+            await call(s, "wait", ms=2000)
             return text_of(await call(s, "read_screen"))
 
         async def go():
             async with mcp_session(self.errlog) as s:
                 await call(s, "wait", ms=12000)   # boot DOS 3.3
-                self.assertNotIn(UNIQUE_NAME, await catalog(s, "CATALOG"))
+                master = await catalog(s, "CATALOG")
+                self.assertIn("SLOT#", master)
+                self.assertNotIn(UNIQUE_NAME, master)
                 ejected = await call(s, "eject_disk", drive=1)
                 self.assertFalse(ejected.is_error, text_of(ejected))
                 inserted = await call(s, "insert_disk", drive=1, path=FIXTURE_DISK)
                 self.assertFalse(inserted.is_error, text_of(inserted))
-                self.assertIn(UNIQUE_NAME, await catalog(s, "CATALOG"))
+                fixture = await catalog(s, "CATALOG")
+                self.assertIn("HELLO", fixture)
+                self.assertIn(UNIQUE_NAME, fixture)
                 inserted = await call(s, "insert_disk", drive=2, path=DOS_IMAGE)
                 self.assertFalse(inserted.is_error, text_of(inserted))
-                self.assertIn("HELLO", await catalog(s, "CATALOG,D2"))
+                second = await catalog(s, "CATALOG,D2")
+                self.assertIn("HELLO", second)
+                self.assertIn("SLOT#", second)
+                self.assertNotIn(UNIQUE_NAME, second)   # drive 2 holds the master, not the fixture in drive 1
                 ejected = await call(s, "eject_disk", drive=2)
                 self.assertFalse(ejected.is_error, text_of(ejected))
                 again = await call(s, "eject_disk", drive=2)   # empty now

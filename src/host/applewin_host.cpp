@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Provides what external/AppleWin/source/Windows/AppleWin.cpp provides to the rest of AppleWin. The harness does not
 // compile that file (it is AppleWin's WinMain, message loop and window startup).
 //

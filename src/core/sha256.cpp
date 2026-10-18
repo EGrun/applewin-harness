@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/sha256.h"
 #include <windows.h>
 #include <bcrypt.h>

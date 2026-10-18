@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/working_copy.h"
 
 #include <stdexcept>

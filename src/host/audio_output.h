@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Windowed playback of the agent-audio timeline (spec: docs/specs/m3.md, D14 "Playback"). Windowed realtime only;
 // headless never creates one, so dsound.dll (delay-loaded) is never loaded headless.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """M4 checkpoints over the pipe (spec: docs/specs/m4.md, pass conditions 1-5, "Restore purity" and "API"; plan Review
 Focus 1, 3, 4 and 5).
 

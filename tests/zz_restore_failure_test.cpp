@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // M4 restore error paths in-process (spec: docs/specs/m4.md "Restore purity"; plan Review Focus 1 and 3). Test prefix
 // "ckpt:". Named zz_ so doctest (file-name order) runs it after every other in-process test: a failed load leaves AppleWin
 // in a post-failure state, and each case ends by re-inserting a fresh working copy and power-cycling (then ejecting).

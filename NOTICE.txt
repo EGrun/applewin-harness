@@ -1,0 +1,38 @@
+applewin-harness - NOTICE
+
+Licensing summary
+-----------------
+The harness project's own source code is MIT licensed (see LICENSE).
+
+The binaries AppleWinHarness.exe and HarnessTests.exe link AppleWin and are
+distributed under the GNU General Public License, version 2 or (at your
+option) any later version (GPL-2.0-or-later). The full GPL v2 text is in
+LICENSE-GPL-2.0.txt. Components linked into those binaries, and their licenses,
+are listed in THIRD-PARTY-NOTICES.txt.
+
+Source offer
+------------
+The complete corresponding source for these binaries is available at:
+
+  Repository:       https://github.com/EGrun/applewin-harness
+  Release commit:   {{RELEASE_COMMIT}}
+  AppleWin source:  https://github.com/AppleWin/AppleWin
+  AppleWin commit:  6c579da5bd9460ebf7c6051a6d635efbd1375c85
+                    (pinned as the git submodule external/AppleWin)
+
+Check out the release commit with its submodules
+(git clone --recurse-submodules, then git checkout the commit above) to get
+exactly the source that was built. No AppleWin source is modified.
+
+ROM images
+----------
+AppleWinHarness.exe contains Apple II ROM images (the Apple II, II+ and IIe
+system, video and peripheral card ROMs) compiled in from AppleWin's resources
+(external/AppleWin/resource). They are included on the same terms as AppleWin's
+own releases.
+
+Disk images
+-----------
+No disk images are included in this repository or in the release bundle. A
+DOS 3.3 System Master disk image can be found in the AppleWin repository's
+bin/ directory (https://github.com/AppleWin/AppleWin/tree/master/bin).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "server/pipe_server.h"
 #include "host/log.h"
 #include "host/harness_version.h"

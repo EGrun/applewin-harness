@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // WorkingCopy unit tests (spec: docs/specs/m2.md, "src/core/working_copy.h").
 #include "doctest/doctest.h"
 #include "core/working_copy.h"

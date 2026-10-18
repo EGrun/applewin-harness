@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // M5 pass condition 2 and Review Focus 4 (docs/specs/m5.md "Harness change: get_text_screen"): Emulator::ReadTextScreen
 // against known bytes in the text pages and soft switches set by the 6502 itself.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Pitch estimate for sound_stopped.dominant_hz (spec: docs/specs/m3.md, Part B "dominant_hz").
 #include <span>

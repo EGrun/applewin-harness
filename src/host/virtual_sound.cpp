@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Virtual sound buffers (D14), and the replacement for AppleWin's Windows/DXSoundBuffer.cpp translation unit.
 #include "host/virtual_sound.h"
 #include "core/audio_capture.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Emulator input queue (spec: docs/specs/m3.md, Part A "Input queue"; D10; pass condition 4 in-process).
 #include "doctest/doctest.h"
 #include "host/emulator.h"

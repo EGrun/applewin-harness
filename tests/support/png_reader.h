@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "doctest/doctest.h"
 #include <cstdint>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/base64.h"
 
 namespace harness {

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """insert_disk and eject_disk over the pipe (spec: docs/specs/m5.md "Disk swapping"; plan Review Focus 6 and 7, Task 5).
 
 Run: python -m unittest discover -s tests/python -v   (HARNESS_EXE selects the exe; default bin/x64/Debug).

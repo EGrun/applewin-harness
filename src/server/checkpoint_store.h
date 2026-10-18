@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // A session's checkpoints on disk (spec: docs/specs/m4.md, "API" checkpoint .. delete_checkpoint; D5). One directory per
 // checkpoint, <workDir>/checkpoints/<id>/, holding AppleWin's state.yaml, a copy of every working disk, and meta.json

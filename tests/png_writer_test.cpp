@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "doctest/doctest.h"
 #include "core/png_writer.h"
 #include "support/png_reader.h"

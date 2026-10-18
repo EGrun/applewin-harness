@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // The ACL'd, overlapped named-pipe transport (spec: docs/specs/m3.md, Part A "Transport"; D3).
 #include "host/emulator.h"

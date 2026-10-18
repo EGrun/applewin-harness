@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "host/window.h"
 
 #include <cstring>

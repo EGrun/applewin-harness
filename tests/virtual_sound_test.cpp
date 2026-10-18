@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // VirtualSoundBuffer tests (spec: docs/specs/m3.md, D14 "Virtual buffers" and "Capture"; plan: M3 Part B Task 1,
 // "vsound:" and Review Focus 1 and 2).
 #include "doctest/doctest.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // AppleWinHarness.exe --serve (spec: docs/specs/m3.md, Part A "Launch", "Transport", pass conditions 2, 3 and 6).
 #include "host/harness_version.h"
 #include "doctest/doctest.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // DominantHz: Hann-windowed radix-2 FFT with parabolic peak refinement (spec: docs/specs/m3.md, Part B).
 #include "core/fft.h"
 #include "core/level_detector.h"   // kDominantFftPoints

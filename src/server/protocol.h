@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // JSON-RPC 2.0 helpers and constants for the harness protocol (spec: docs/specs/m3.md, Part A "Transport" and "Errors";
 // error codes from docs/api_spec.md).

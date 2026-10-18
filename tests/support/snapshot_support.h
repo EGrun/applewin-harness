@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Helpers shared by the in-process M4 checkpoint tests (snapshot_test.cpp, zz_restore_failure_test.cpp).
 #include "doctest/doctest.h"

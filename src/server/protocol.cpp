@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "server/protocol.h"
 #include <stdexcept>
 #include <utility>

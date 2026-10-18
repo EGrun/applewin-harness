@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Synthetic signals and measurements for the agent-audio tests (M3 Part B).
 #include "core/audio_capture.h"

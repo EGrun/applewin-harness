@@ -102,9 +102,15 @@ Consequence (D2 of the M4 rulings): a replay is exact only between two restores 
 **D11 (M4): startup sweep.** A killed server cannot delete its work directory. On start, the harness removes `%TEMP%\applewin-harness\<pid>` directories and `<pid>.ini` files whose process is no longer running. Entries of live processes are skipped, so a reused pid can leave a stale directory behind but never causes a live one to be deleted.
 
 ## D6 — Licensing
-**Status:** Open — must be decided before M1 code is published
+**Status:** Accepted (2026-10-18)
 
-AppleWin is GPL-2.0. Under D2 the harness links AppleWin code, so the harness must be distributed under a GPL-2.0-compatible license.
+AppleWin is GPL-2.0-or-later. Under D2 the harness links AppleWin code, so the compiled binaries must be distributed under GPL-2.0-or-later. The user decided: "use a split MIT license where possible, and GPL2 compatible otherwise. Do not include disk images in the repo."
+
+- **MIT for what the project wrote.** `src/`, `tests/`, `adapter/`, `tools/` and `docs/` are MIT (`LICENSE`), and each owned source file carries `SPDX-License-Identifier: MIT`. MIT is GPL-2.0-compatible, so the combined work is allowed, and it keeps the project's own code reusable on permissive terms (for example the Python adapter, which does not link AppleWin).
+- **GPL where required.** `AppleWinHarness.exe` and `HarnessTests.exe` link AppleWin, so as combined works they are GPL-2.0-or-later (`LICENSE-GPL-2.0.txt`, copied from the submodule). `NOTICE.txt` carries the source offer: this repository's URL and release commit, plus the pinned AppleWin commit (D7).
+- **Third-party notices.** `THIRD-PARTY-NOTICES.txt` lists everything linked into the exe (AppleWin, zlib, minizip, libyaml, nlohmann/json) with license texts, and names the adapter's runtime dependency `mcp` (MIT, installed by pip) and doctest (test binary only).
+- **ROM images.** AppleWin compiles Apple II ROM images into the exe as resources. The bundle includes them on the same terms as AppleWin's own releases (risk recorded in `project.md`).
+- **No disk images** in the repository or the release bundle. Tests use the images in the AppleWin submodule. The DOS 3.3 System Master is in the AppleWin repository's `bin/` directory.
 
 ## D7 — How the harness finds AppleWin source
 **Status:** Accepted

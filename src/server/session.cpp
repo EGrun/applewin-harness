@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "server/session.h"
 #include "host/log.h"
 #include "server/protocol.h"

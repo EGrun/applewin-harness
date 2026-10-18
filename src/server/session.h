@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // The session loop and the agent and operator methods (spec: docs/specs/m3.md, Part A "Threading and the session
 // loop", "Agent methods", "Operator methods"). One session per process (P6).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "host/emulator.h"
 #include <windows.h>

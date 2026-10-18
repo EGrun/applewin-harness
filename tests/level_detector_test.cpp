@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // LevelDetector unit tests (spec: docs/specs/m3.md, Part B "subscribe_audio"; plan: M3 Part B Task 1, "level:"; Review
 // Focus 3).
 #include "doctest/doctest.h"

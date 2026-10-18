@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "server/checkpoint_store.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>

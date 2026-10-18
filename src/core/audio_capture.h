@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // The agent-audio timeline (spec: docs/specs/m3.md, D14 "Capture"; plan: M3 Part B, Global Constraints "Timeline" and
 // "Placing commits"). Independent of AppleWin: it only knows emulated cycles.

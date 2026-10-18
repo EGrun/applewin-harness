@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // DominantHz unit tests (spec: docs/specs/m3.md, Part B "dominant_hz"; plan: M3 Part B Task 1, "fft:").
 #include "doctest/doctest.h"
 #include "core/fft.h"

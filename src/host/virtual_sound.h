@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Virtual sound buffers (spec: docs/specs/m3.md, D14). AppleWin never gets a real DirectSound buffer: every
 // SoundBuffer it creates is a VirtualSoundBuffer, and every commit feeds the AudioCapture timeline.

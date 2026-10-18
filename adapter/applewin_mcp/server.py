@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "host/emulator.h"
 #include "host/log.h"
 #include "host/applewin_host.h"

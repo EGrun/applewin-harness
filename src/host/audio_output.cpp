@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Windowed playback (spec: docs/specs/m3.md, D14 "Playback"). dsound.dll is delay-loaded (Harness.props), so it is
 // loaded only when Open runs: windowed starts only.
 #include "host/audio_output.h"

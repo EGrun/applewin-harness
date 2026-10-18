@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/png_writer.h"
 #include <zlib.h>
 #include <cstring>

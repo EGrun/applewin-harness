@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """AppleWinHarness.exe --serve over its named pipe (spec: docs/specs/m3.md, Parts A and B; pass conditions 1-5,
 7 and 8).
 

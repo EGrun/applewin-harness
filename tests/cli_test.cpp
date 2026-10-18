@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // AppleWinHarness.exe command-line tests (spec: docs/specs/m2.md, "src/main.cpp - command line" and "Test layout").
 #include "doctest/doctest.h"
 #include "core/sha256.h"

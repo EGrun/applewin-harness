@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """MCP agent adapter for AppleWinHarness (spec: docs/specs/m5.md)."""
 import os
 

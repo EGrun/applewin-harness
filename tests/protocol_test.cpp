@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // JSON-RPC helpers (spec: docs/specs/m3.md, Part A "Transport" - framing; api_spec.md "Errors").
 #include "doctest/doctest.h"
 #include "server/protocol.h"

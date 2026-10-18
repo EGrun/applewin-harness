@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // AudioCapture and EncodeWav unit tests (spec: docs/specs/m3.md, D14 "Capture" and Part B "get_audio"; plan: M3 Part B
 // Task 1, "capture:" and "wav:").
 #include "doctest/doctest.h"

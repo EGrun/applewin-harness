@@ -137,4 +137,10 @@ bin\x64\Debug\HarnessTests.exe -tse=windowed,audio
 Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64, runs `HarnessTests.exe -tse=windowed,audio`, then the Python pipe tests, and then the adapter tests.
 
 ## License
-Not decided yet. The harness links AppleWin (GPL-2.0), so its license must be GPL-2.0-compatible (decision D6).
+The license is split (decision D6):
+
+- **MIT:** everything this project wrote (`src/`, `tests/`, `adapter/`, `tools/`, `docs/`). See [LICENSE](LICENSE). Each source file has an `SPDX-License-Identifier: MIT` header.
+- **GPL-2.0-or-later:** the binaries `AppleWinHarness.exe` and `HarnessTests.exe`, because they link AppleWin, which is GPL-2.0-or-later. See [LICENSE-GPL-2.0.txt](LICENSE-GPL-2.0.txt). [NOTICE.txt](NOTICE.txt) gives the source offer, and says the exe contains AppleWin's Apple II ROM images on the same terms as AppleWin's own releases.
+- **Third-party components** (AppleWin, zlib, minizip, libyaml, nlohmann/json, and the `mcp` package the adapter installs) keep their own licenses. See [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
+
+**No disk images are included** in this repository or in the release bundle. The tests use images from the AppleWin submodule. You can get the DOS 3.3 System Master from the AppleWin repository's [`bin/` directory](https://github.com/AppleWin/AppleWin/tree/master/bin).

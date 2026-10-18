@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/pacing.h"
 #include <cmath>
 #include <stdexcept>

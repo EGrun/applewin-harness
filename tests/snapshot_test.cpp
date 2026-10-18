@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // M4 checkpoints in-process (spec: docs/specs/m4.md, pass conditions 1, 3, 5 and 6, "Restore purity"; plan Review Focus
 // 1 and 3). Test prefix "ckpt:".
 //

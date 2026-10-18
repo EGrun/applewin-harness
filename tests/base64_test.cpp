@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "doctest/doctest.h"
 #include "core/base64.h"
 #include <cstring>

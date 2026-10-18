@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "doctest/doctest.h"
 #include "host/harness_frame.h"
 #include "host/emulator.h"

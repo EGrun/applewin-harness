@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Standard-library client for AppleWinHarness.exe --serve (spec: docs/specs/m3.md, Part A "Python client").
 
 Harness.launch() starts the exe and reads its announcement line; connect(role) opens the pipe and says hello.

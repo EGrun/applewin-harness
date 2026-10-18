@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // LevelDetector (spec: docs/specs/m3.md, Part B "subscribe_audio").
 #include "core/level_detector.h"
 #include "core/audio_capture.h"

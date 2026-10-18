@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/frame_view.h"
 
 namespace harness {

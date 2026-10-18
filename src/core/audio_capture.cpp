@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // The agent-audio timeline; see audio_capture.h for the placement rules.
 #include "core/audio_capture.h"
 #include <algorithm>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Helpers for tests that launch AppleWinHarness.exe --serve and talk to it over its named pipe.
 #include "support/golden.h"

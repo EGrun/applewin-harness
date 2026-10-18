@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "core/wav.h"
 #include <cstring>
 #include <stdexcept>

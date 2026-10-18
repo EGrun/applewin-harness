@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // WAV encoding for get_audio (spec: docs/specs/m3.md, Part B "get_audio").
 #include <cstdint>

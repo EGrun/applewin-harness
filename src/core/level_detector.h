@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 // Sound events for subscribe_audio (spec: docs/specs/m3.md, Part B "subscribe_audio").
 #include <cstdint>

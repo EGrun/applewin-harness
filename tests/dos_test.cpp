@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // DOS 3.3 in-process golden (spec: docs/specs/m2.md, pass conditions 1 and 3).
 #include "doctest/doctest.h"
 #include "host/emulator.h"

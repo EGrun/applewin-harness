@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Window unit tests (spec: docs/specs/m2.md, "src/host/window.h"). They need a desktop session.
 #include "doctest/doctest.h"
 #include "host/window.h"

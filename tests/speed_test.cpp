@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // M3 Part C (D11): speed controls. Spec: docs/specs/m3.md Part C, docs/api_spec.md "Speed".
 // The in-process cases ("speed: ...") are fast and deterministic. The rate and full-speed cases are in suite
 // "realtime" (headless, wall-clock timing).

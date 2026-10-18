@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // HarnessFrame unit tests.
 #include "doctest/doctest.h"
 #include "host/harness_frame.h"

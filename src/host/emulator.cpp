@@ -1140,6 +1140,83 @@ std::vector<InputApplied> Emulator::TakeAppliedInputs()
     return std::exchange(g_input.applied, {});
 }
 
+namespace {
+// The save state stores each image name as the UTF-8 of AppleWin's ANSI string (YamlSaveHelper::SaveString), and the
+// load hands those bytes back to the ANSI file API (see CheckImagesExist). The two agree only when the UTF-8 bytes equal
+// the ANSI bytes (ASCII, or a UTF-8 ANSI code page); otherwise the checkpoint could never be restored.
+bool SurvivesSaveState(const std::string& ansi)
+{
+    if (ansi.empty())
+        return true;
+    const int wideLen = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, ansi.data(), int(ansi.size()), nullptr, 0);
+    if (wideLen <= 0)
+        return false;
+    std::wstring wide(size_t(wideLen), L'\0');
+    MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, ansi.data(), int(ansi.size()), wide.data(), wideLen);
+    const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLen, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0)
+        return false;
+    std::string utf8(size_t(utf8Len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLen, utf8.data(), utf8Len, nullptr, nullptr);
+    return utf8 == ansi;
+}
+
+
+// D10 (M6): the string AppleWin is given for a working copy. AppleWin's save state keeps image paths as UTF-8 but its
+// load reads them with the ANSI file API, so a path that is not ANSI-safe could never be restored. Such a path is
+// replaced by its ASCII 8.3 short path (GetShortPathNameW; the file must exist) when one exists. A path with no ASCII
+// form is passed on as ANSI (SaveSnapshot then refuses it); one that has no ANSI form at all is an error here.
+std::string ImagePathForAppleWin(const std::filesystem::path& image)
+{
+    const std::wstring& wide = image.native();
+    BOOL usedDefault = FALSE;
+    std::string ansi;
+    const int len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wide.data(), int(wide.size()), nullptr, 0, nullptr,
+                                        &usedDefault);
+    if (len > 0 && !usedDefault) {
+        ansi.assign(size_t(len), '\0');
+        usedDefault = FALSE;
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wide.data(), int(wide.size()), ansi.data(), len, nullptr,
+                            &usedDefault);
+        if (!usedDefault && SurvivesSaveState(ansi))
+            return ansi;
+    }
+    std::wstring shortPath(MAX_PATH, L'\0');
+    DWORD n = GetShortPathNameW(image.c_str(), shortPath.data(), DWORD(shortPath.size()));
+    if (n >= shortPath.size()) {
+        shortPath.resize(n);
+        n = GetShortPathNameW(image.c_str(), shortPath.data(), DWORD(shortPath.size()));
+    }
+    if (n > 0 && n < shortPath.size()) {
+        shortPath.resize(n);
+        if (std::all_of(shortPath.begin(), shortPath.end(), [](wchar_t c) { return c > 0 && c < 0x80; }))
+        {
+            std::string ascii;
+            for (const wchar_t c : shortPath)
+                ascii.push_back(char(c));
+            return ascii;
+        }
+    }
+    if (ansi.empty())
+        throw std::runtime_error("Emulator: the disk image path has characters the ANSI code page cannot represent and "
+                                 "no ASCII short (8.3) path exists for it");
+    return ansi;
+}
+
+// The long path of every image inserted through a different (short) string, keyed by that string upper-cased: list_disks
+// keeps reporting the long path although AppleWin (and so the save state) holds the short one.
+std::map<std::string, std::filesystem::path> g_longPaths;
+
+std::string UpperAscii(std::string s)
+{
+    for (char& c : s)
+        if (c >= 'a' && c <= 'z')
+            c = char(c - 'a' + 'A');
+    return s;
+}
+
+}  // namespace
+
 void Emulator::InsertDisk(int drive, const std::filesystem::path& image, bool writeProtected)
 {
     RequireStarted();
@@ -1147,12 +1224,15 @@ void Emulator::InsertDisk(int drive, const std::filesystem::path& image, bool wr
         throw std::out_of_range("Emulator: drive must be 0 or 1");
     Disk2InterfaceCard& card = Disk2Card();
     const size_t before = HostFrame().messages().size();
-    const ImageError_e err = card.InsertDisk(drive, image.string(), writeProtected, false);
+    const std::string path = ImagePathForAppleWin(image);
+    const ImageError_e err = card.InsertDisk(drive, path, writeProtected, false);
+    if (err == eIMAGE_ERROR_NONE)
+        g_longPaths[UpperAscii(path)] = image;
     if (err != eIMAGE_ERROR_NONE) {
         // InsertDisk() itself reports nothing; the Win32 UI calls this separately. It routes AppleWin's human-readable
         // text through FrameMessageBox, which HarnessFrame records.
-        card.NotifyInvalidImage(drive, image.string(), err);
-        std::string what = "Emulator: cannot insert " + image.string() + " (image error " + std::to_string(int(err)) + ")";
+        card.NotifyInvalidImage(drive, path, err);
+        std::string what = "Emulator: cannot insert " + path + " (image error " + std::to_string(int(err)) + ")";
         const auto& msgs = HostFrame().messages();
         for (size_t i = before; i < msgs.size(); ++i)
             what += "\n  " + msgs[i];
@@ -1521,7 +1601,8 @@ void CheckImagesExist(const std::filesystem::path& stateFile, const std::vector<
         if (expected) {
             const std::wstring absolute = std::filesystem::path(image.absolutePath).lexically_normal().native();
             const bool listed = std::any_of(expected->begin(), expected->end(), [&](const std::filesystem::path& p) {
-                const std::wstring w = p.lexically_normal().native();
+                // The save state holds the path AppleWin was given at insert (D10: possibly the short path).
+                const std::wstring w = std::filesystem::path(ImagePathForAppleWin(p)).lexically_normal().native();
                 return CompareStringOrdinal(w.c_str(), int(w.size()), absolute.c_str(), int(absolute.size()), TRUE) ==
                        CSTR_EQUAL;
             });
@@ -1619,26 +1700,6 @@ std::unique_ptr<ScopedCurrentDirectory> EnterStateDirectory(const std::filesyste
     } catch (const std::exception& e) {
         throw SnapshotPreLoadError(e.what());
     }
-}
-
-// The save state stores each image name as the UTF-8 of AppleWin's ANSI string (YamlSaveHelper::SaveString), and the
-// load hands those bytes back to the ANSI file API (see CheckImagesExist). The two agree only when the UTF-8 bytes equal
-// the ANSI bytes (ASCII, or a UTF-8 ANSI code page); otherwise the checkpoint could never be restored.
-bool SurvivesSaveState(const std::string& ansi)
-{
-    if (ansi.empty())
-        return true;
-    const int wideLen = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, ansi.data(), int(ansi.size()), nullptr, 0);
-    if (wideLen <= 0)
-        return false;
-    std::wstring wide(size_t(wideLen), L'\0');
-    MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, ansi.data(), int(ansi.size()), wide.data(), wideLen);
-    const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLen, nullptr, 0, nullptr, nullptr);
-    if (utf8Len <= 0)
-        return false;
-    std::string utf8(size_t(utf8Len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideLen, utf8.data(), utf8Len, nullptr, nullptr);
-    return utf8 == ansi;
 }
 
 // After a failed Snapshot_LoadState (which has removed every card, writing that to the config file, and may have
@@ -1873,6 +1934,9 @@ std::vector<DiskInfo> Emulator::Disks() const
         DiskInfo d;
         d.drive = drive;
         d.workingPath = std::filesystem::path(card.DiskGetFullPathName(drive));
+        const auto longPath = g_longPaths.find(UpperAscii(card.DiskGetFullPathName(drive)));
+        if (longPath != g_longPaths.end())
+            d.workingPath = longPath->second;   // D10: AppleWin holds the short path
         d.writeProtected = card.GetProtect(drive);
         d.format = ImageFormat(card, drive);
         disks.push_back(std::move(d));

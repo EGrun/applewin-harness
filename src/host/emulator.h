@@ -209,7 +209,9 @@ public:
     // AppleWin's save state to stateFile (Snapshot_SetFilename + Snapshot_SaveState). A FrameMessageBox during the save
     // throws std::runtime_error carrying its text. Disks are not copied here (CheckpointStore does that). Refused with
     // std::runtime_error before writing anything: a disk image path AppleWin's save state cannot bring back (it stores
-    // names as UTF-8 and loads them as ANSI, so any non-ASCII path unless the ANSI code page is UTF-8).
+    // names as UTF-8 and loads them as ANSI, so any non-ASCII path unless the ANSI code page is UTF-8). InsertDisk
+    // (D10, M6) hands AppleWin the file's ASCII 8.3 short path when its long path is not ANSI-safe, so only a
+    // non-ASCII path with no short name is refused here.
     SnapshotMeta SaveSnapshot(const std::filesystem::path& stateFile);
     // Snapshot_LoadState from stateFile, then restore purity in the spec's order: the session's CURRENT speed settings
     // re-applied (ruling D8; enhance-disk included, meta.speed is not used), srand(1), speaker internals reset to a

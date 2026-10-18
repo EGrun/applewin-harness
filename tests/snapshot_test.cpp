@@ -569,8 +569,8 @@ TEST_CASE("ckpt: FLASH text replays identically after restores, whatever ran bef
 
 // AppleWin's save state stores disk image names as UTF-8 and its load hands those bytes to the ANSI file API
 // (YamlSaveHelper::SaveString, Disk2InterfaceCard::LoadSnapshotFloppy). Unless the ANSI code page is UTF-8, a non-ASCII
-// path cannot come back: the checkpoint is refused, and a save state naming one is refused before loading (no file
-// dialog, machine unchanged, ruling D7).
+// path cannot come back: the checkpoint is refused unless the image went in through its ASCII 8.3 short path (D10, M6),
+// and a save state naming a non-ASCII path is refused before loading (no file dialog, machine unchanged, ruling D7).
 TEST_CASE("ckpt: a non-ASCII disk path is refused at checkpoint, or restores; a save state naming one never opens a dialog")
 {
     auto& e = StartedEmulator();
@@ -601,7 +601,12 @@ TEST_CASE("ckpt: a non-ASCII disk path is refused at checkpoint, or restores; a 
         REQUIRE(e.RunFrames(60));
         const std::string before = e.StateChecksum();
         const fs::path state = dir / "state.yaml";
-        if (utf8Acp) {
+        // D10 (M6): the working copy went in through its ASCII 8.3 short path when the volume has one for it.
+        wchar_t shortBuf[MAX_PATH] = {};
+        const DWORD shortLen = GetShortPathNameW(copy.Path().c_str(), shortBuf, MAX_PATH);
+        const bool hasAsciiPath = shortLen > 0 && shortLen < MAX_PATH &&
+                                  std::all_of(shortBuf, shortBuf + shortLen, [](wchar_t c) { return c < 0x80; });
+        if (utf8Acp || hasAsciiPath) {
             const SnapshotMeta meta = e.SaveSnapshot(state);
             e.EjectAll();
             e.LoadSnapshot(state, meta);

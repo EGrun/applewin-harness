@@ -10,6 +10,7 @@ to stderr. The adapter writes the line "harness pid <N>" to stderr once the harn
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import math
 import os
@@ -20,6 +21,7 @@ import time
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
 
 FRAMES_PER_SECOND = 60
@@ -31,8 +33,69 @@ WAIT_RANGE = (1, 60000)
 LISTEN_RANGE = (0, 60000)
 
 
+_stderr_lock = threading.Lock()   # the adapter's lines and the forwarded harness lines never interleave mid-line
+_logger = logging.getLogger("applewin_mcp")
+
+
+def _level_name(levelno):
+    if levelno >= logging.ERROR:
+        return "error"
+    if levelno >= logging.WARNING:
+        return "warning"
+    return "info" if levelno >= logging.INFO else "debug"
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line, the harness's shape: {ts, level, msg, component}."""
+
+    def format(self, record):
+        ms = int(record.msecs)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)) + ".{:03d}Z".format(ms)
+        msg = record.getMessage()
+        if record.exc_info:
+            msg += "\n" + self.formatException(record.exc_info)
+        return json.dumps({"ts": ts, "level": _level_name(record.levelno), "msg": msg, "component": "adapter"})
+
+
+class TextFormatter(logging.Formatter):
+    """The harness's text shape: "level: message", one line."""
+
+    def format(self, record):
+        msg = record.getMessage()
+        if record.exc_info:
+            msg += "\n" + self.formatException(record.exc_info)
+        return "{}: {}".format(_level_name(record.levelno), msg.replace("\r", "\\r").replace("\n", "\\n"))
+
+
+class _StderrHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            data = (self.format(record) + "\n").encode("utf-8", "replace")
+            write_stderr(data)
+        except Exception:
+            self.handleError(record)
+
+
+def write_stderr(data):
+    """Writes whole bytes to stderr under the lock."""
+    with _stderr_lock:
+        try:
+            sys.stderr.buffer.write(data)
+            sys.stderr.buffer.flush()
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def configure_logging(log_format):
+    handler = _StderrHandler()
+    handler.setFormatter(JsonFormatter() if log_format == "json" else TextFormatter())
+    root = logging.getLogger()
+    root.handlers[:] = [handler]   # the MCP SDK's own records go through the same formatter
+    root.setLevel(logging.INFO)
+
+
 def log(message):
-    print(message, file=sys.stderr, flush=True)
+    _logger.info(message)
 
 
 def parse_args(argv=None):
@@ -41,6 +104,9 @@ def parse_args(argv=None):
     p.add_argument("--headless", action="store_true", help="run the harness without a window")
     p.add_argument("--disk", help="disk image for slot 6 drive 1 (the harness works on a copy)")
     p.add_argument("--realtime", action="store_true", help="run in realtime mode (default: stepped)")
+    p.add_argument("--log-format", choices=("text", "json"), default="text",
+                   help="stderr log format, also passed to the harness (default: text)")
+    p.add_argument("--version", action="version", version="applewin_mcp " + __version__)
     p.add_argument("--text-screen", action="store_true", help="enable the read_screen tool")
     return p.parse_args(argv)
 
@@ -60,7 +126,8 @@ class Machine:
         self.events = []        # sound events not yet reported by listen (buffered from launch)
         self.applied = set()    # input ids whose input_applied has arrived
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
-        self.harness = Harness.launch(headless=args.headless)
+        self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
+                                      stderr_line=self._forward_harness_line)
         log("harness pid {}".format(self.harness.pid))
         try:
             self.operator = self.harness.connect("operator")
@@ -74,6 +141,13 @@ class Machine:
         except BaseException:
             self.shutdown()
             raise
+
+    @staticmethod
+    def _forward_harness_line(line):
+        """The harness's stderr, line by line and unchanged (so in json mode each line is still one JSON object)."""
+        if not line.endswith(b"\n"):
+            line += b"\n"
+        write_stderr(line)
 
     # ---- helpers (call with self.lock held) ----
 
@@ -292,7 +366,7 @@ def build_server(args, machine):
 
 def main(argv=None):
     args = parse_args(argv)
-    logging.basicConfig(stream=sys.stderr)
+    configure_logging(args.log_format)
     machine = Machine(args)
     try:
         build_server(args, machine).run("stdio")

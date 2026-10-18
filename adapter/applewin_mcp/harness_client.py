@@ -207,8 +207,10 @@ class Connection:
 class Harness:
     """A running AppleWinHarness.exe --serve."""
 
-    def __init__(self, process, announcement):
+    def __init__(self, process, announcement, stderr_line=None):
+        """stderr_line: optional callable given each complete stderr line (bytes, newline included) as it arrives."""
         self.process = process
+        self._stderr_line = stderr_line
         self.announcement = announcement
         self.pipe = announcement["pipe"]
         self.agent_token = announcement["agent_token"]
@@ -226,15 +228,20 @@ class Harness:
 
     def _drain(self, stream, attr):
         try:
+            if attr == "stderr" and self._stderr_line is not None:
+                for line in iter(stream.readline, b""):
+                    self.stderr += line
+                    self._stderr_line(line)
+                return
             for chunk in iter(lambda: stream.read1(4096) if hasattr(stream, "read1") else stream.read(4096), b""):
                 setattr(self, attr, getattr(self, attr) + chunk)
         except (OSError, ValueError):
             pass
 
     @classmethod
-    def launch(cls, headless=True, announce_timeout=15.0, cwd=None, extra_args=(), env=None):
+    def launch(cls, headless=True, announce_timeout=15.0, cwd=None, extra_args=(), env=None, stderr_line=None):
         """cwd: the server's working directory (default: the exe's directory). extra_args: more command-line
-        arguments (for example ["--log-format", "json"]). env: environment overrides on top of this process's."""
+        arguments (for example ["--log-format", "json"]). stderr_line: see __init__. env: environment overrides on top of this process's."""
         args = [exe_path(), "--serve"] + (["--headless"] if headless else []) + list(extra_args)
         child_env = None if env is None else dict(os.environ, **env)
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -261,7 +268,7 @@ class Harness:
         except ValueError:
             process.kill()
             raise RuntimeError("announcement is not JSON: {!r}".format(line))
-        harness = cls(process, announcement)
+        harness = cls(process, announcement, stderr_line)
         harness.announcement_line = line
         return harness
 

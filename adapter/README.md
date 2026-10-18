@@ -16,7 +16,7 @@ Run it from the `adapter` directory, or put that directory on `PYTHONPATH`:
 
 ```
 cd adapter
-python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk <image>] [--realtime] [--text-screen]
+python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk <image>] [--realtime] [--text-screen] [--log-format text|json]
 ```
 
 | Flag | Meaning |
@@ -25,6 +25,8 @@ python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk 
 | `--headless` | No window and no audio device. Without it the harness shows a view-only window and plays the sound. |
 | `--disk <image>` | A disk image for slot 6, drive 1. The harness works on a copy; the original is never written to. Without it the machine starts with no disk. |
 | `--realtime` | Run in realtime mode. The default is stepped mode. |
+| `--log-format text\|json` | Format of the log lines on stderr (default `text`). It is also passed to the harness, whose stderr lines are forwarded unchanged, so in `json` mode every stderr line is one JSON object `{ts, level, msg, component, ...}` (`component` is `adapter` for the adapter's own lines). stdout is always MCP only. |
+| `--version` | Prints the adapter version and exits. |
 | `--text-screen` | Turn on the `read_screen` tool (the session is created with `allow_text_screen`). |
 
 The server starts the harness (`--serve`), creates the session and serves MCP on stdio. stdout carries MCP frames only; log lines go to stderr. When the server exits it closes the session and the harness exits. To run a task, see [examples/basic_count.md](examples/basic_count.md).
@@ -50,7 +52,8 @@ No other operator method (sessions, checkpoints, export, speed, stepping) is rea
 - **Typing.** `type_text` and `press_key` block until the Apple has read the keys, plus a few frames for the program to echo them, so a `look` straight afterwards shows the result. If the keyboard isn't read within 600 frames beyond the time the typing itself takes, the tool returns an error (the program may be busy or not reading keys). Call `wait`, then look.
 - **Sound.** The server subscribes to audio at launch, so `listen` reports sound from launch onwards, not only from the previous `listen`. `listen` with no events reports "no sound events since the last listen".
 - **Swapping disks.** `insert_disk` and `eject_disk` do not reboot the machine or pause it. After a swap, DOS needs a command such as `CATALOG` (or `CATALOG,D2`) to see the new disk. Drives are numbered 1 and 2.
-- **Errors.** A harness error comes back as an MCP tool error with the harness message.
+- **Errors.** A harness error comes back as an MCP tool error with the harness message. That includes the harness limits (`-32602` for an out-of-range value such as `press_key` `hold_ms` over 10000, `-32010` when the input queue is full). The adapter's own caps (`wait`, `listen`) are unchanged.
+- **Version.** `applewin_mcp.__version__` is read from the `VERSION` file at the repository root, or from `adapter/VERSION` in the release bundle; if neither exists it is `0.0.0+unknown`.
 
 ## Tests
 ```

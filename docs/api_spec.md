@@ -181,6 +181,8 @@ Returns `{ session_id }`.
 
 **`eject_disk`** `{ slot: 6, drive: 1|2 }` — flushes the drive's current track, unmounts it and replies `{}`. An empty drive is `-32005`. Any slot other than 6 is `-32602`. The working copy is kept until `close_session`.
 
+**`subscribe_disk_writes`** `{}` / **`unsubscribe_disk_writes`** `{}` — operator only (an agent gets `-32001`). The first makes this connection receive `disk_written` notifications and replies `{}`; the second stops them and replies `{}`. Only writes after the subscribe are reported. Subscribing again changes nothing. Before a session exists they return `-32002`; after a failed restore, `subscribe_disk_writes` returns `-32008`. The subscription lasts until the connection unsubscribes or closes.
+
 Both: after a failed restore they return `-32008`. Before a session exists they return `-32002`. `list_disks` and `export_disk` reflect every swap. `checkpoint` records the drives as they are, including empty ones, and `restore_checkpoint` puts back the checkpointed drive contents (a disk swapped in or out since, or an empty drive, included).
 
 ### Execution control
@@ -271,7 +273,11 @@ A checkpoint is an AppleWin save state plus copies of the working disks, stored 
 | 9 | 1+1+1+1+1 | input state (D6): the //e any-key-down flag ($C010 bit 7), joystick buttons 0 and 1, paddle positions 0 (x) and 1 (y) |
 
 ### Operator notifications
-- `disk_written` `{ slot, drive }`
+- `disk_written` `{ slot: 6, drive: 1|2 }` — sent to connections that called `subscribe_disk_writes`, once per write burst, to say that the drive's working image has new writes and `export_disk` now has something new.
+  - **Burst.** The harness watches AppleWin's own write light for the drive: AppleWin renews it whenever the controller is in write mode with the drive spinning, and it runs out after 1,000,000 emulated cycles (about one emulated second). A burst starts at the first write and ends at the first of: the drive has gone that long without a write; the next `checkpoint`; `export_disk` of that drive; `eject_disk` or `insert_disk` of that drive; or `close_session`. The notification is sent when the burst ends. When an early end causes it, the notification is sent before that call's reply. A write after an early end starts a new burst.
+  - **Timing.** The light is sampled once per emulated frame, between frames, so in a stepped session the notification comes out at a fixed emulated cycle. Reading a disk (`CATALOG`, `LOAD`) is not a write.
+  - **`restore_checkpoint`** discards an open burst without a notification: its writes belong to the timeline that was thrown away.
+  - The working image on disk is written when AppleWin moves the head to another track or the drive stops, so it can lag a write by up to a second. `export_disk` flushes first and is always current.
 - `log` `{ level, message, emulated_ms }`
 
 ## Shared-memory frames

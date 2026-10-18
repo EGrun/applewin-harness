@@ -83,6 +83,10 @@ private:
     void Dispatch(const Command& command);   // replies with the result, an RpcError, or -32603 with what()
     void SendInputApplied();                 // input_applied for every entry of Emulator::TakeAppliedInputs()
     void SendSoundEvents();                  // feed each audio subscriber's detector; sound_started / sound_stopped
+    // disk_written: samples each drive's write light and sends one notification per write burst. `endOpen` ends every
+    // open burst now (or just `onlyDrive`'s, 0 or 1); ResetDiskBursts forgets them without a notification.
+    void SampleDiskWrites(bool endOpen = false, int onlyDrive = -1);
+    void ResetDiskBursts();
     void SendFrameReady();                   // frame_ready to the subscribers that are due (the present observer)
     bool PauseRunning();                     // Running: run until the next present, then Paused; false if the window closed
     void Cleanup() noexcept;                 // emulator shut down, working copies, work dir and INI removed
@@ -109,6 +113,8 @@ private:
     void ApplySpeed(const nlohmann::json& params, bool create);
     nlohmann::json GetAudio(const nlohmann::json& params);
     nlohmann::json SubscribeAudio(const ConnectionPtr& connection, const nlohmann::json& params);
+    nlohmann::json SubscribeDiskWrites(const ConnectionPtr& connection);
+    nlohmann::json UnsubscribeDiskWrites(const ConnectionPtr& connection);
 
     // M4 operator methods (docs/specs/m4.md, "API").
     nlohmann::json Checkpoint(const nlohmann::json& params);
@@ -155,6 +161,12 @@ private:
     std::map<uint64_t, ConnectionPtr> inputOwners_;   // input_id -> the connection that receives input_applied
     std::map<uint64_t, FrameSubscription> frameSubscriptions_;   // by connection id
     std::map<uint64_t, AudioSubscription> audioSubscriptions_;   // by connection id
+    std::map<uint64_t, ConnectionPtr> diskWriteSubscribers_;     // by connection id
+    struct DiskBurst {
+        bool open = false;        // a write has been seen and its burst has not been reported
+        uint32_t lastLight = 0;   // the drive's write light at the previous sample
+    };
+    DiskBurst diskBursts_[2];     // by drive (0 = drive 1)
 };
 
 }  // namespace harness

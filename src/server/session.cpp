@@ -228,7 +228,7 @@ bool Session::IsOperatorOnly(std::string_view method)
 int Session::RunMainLoop()
 {
     int rc = 0;
-    emulator_.SetPresentObserver([this] { SendFrameReady(); SendSoundEvents(); });
+    emulator_.SetPresentObserver([this] { SendFrameReady(); SendSoundEvents(); SampleDiskWrites(); });
     try {
         for (;;) {
             if (fatalError_) {
@@ -245,6 +245,7 @@ int Session::RunMainLoop()
                 const bool open = emulator_.RunRealtimeStep();
                 SendInputApplied();
                 SendSoundEvents();
+                SampleDiskWrites();
                 if (!open) break;   // window closed: exit 0
                 if (!emulator_.PumpWindow()) break;
                 if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) break;   // launcher exited: exit 0
@@ -364,8 +365,8 @@ void Session::Dispatch(const Command& command)
         else if (m == "export_disk") result = ExportDisk(params);
         else if (m == "insert_disk") result = InsertDisk(params);
         else if (m == "eject_disk") result = EjectDisk(params);
-        else if (m == "subscribe_disk_writes" || m == "unsubscribe_disk_writes")
-            throw RpcError{kInternalError, "not implemented"};   // stub until M6 Task 4
+        else if (m == "subscribe_disk_writes") result = SubscribeDiskWrites(conn);
+        else if (m == "unsubscribe_disk_writes") result = UnsubscribeDiskWrites(conn);
         else throw RpcError{kMethodNotFound, "method not found: " + m};
         reply = MakeResult(command.id, std::move(result));
         LogSuccess(command.method);
@@ -446,6 +447,7 @@ bool Session::PauseRunning()
     state_ = State::Paused;
     SendInputApplied();
     SendSoundEvents();
+    SampleDiskWrites();
     return open;
 }
 
@@ -463,6 +465,7 @@ void Session::Cleanup() noexcept
     if (!ini_.empty()) fs::remove(ini_, ec);
     frameSubscriptions_.clear();
     audioSubscriptions_.clear();
+    diskWriteSubscribers_.clear();
     inputOwners_.clear();
 }
 
@@ -559,6 +562,7 @@ json Session::CreateSession(const json& params)
 json Session::CloseSession(const json&)
 {
     exitRequested_ = true;   // R6: also valid with no session. The reply is sent, then the loop exits (code 0).
+    SampleDiskWrites(true);   // an open write burst ends here
     return json::object();
 }
 
@@ -593,6 +597,7 @@ json Session::StepFrames(const json& params)
     if (open) open = emulator_.RunFrames(uint32_t(frames), Pacing::Stepped);
     SendInputApplied();
     SendSoundEvents();
+    SampleDiskWrites();
     if (!open) {
         exitRequested_ = true;
         throw RpcError{kInvalidState, "the window was closed"};
@@ -894,6 +899,62 @@ void Session::SendSoundEvents()
     }
 }
 
+// ---- disk_written (docs/specs/m6.md). ----
+// The signal is AppleWin's own per-drive write light (Emulator::DiskWriteLight): set to 1,000,000 cycles whenever the
+// controller is in write mode with the drive spinning, and counted down by every emulated cycle after that. It is
+// sampled between frames on the emulator thread, so it is deterministic in stepped mode. A burst opens when the light
+// has been raised (it rose since the last sample, or is at its maximum) and ends when the light reaches 0 (1,000,000
+// cycles, about one emulated second, without a write), or when the session ends it early (checkpoint, export_disk,
+// eject_disk, insert_disk, close_session). The light left over from an early-ended burst opens nothing new.
+
+json Session::SubscribeDiskWrites(const ConnectionPtr& connection)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    if (diskWriteSubscribers_.empty()) ResetDiskBursts();   // only writes from now on are reported
+    diskWriteSubscribers_[connection->id()] = connection;
+    return json::object();
+}
+
+json Session::UnsubscribeDiskWrites(const ConnectionPtr& connection)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    diskWriteSubscribers_.erase(connection->id());
+    return json::object();
+}
+
+void Session::ResetDiskBursts()
+{
+    try {
+        for (int drive = 0; drive < 2; ++drive)
+            diskBursts_[drive] = DiskBurst{false, emulator_.DiskWriteLight(drive)};
+    } catch (...) {
+    }
+}
+
+void Session::SampleDiskWrites(bool endOpen, int onlyDrive)
+{
+    // Also called from the present observer inside a run: must not throw.
+    try {
+        if (diskWriteSubscribers_.empty() || state_ == State::NoSession) return;
+        for (int drive = 0; drive < 2; ++drive) {
+            if (onlyDrive >= 0 && drive != onlyDrive) continue;
+            DiskBurst& b = diskBursts_[drive];
+            const uint32_t light = emulator_.DiskWriteLight(drive);
+            if (light != 0 && !b.open && (light > b.lastLight || light >= Emulator::kWriteLightCycles)) b.open = true;
+            if (b.open && (light == 0 || endOpen)) {
+                b.open = false;
+                const json note = MakeNotification("disk_written", json{{"slot", 6}, {"drive", drive + 1}});
+                for (auto& [id, conn] : diskWriteSubscribers_) {
+                    try { conn->Send(note); } catch (...) {}
+                }
+            }
+            b.lastLight = light;
+        }
+    } catch (...) {
+    }
+}
+
 // ---- M4: checkpoints, state checksum, step_cycles, disks (docs/specs/m4.md). ----
 
 namespace {
@@ -994,6 +1055,7 @@ json Session::Checkpoint(const json& params)
         exitRequested_ = true;
         throw RpcError{kInvalidState, "the window was closed"};
     }
+    SampleDiskWrites(true);   // an open write burst ends at a checkpoint
     try {
         const SnapshotMeta meta = emulator_.SaveSnapshot(checkpoints_->PendingStateFile());
         emulator_.FlushDisks();
@@ -1077,6 +1139,7 @@ json Session::RestoreCheckpoint(const json& params)
     SendInputApplied();
     const uint64_t at = emulator_.EmulatedCycles();
     audioFloor_ = at;   // audio from before the restore is gone (get_audio: -32009)
+    ResetDiskBursts();   // the restored write light is not a new write; an open burst belonged to the discarded timeline
     for (auto& [cid, sub] : audioSubscriptions_)
         sub.detector = LevelDetector(sub.thresholdDb, sub.minSilenceMs, at);
     state_ = State::Paused;   // both run modes; resume starts a fresh paced run
@@ -1125,6 +1188,7 @@ json Session::StepCycles(const json& params)
     if (open) open = emulator_.RunCycles(cycles);
     SendInputApplied();
     SendSoundEvents();
+    SampleDiskWrites();
     if (!open) {
         exitRequested_ = true;
         throw RpcError{kInvalidState, "the window was closed"};
@@ -1171,6 +1235,7 @@ json Session::ExportDisk(const json& params)
         if (d.drive == int(drive) - 1) found = &d;
     if (!found) throw RpcError{kDiskNotFound, "drive " + std::to_string(drive) + " is empty"};
 
+    SampleDiskWrites(true, int(drive) - 1);   // an open write burst ends at export_disk, before the reply
     emulator_.FlushDisks();
     fs::copy_file(found->workingPath, dest, fs::copy_options::none, ec);
     if (ec) throw RpcError{kInternalError, "cannot write " + PathUtf8(dest) + ": " + ec.message()};
@@ -1212,8 +1277,10 @@ json Session::InsertDisk(const json& params)
     for (const DiskInfo& d : emulator_.Disks())
         if (d.drive == drive) previous = d;
     try {
+        SampleDiskWrites(true, drive);   // the disk being replaced: its write burst ends
         if (previous) emulator_.EjectDisk(drive);   // flushes the track first
         emulator_.InsertDisk(drive, copy->Path(), writeProtected);
+        ResetDiskBursts();
     } catch (const std::exception& e) {
         // AppleWin's own image-open result said no: leave the drive as it was and name the user's image.
         std::string what = e.what();
@@ -1243,7 +1310,9 @@ json Session::EjectDisk(const json& params)
     for (const DiskInfo& d : emulator_.Disks())
         if (d.drive == drive) occupied = true;
     if (!occupied) throw RpcError{kDiskNotFound, "drive " + std::to_string(drive + 1) + " is empty"};
+    SampleDiskWrites(true, drive);   // an open write burst ends at eject_disk
     emulator_.EjectDisk(drive);   // flushes the track first; the working copy stays until close_session
+    ResetDiskBursts();
     return json::object();
 }
 

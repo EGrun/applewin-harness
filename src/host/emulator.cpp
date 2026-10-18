@@ -1891,6 +1891,17 @@ void Emulator::FlushDisks()
             card.FlushCurrentTrack(drive);
 }
 
+uint32_t Emulator::DiskWriteLight(int drive) const
+{
+    RequireStarted();
+    if (drive < DRIVE_1 || drive > DRIVE_2 || GetCardMgr().QuerySlot(SLOT6) != CT_Disk2)
+        return 0;
+    Disk2InterfaceCard& card = Disk2Card();
+    if (card.IsDriveEmpty(drive))
+        return 0;
+    return (card.*Disk2Drives(Disk2DrivesTag{}))[drive].m_writelight;
+}
+
 void Emulator::EjectAll()
 {
     RequireStarted();

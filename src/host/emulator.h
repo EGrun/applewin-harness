@@ -245,6 +245,12 @@ public:
     std::vector<DiskInfo> Disks() const;
     // Writes each drive's current track back to its image (FlushCurrentTrack), so the file holds every write.
     void FlushDisks();
+    // Cycles left on the drive's write light (0 for an empty drive or no Disk II). AppleWin sets it to
+    // kWriteLightCycles whenever the controller is in write mode with the drive spinning, and counts it down by the
+    // emulated cycles of every step after that: nonzero means "written within the last kWriteLightCycles cycles".
+    // The harness's disk_written detector samples it between frames.
+    static constexpr uint32_t kWriteLightCycles = 1000000;   // Disk2InterfaceCard::WRITELIGHT_CYCLES (private there)
+    uint32_t DiskWriteLight(int drive) const;
     // EjectAll: flushes and ejects both slot-6 drives, so AppleWin releases the files, and remembers what was inserted.
     // ReinsertAll: inserts the remembered images again (same paths, same write protection), for a restore abandoned
     // before LoadSnapshot, and forgets them; a no-op when nothing is remembered (a successful LoadSnapshot also forgets

@@ -199,6 +199,49 @@ class DiskWrittenTest(LoggingTestCase):
         op.call("step_frames", frames=120, timeout=60.0)
         self.assertEqual([n["params"] for n in self.written(op)], [{"slot": 6, "drive": 1}])   # a second burst
 
+    def burst_ended_early_by(self, name, make_call):
+        """SAVE in stepped mode and stop 6-frame steps at the third change of the working copy: the head has moved
+        off the last track written, so the burst is still open (the last write is under 1 emulated second old) and
+        the SAVE has no more writes to come. `make_call(op, dest)` is the early end; it must report exactly one
+        disk_written before its reply, and the quiet period after it must report none."""
+        h = self.launch()
+        op, agent = self.booted(h)
+        op.call("subscribe_disk_writes")
+        working = op.call("list_disks")[0]["working_path"]
+        seen = lambda: (os.stat(working).st_mtime_ns, os.stat(working).st_size)
+        last, changes = seen(), 0
+        agent.call("type_text", text="10 REM EARLY\nSAVE EARLY\n", inter_key_delay_ms=0)
+        for _ in range(60):
+            op.call("step_frames", frames=6, timeout=60.0)
+            now = seen()
+            changes += now != last
+            last = now
+            if changes == 3:
+                break
+        self.assertEqual(changes, 3, "the SAVE never wrote the disk three times")
+        self.assertEqual(op.drain_notifications(quiet=0.2, limit=1.0), [], "the burst must still be open")
+        make_call(op, os.path.join(self.tmp_dir(), name + ".dsk"))
+        # The reader queues a notification before the reply that followed it on the wire, so one that was sent before
+        # the reply is already here; none may arrive later.
+        first = op.next_notification(timeout=0)
+        self.assertEqual((first["method"], first["params"]), ("disk_written", {"slot": 6, "drive": 1}))
+        op.call("step_frames", frames=120, timeout=60.0)   # more than 1 emulated second of quiet
+        self.assertEqual(self.written(op), [], "a burst ended early must not be reported again at the quiet period")
+
+    def tmp_dir(self):
+        d = tempfile.mkdtemp(prefix="awh-dw-")
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    def test_export_disk_ends_the_burst_before_its_reply(self):
+        self.burst_ended_early_by("export", lambda op, dest: op.call("export_disk", slot=6, drive=1, dest_path=dest))
+
+    def test_checkpoint_ends_the_burst_before_its_reply(self):
+        self.burst_ended_early_by("cp", lambda op, dest: op.call("checkpoint", name="early"))
+
+    def test_eject_disk_ends_the_burst_before_its_reply(self):
+        self.burst_ended_early_by("eject", lambda op, dest: op.call("eject_disk", slot=6, drive=1))
+
     def test_no_notification_without_a_subscription_or_after_unsubscribing(self):
         h = self.launch()
         op, agent = self.booted(h)

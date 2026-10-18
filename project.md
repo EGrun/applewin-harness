@@ -151,7 +151,17 @@ Build an MCP server that wraps the agent API, and an example agent task (for exa
 
 **Acceptance:** an MCP-capable agent such as Claude completes the example task end to end.
 
-### M6 — Hardening and release (implemented, awaiting final review)
+### M6 — Hardening and release ✅
+**Status:** Done. See `docs/specs/m6.md`. The work covers:
+- input and request limits;
+- structured logging and operator `log` notifications;
+- `disk_written` notifications;
+- ASCII 8.3 short paths for non-ASCII work directories (D10);
+- MIT/GPL licensing (D6);
+- `tools/make_release.ps1` and the release zip, which CI builds, tests from outside the repository, and uploads.
+
+CI passed on 2026-10-18.
+
 Add input rate limits, request size limits, structured logging, and a portable release bundle. Run the end-to-end scenario in CI.
 
 ### Later (optional)

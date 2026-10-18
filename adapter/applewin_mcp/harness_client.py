@@ -232,11 +232,13 @@ class Harness:
             pass
 
     @classmethod
-    def launch(cls, headless=True, announce_timeout=15.0, cwd=None):
-        """cwd: the server's working directory (default: the exe's directory)."""
-        args = [exe_path(), "--serve"] + (["--headless"] if headless else [])
+    def launch(cls, headless=True, announce_timeout=15.0, cwd=None, extra_args=(), env=None):
+        """cwd: the server's working directory (default: the exe's directory). extra_args: more command-line
+        arguments (for example ["--log-format", "json"]). env: environment overrides on top of this process's."""
+        args = [exe_path(), "--serve"] + (["--headless"] if headless else []) + list(extra_args)
+        child_env = None if env is None else dict(os.environ, **env)
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   cwd=cwd or os.path.dirname(exe_path()))
+                                   cwd=cwd or os.path.dirname(exe_path()), env=child_env)
         line_box = []
 
         def read_line():

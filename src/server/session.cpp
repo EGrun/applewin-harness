@@ -193,7 +193,8 @@ bool Session::IsOperatorOnly(std::string_view method)
            method == "checkpoint" || method == "restore_checkpoint" || method == "list_checkpoints" ||
            method == "delete_checkpoint" || method == "get_state_checksum" || method == "step_cycles" ||
            method == "list_disks" || method == "export_disk" ||
-           method == "insert_disk" || method == "eject_disk";
+           method == "insert_disk" || method == "eject_disk" ||
+           method == "subscribe_disk_writes" || method == "unsubscribe_disk_writes";
 }
 
 int Session::RunMainLoop()
@@ -288,6 +289,8 @@ void Session::Dispatch(const Command& command)
         else if (m == "export_disk") result = ExportDisk(params);
         else if (m == "insert_disk") result = InsertDisk(params);
         else if (m == "eject_disk") result = EjectDisk(params);
+        else if (m == "subscribe_disk_writes" || m == "unsubscribe_disk_writes")
+            throw RpcError{kInternalError, "not implemented"};   // stub until M6 Task 4
         else throw RpcError{kMethodNotFound, "method not found: " + m};
         reply = MakeResult(command.id, std::move(result));
     } catch (const RpcError& e) {

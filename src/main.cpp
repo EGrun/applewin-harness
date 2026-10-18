@@ -36,6 +36,7 @@ struct Args {
     bool serve = false;
     bool headless = false;
     bool realtime = false;
+    std::string logFormat = "text";   // --log-format text|json (accepted; applied in M6 Task 2)
     std::optional<std::filesystem::path> disk1;
     std::optional<std::filesystem::path> png;
     std::vector<Step> steps;
@@ -85,7 +86,7 @@ bool ParseTypeText(const std::wstring& s, std::string& out)
 
 bool ParseArgs(int argc, wchar_t** argv, Args& a)
 {
-    bool haveHeadless = false, haveRealtime = false;
+    bool haveHeadless = false, haveRealtime = false, haveLogFormat = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring k = argv[i];
         const bool hasValue = i + 1 < argc;
@@ -95,6 +96,12 @@ bool ParseArgs(int argc, wchar_t** argv, Args& a)
             haveHeadless = a.headless = true;
         } else if (k == L"--realtime" && !haveRealtime) {
             haveRealtime = a.realtime = true;
+        } else if (k == L"--log-format" && hasValue && !haveLogFormat) {
+            haveLogFormat = true;
+            const std::wstring v = argv[++i];
+            if (v == L"text") a.logFormat = "text";
+            else if (v == L"json") a.logFormat = "json";
+            else return false;
         } else if (k == L"--disk1" && hasValue && !a.disk1) {
             a.disk1 = std::filesystem::path(argv[++i]);
         } else if (k == L"--png" && hasValue && !a.png) {

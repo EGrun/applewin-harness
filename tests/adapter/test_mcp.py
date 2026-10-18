@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """MCP adapter over stdio (spec: docs/specs/m5.md, pass conditions 1 and 3; plan Review Focus 1, 2, 3 and 5).
 
 Run: python -m unittest discover -s tests/adapter -v   (HARNESS_EXE selects the exe; default bin/x64/Debug).
@@ -10,6 +11,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -101,6 +103,37 @@ def sha256_file(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+async def m5_end_to_end(test, s):
+    """Pass condition 1 of M5 (and Review Focus 3: no wait between type_text and the screen reads)."""
+    waited = await call(s, "wait", ms=12000)   # boot DOS 3.3
+    test.assertFalse(waited.is_error, text_of(waited))
+    for line in ('10 FOR I = 1 TO 10', '20 PRINT I', '30 NEXT I'):
+        typed = await call(s, "type_text", text=line + "\n")
+        test.assertFalse(typed.is_error, text_of(typed))
+    shown = await call(s, "read_screen")
+    test.assertFalse(shown.is_error, text_of(shown))
+    test.assertIn("20 PRINT I", text_of(shown))   # visible at once, no wait in between
+    ran = await call(s, "type_text", text="HOME:RUN\n")
+    test.assertFalse(ran.is_error, text_of(ran))
+    await call(s, "wait", ms=1500)
+    screen = text_of(await call(s, "read_screen"))
+    lines = screen.splitlines()
+    test.assertTrue(lines[0].startswith("40col"), lines[:1])
+    rows = [l.strip() for l in lines[1:]]
+    test.assertEqual(rows[:10], [str(n) for n in range(1, 11)], screen)
+    looked = await call(s, "look")
+    test.assertFalse(looked.is_error, text_of(looked))
+    images = [c for c in looked.content if c.type == "image"]
+    test.assertEqual(len(images), 1)
+    test.assertEqual(images[0].mime_type, "image/png")
+    test.assertEqual(png_size(base64.b64decode(images[0].data)), (560, 384))
+    # press_key takes a numeric ASCII code (13 = RETURN), not only a string
+    schema = next(t for t in (await s.list_tools()).tools if t.name == "press_key").input_schema
+    test.assertIn("integer", [o.get("type") for o in schema["properties"]["key"]["anyOf"]])
+    pressed = await call(s, "press_key", key=13)
+    test.assertFalse(pressed.is_error, text_of(pressed))
+
+
 class AdapterTestCase(unittest.TestCase):
     def setUp(self):
         self.errlog = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
@@ -162,33 +195,7 @@ class EndToEndTest(AdapterTestCase):
         """Pass condition 1 (and Review Focus 3: no wait between type_text and the screen reads)."""
         async def go():
             async with mcp_session(self.errlog) as s:
-                waited = await call(s, "wait", ms=12000)   # boot DOS 3.3
-                self.assertFalse(waited.is_error, text_of(waited))
-                for line in ('10 FOR I = 1 TO 10', '20 PRINT I', '30 NEXT I'):
-                    typed = await call(s, "type_text", text=line + "\n")
-                    self.assertFalse(typed.is_error, text_of(typed))
-                shown = await call(s, "read_screen")
-                self.assertFalse(shown.is_error, text_of(shown))
-                self.assertIn("20 PRINT I", text_of(shown))   # visible at once, no wait in between
-                ran = await call(s, "type_text", text="HOME:RUN\n")
-                self.assertFalse(ran.is_error, text_of(ran))
-                await call(s, "wait", ms=1500)
-                screen = text_of(await call(s, "read_screen"))
-                lines = screen.splitlines()
-                self.assertTrue(lines[0].startswith("40col"), lines[:1])
-                rows = [l.strip() for l in lines[1:]]
-                self.assertEqual(rows[:10], [str(n) for n in range(1, 11)], screen)
-                looked = await call(s, "look")
-                self.assertFalse(looked.is_error, text_of(looked))
-                images = [c for c in looked.content if c.type == "image"]
-                self.assertEqual(len(images), 1)
-                self.assertEqual(images[0].mime_type, "image/png")
-                self.assertEqual(png_size(base64.b64decode(images[0].data)), (560, 384))
-                # press_key takes a numeric ASCII code (13 = RETURN), not only a string
-                schema = next(t for t in (await s.list_tools()).tools if t.name == "press_key").input_schema
-                self.assertIn("integer", [o.get("type") for o in schema["properties"]["key"]["anyOf"]])
-                pressed = await call(s, "press_key", key=13)
-                self.assertFalse(pressed.is_error, text_of(pressed))
+                await m5_end_to_end(self, s)
         self.run_async(go)
 
     def test_stdout_is_clean_mcp_only(self):
@@ -326,6 +333,121 @@ class ListenTest(AdapterTestCase):
                 self.assertFalse(second.is_error, text_of(second))
                 self.assertNotIn("sound_started", text_of(second))
                 self.assertNotIn("sound_stopped", text_of(second))
+        self.run_async(go)
+
+
+class LimitErrorTest(AdapterTestCase):
+    def test_harness_limit_errors_come_back_as_tool_errors_with_the_harness_message(self):
+        """M6: the adapter passes the harness limits through (hold_ms 0-10000, duration_ms 0-60000,
+        inter_key_delay_ms 0-1000)."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                for name, args, field in (("press_key", {"key": "A", "hold_ms": 10001}, "hold_ms"),
+                                          ("set_joystick", {"x": 1, "duration_ms": 60001}, "duration_ms"),
+                                          ("type_text", {"text": "A", "inter_key_delay_ms": 1001}, "inter_key_delay_ms")):
+                    with self.subTest(tool=name):
+                        result = await call(s, name, **args)
+                        self.assertTrue(result.is_error, "{} {} must be rejected".format(name, args))
+                        self.assertIn(field, text_of(result))   # the harness's -32602 message, not an opaque failure
+        self.run_async(go)
+
+
+class AdapterLoggingTest(AdapterTestCase):
+    SECRET = "QZXADAPTERSECRET"
+
+    def test_json_log_lines_have_the_required_fields(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--log-format", "json"]) as s:
+                await call(s, "wait", ms=100)
+                typed = await call(s, "type_text", text="10 REM " + self.SECRET + "\n")
+                self.assertFalse(typed.is_error, text_of(typed))
+                await call(s, "press_key", key="A", hold_ms=10001)   # rejected by the harness
+        self.run_async(go)
+        lines = [l for l in self.stderr_text().splitlines() if l.strip()]
+        self.assertTrue(lines, "the adapter wrote nothing to stderr")
+        records = []
+        for line in lines:
+            with self.subTest(line=line[:120]):
+                record = json.loads(line)
+                self.assertRegex(record["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+                self.assertIn(record["level"], ("debug", "info", "warning", "error"))
+                self.assertIsInstance(record["msg"], str)
+                self.assertIn("component", record)
+                records.append(record)
+        adapter = [r for r in records if r["component"] == "adapter"]
+        self.assertTrue(adapter, "no record with component 'adapter'")
+        self.assertTrue(any(re.search(r"harness pid \d+", r["msg"]) for r in adapter), "the 'harness pid N' line")
+        self.assertNotIn(self.SECRET, self.stderr_text())
+
+    def test_the_default_format_is_text_with_the_pid_line(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=100)
+        self.run_async(go)
+        self.assertRegex(self.stderr_text(), r"harness pid \d+")
+        self.assertFalse(self.stderr_text().lstrip().startswith("{"))
+
+    def test_an_invalid_log_format_is_a_usage_error(self):
+        env = dict(os.environ, PYTHONPATH=ADAPTER_DIR)
+        r = subprocess.run([sys.executable, "-m", "applewin_mcp", "--exe", exe_path(), "--log-format", "xml"], env=env,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(r.stdout, b"")
+
+
+class VersionTest(unittest.TestCase):
+    def test_the_adapter_version_is_the_version_file(self):
+        import applewin_mcp
+        with open(os.path.join(REPO_ROOT, "VERSION"), encoding="ascii") as f:
+            self.assertEqual(applewin_mcp.__version__, f.read().strip())
+
+
+# ---- Pass condition 7 / Review Focus 5: the extracted bundle works on its own ----
+
+def bundle_root():
+    d = os.path.abspath(os.environ["HARNESS_BUNDLE_DIR"])
+    if not os.path.isfile(os.path.join(d, "AppleWinHarness.exe")):
+        children = [os.path.join(d, c) for c in os.listdir(d) if os.path.isfile(os.path.join(d, c, "AppleWinHarness.exe"))]
+        if len(children) == 1:
+            return children[0]
+    return d
+
+
+@unittest.skipUnless(os.environ.get("HARNESS_BUNDLE_DIR"), "set HARNESS_BUNDLE_DIR to the extracted bundle")
+class BundleSmokeTest(AdapterTestCase):
+    """The M5 end-to-end flow with the bundle's exe and adapter package only (PYTHONPATH=<bundle>/adapter), from a
+    working directory outside the repository. Needs `pip install -r adapter/requirements.txt` and the DOS master."""
+
+    def setUp(self):
+        super().setUp()
+        self.bundle = bundle_root()
+        self.cwd = tempfile.mkdtemp(prefix="awh-m6-bundle-cwd-")
+        self.addCleanup(shutil.rmtree, self.cwd, True)
+        env = dict(os.environ)
+        for name in ("HARNESS_EXE", "PYTHONPATH"):
+            env.pop(name, None)
+        env["PYTHONPATH"] = os.path.join(self.bundle, "adapter")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"   # keep the extracted bundle exactly as the layout test expects
+        self.env = env
+
+    def params(self):
+        return StdioServerParameters(
+            command=sys.executable, env=self.env, cwd=self.cwd,
+            args=["-m", "applewin_mcp", "--exe", os.path.join(self.bundle, "AppleWinHarness.exe"), "--headless",
+                  "--disk", DOS_IMAGE, "--text-screen"])
+
+    def test_the_adapter_package_comes_from_the_bundle(self):
+        out = subprocess.run([sys.executable, "-c", "import applewin_mcp; print(applewin_mcp.__file__)"], env=self.env,
+                             cwd=self.cwd, stdout=subprocess.PIPE, text=True, timeout=60).stdout.strip()
+        self.assertTrue(os.path.normcase(os.path.realpath(out)).startswith(
+            os.path.normcase(os.path.realpath(self.bundle))), out)
+
+    def test_boot_type_run_read_and_look_from_the_bundle(self):
+        async def go():
+            async with stdio_client(self.params(), errlog=self.errlog) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), CALL_TIMEOUT)
+                    await m5_end_to_end(self, session)
         self.run_async(go)
 
 

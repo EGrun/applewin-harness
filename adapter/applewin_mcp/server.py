@@ -27,7 +27,7 @@ from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
 
 FRAMES_PER_SECOND = 60
-INPUT_FRAME_CAP = 600      # frames type_text / press_key wait for the keyboard to be read
+INPUT_FRAME_CAP = 600      # frames type_text / press_key wait beyond the input's own time (the harness's text timeout)
 DEFAULT_HOLD_MS = 50       # the harness's press_key default
 SETTLE_FRAMES = 3          # frames after the last key so the program can echo it
 CALL_TIMEOUT = 600.0
@@ -181,7 +181,7 @@ class Machine:
         self.stepped = not args.realtime
         self.lock = threading.Lock()
         self.events = []        # sound events not yet reported by listen (buffered from launch)
-        self.applied = set()    # input ids whose input_applied has arrived
+        self.applied = {}       # input id -> discarded, for each input whose input_applied has arrived
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
         self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
                                       stderr_line=self._forward_harness_line)
@@ -227,7 +227,7 @@ class Machine:
             wait = 0.0
             method, params = note.get("method"), note.get("params") or {}
             if method == "input_applied":
-                self.applied.add(params.get("input_id"))
+                self.applied[params.get("input_id")] = bool(params.get("discarded"))
             elif method in ("sound_started", "sound_stopped"):
                 self.events.append((method, params))
 
@@ -252,7 +252,10 @@ class Machine:
         while True:
             self.pump(0.02 if self.stepped else 0.0)
             if input_id in self.applied:
-                self.applied.discard(input_id)
+                if self.applied.pop(input_id):   # the harness dropped a text the program did not read (D10)
+                    raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
+                                    "(it may be busy), and the rest of the text was dropped. Call wait to let time "
+                                    "pass, then look.".format(INPUT_FRAME_CAP))
                 self.advance(SETTLE_FRAMES)   # let the program echo the last key
                 return
             if frames >= allowed:
@@ -366,7 +369,9 @@ def build_server(args, machine):
     async def press_key(key: str | int, hold_ms: int = 0) -> str:
         """Press one key: a character, an ASCII code (an integer 0-127, e.g. 13 for
         RETURN), or a name such as RETURN, ESC, TAB, DELETE, LEFT, RIGHT, UP, DOWN, CTRL-A to CTRL-Z,
-        or RESET. Blocks until the keyboard has read it. If the program is not reading the keyboard this fails with an error. To let time pass, call wait."""
+        or RESET. Like a real keyboard it does not wait for the program: a key the program has not read yet is
+        replaced. Returns once the key is released, plus a few frames for the program to react. To let time pass,
+        call wait."""
         return await asyncio.to_thread(machine.press_key, key, hold_ms)
 
     @mcp.tool()

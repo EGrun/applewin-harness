@@ -670,14 +670,28 @@ class AgentMethodsTest(PipeTestCase):
         op.call("step_frames", frames=1)                       # ~17 ms: still held
         with self.assertRaises(TimeoutError):
             agent.next_notification(timeout=0.5)
-        op.call("step_frames", frames=5)
+        now = op.call("step_frames", frames=5)["emulated_cycles"]
         note = agent.next_notification(timeout=5.0)
         self.assertEqual(note["params"]["input_id"], pressed["input_id"])
         self.assertGreaterEqual(note["params"]["last_cycle"] - note["params"]["first_cycle"], ms_to_cycles(50))
 
-        # No program reads the keyboard here, so "A" is still unread: the next key waits for the strobe.
+        # No program reads the keyboard here, so "A" is still unread. press_key does not wait for the strobe: it
+        # replaces "A" (D10).
+        replaced = agent.call("press_key", key="C", hold_ms=0)
+        self.assertEqual(replaced["applied_at_cycle"], now)
+        op.call("step_frames", frames=1)
+        self.assertEqual(agent.next_notification(timeout=5.0)["params"]["input_id"], replaced["input_id"])
+
+        # A type_text key does wait for the strobe; after 600 frames unread the text is dropped as discarded.
         waiting = agent.call("type_text", text="B")
         self.assertIsNone(waiting["applied_at_cycle"])
+        op.call("step_frames", frames=598)
+        with self.assertRaises(TimeoutError):
+            agent.next_notification(timeout=0.5)
+        op.call("step_frames", frames=4)
+        note = agent.next_notification(timeout=5.0)
+        self.assertEqual(note["params"], {"input_id": waiting["input_id"], "first_cycle": None, "last_cycle": None,
+                                          "discarded": True})
 
     def test_input_parameters_are_validated(self):
         h = self.launch()

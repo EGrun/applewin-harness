@@ -180,6 +180,12 @@ Input is applied between bursts or steps. Every input response reports `applied_
 - **Stepped mode:** this is the paused cycle count, so it's fully deterministic.
 - **Realtime mode:** when input lands depends on when the client sends it. The cycle stamp records exactly when it was applied, so a run can be analysed afterwards and, later, replayed.
 
+**Keys and the strobe (post-M6 fix, 2026-10-19):** M3 made every key wait until the keyboard strobe was clear. A program that stops reading the keyboard (a game mid-animation) then left one unread `press_key` at the head of the queue for ever, and everything behind it (keys, joystick changes, RESET) with it. The rules are now:
+- **`press_key` does not wait for the strobe.** It overwrites the keyboard latch, as a keypress does on a real //e (AppleWin's `KeybQueueKeypress`): a key the program has not read yet is lost.
+- **`type_text` still waits for the strobe**, key by key, so typed text arrives whole and in order (like AppleWin's paste).
+- **A `type_text` key that is due but not taken within 600 frames is dropped with the rest of its text**, reported once as `input_applied { …, discarded: true }` (the D1 shape). Nothing else in the queue waits on the program, so the queue always drains on its own.
+- RESET stays in queue order: with the two rules above it can wait at most for one text timeout.
+
 ## D11 — Speed controls mirror AppleWin exactly
 **Status:** Accepted
 

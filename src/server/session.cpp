@@ -404,12 +404,13 @@ void Session::SendInputApplied()
             } else {
                 params["first_cycle"] = a.firstCycle;
                 params["last_cycle"] = a.lastCycle;
-                if (!a.keys.empty()) {   // press_keys (D10, "Key sequences")
-                    json keys = json::array();
-                    for (const KeyTiming& k : a.keys)
-                        keys.push_back(json{{"applied_cycle", k.appliedCycle}, {"read_cycle", k.readCycle}});
-                    params["keys"] = std::move(keys);
-                }
+            }
+            if (!a.keys.empty()) {   // press_keys (D10, "Key sequences"); a timed-out one: the keys it pressed
+                json keys = json::array();
+                for (const KeyTiming& k : a.keys)
+                    keys.push_back(json{{"applied_cycle", k.appliedCycle},
+                                        {"read_cycle", k.readCycle ? json(k.readCycle) : json(nullptr)}});
+                params["keys"] = std::move(keys);
             }
             conn->Send(MakeNotification("input_applied", params));
         } catch (...) {

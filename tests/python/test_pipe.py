@@ -717,6 +717,24 @@ class AgentMethodsTest(PipeTestCase):
         # the default 50 ms hold of "LEFT" outlasts its read, so its release is the last effect
         self.assertGreaterEqual(params["last_cycle"] - keys[2]["applied_cycle"], ms_to_cycles(50))
 
+    def test_a_timed_out_press_keys_reports_the_keys_it_pressed(self):
+        h = self.launch()
+        op = self.stepped_session(h)   # no disk: nothing reads the keyboard
+        op.call("step_frames", frames=10)
+        agent = h.connect("agent")
+        sent = agent.call("press_keys", keys=["A", "B"])
+        op.call("step_frames", frames=598)
+        with self.assertRaises(TimeoutError):
+            agent.next_notification(timeout=0.5)
+        op.call("step_frames", frames=4)
+        params = agent.next_notification(timeout=5.0)["params"]
+        self.assertEqual(params["input_id"], sent["input_id"])
+        self.assertTrue(params["discarded"])
+        self.assertIsNone(params["first_cycle"])
+        self.assertEqual(len(params["keys"]), 1)   # "A" was pressed and never read; "B" was never pressed
+        self.assertIsInstance(params["keys"][0]["applied_cycle"], int)
+        self.assertIsNone(params["keys"][0]["read_cycle"])
+
     def test_press_keys_parameters_are_validated(self):
         h = self.launch()
         self.stepped_session(h)

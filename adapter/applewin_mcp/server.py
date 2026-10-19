@@ -2,7 +2,7 @@
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
-and as agent (to type, look, listen), and serves eleven tools over MCP stdio.
+and as agent (to type, look, listen), and serves twelve tools over MCP stdio.
 
 stdout carries MCP frames only: the harness child's stdout is a pipe that harness_client drains, and all logging goes
 to stderr. The adapter writes the line "harness pid <N>" to stderr once the harness is running.
@@ -27,7 +27,8 @@ from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
 
 FRAMES_PER_SECOND = 60
-INPUT_FRAME_CAP = 600      # frames type_text / press_key wait beyond the input's own time (the harness's text timeout)
+BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC: emulated cycles to emulated ms (D10)
+INPUT_FRAME_CAP = 600      # frames per key the input tools wait beyond the input's own time (the harness's timeout)
 DEFAULT_HOLD_MS = 50       # the harness's press_key default
 SETTLE_FRAMES = 3          # frames after the last key so the program can echo it
 CALL_TIMEOUT = 600.0
@@ -151,6 +152,10 @@ def configure_logging(log_format):
     _writer.dropped_line = dropped_line
 
 
+def cycles_to_ms(cycles):
+    return cycles * 1000.0 / BASE_CLOCK_HZ
+
+
 def log(message):
     _logger.info(message)
 
@@ -257,7 +262,7 @@ class Machine:
             wait = 0.0
             method, params = note.get("method"), note.get("params") or {}
             if method == "input_applied":
-                self.applied[params.get("input_id")] = bool(params.get("discarded"))
+                self.applied[params.get("input_id")] = params
             elif method in ("sound_started", "sound_stopped"):
                 self.events.append((method, params))
 
@@ -274,20 +279,22 @@ class Machine:
         else:
             time.sleep(ms / 1000.0)
 
-    def await_input(self, input_id, expected_ms):
-        """Lets time pass, a frame at a time, until input_applied arrives for input_id. The cap counts frames beyond
-        expected_ms, the time the input itself takes (keys x delay, or the hold)."""
+    def await_input(self, input_id, expected_ms, keys=1):
+        """Lets time pass, a frame at a time, until input_applied arrives for input_id, and returns its params. The
+        cap counts frames beyond expected_ms, the time the input itself takes (keys x delay, or the hold): 600 per key,
+        since the harness may wait that long on each key before it drops the rest (D10). It is only a safety net."""
         frames = 0
-        allowed = math.ceil(expected_ms * FRAMES_PER_SECOND / 1000) + INPUT_FRAME_CAP
+        allowed = math.ceil(expected_ms * FRAMES_PER_SECOND / 1000) + INPUT_FRAME_CAP * max(1, keys)
         while True:
             self.pump(0.02 if self.stepped else 0.0)
             if input_id in self.applied:
-                if self.applied.pop(input_id):   # the harness dropped a text the program did not read (D10)
+                params = self.applied.pop(input_id)
+                if params.get("discarded"):   # the harness dropped keys the program did not read (D10)
                     raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
-                                    "(it may be busy), and the rest of the text was dropped. Call wait to let time "
+                                    "(it may be busy), and the rest of the keys were dropped. Call wait to let time "
                                     "pass, then look.".format(INPUT_FRAME_CAP))
                 self.advance(SETTLE_FRAMES)   # let the program echo the last key
-                return
+                return params
             if frames >= allowed:
                 raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
                                 "(it may be busy). Call wait to let time pass, then look.".format(INPUT_FRAME_CAP))
@@ -299,7 +306,7 @@ class Machine:
     def type_text(self, text, inter_key_delay_ms):
         with self.lock:
             reply = self.rpc(self.agent, "type_text", text=text, inter_key_delay_ms=inter_key_delay_ms)
-            self.await_input(reply["input_id"], len(text) * inter_key_delay_ms)
+            self.await_input(reply["input_id"], len(text) * inter_key_delay_ms, keys=len(text))
         return "typed {} characters".format(len(text))
 
     def press_key(self, key, hold_ms):
@@ -310,6 +317,23 @@ class Machine:
             reply = self.rpc(self.agent, "press_key", **params)
             self.await_input(reply["input_id"], hold_ms if hold_ms > 0 else DEFAULT_HOLD_MS)
         return "pressed {}".format(key)
+
+    def press_keys(self, keys):
+        with self.lock:
+            reply = self.rpc(self.agent, "press_keys", keys=keys)   # the harness validates every entry
+            expected_ms = 0   # an upper bound: every delay and every hold, end to end
+            for k in keys:
+                entry = k if isinstance(k, dict) else {}
+                expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
+            applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys))
+        timings = applied.get("keys") or []
+        start = timings[0]["applied_cycle"] if timings else 0
+        lines = []
+        for i, (k, t) in enumerate(zip(keys, timings), 1):
+            name = k.get("key") if isinstance(k, dict) else k
+            lines.append("{}. {}  applied {:.1f} ms  read {:.1f} ms".format(
+                i, name, cycles_to_ms(t["applied_cycle"] - start), cycles_to_ms(t["read_cycle"] - start)))
+        return "\n".join(lines)
 
     def set_joystick(self, x, y, button0, button1, duration_ms):
         params = {}
@@ -432,6 +456,19 @@ def build_server(args, machine):
         replaced. Returns once the key is released, plus a few frames for the program to react. To let time pass,
         call wait."""
         return await asyncio.to_thread(machine.press_key, key, hold_ms)
+
+    @mcp.tool()
+    async def press_keys(keys: list[str | int | dict]) -> str:
+        """Press a timed sequence of keys in one call, timed in the machine's own time: use it for a game manoeuvre
+        whose keys must land at exact moments (your thinking time between calls would otherwise sit between them).
+        Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
+        delay_ms (default 0, up to 10000) is the gap after the previous key was pressed (for the first key, after
+        this call); hold_ms (default 50, up to 10000) is how long the key is held, and may outlast later keys. Each
+        key also waits until the program has read the previous one, so fast keys are never lost (LEFT, LEFT stays two
+        presses). At most 256 keys. Returns, per key, when it was pressed (applied) and when the program read it, in
+        ms from the first press: a program acts on a key when it reads it. Returns once the last key is read and
+        released. If the program stops reading keys for 600 frames the rest are dropped and this fails."""
+        return await asyncio.to_thread(machine.press_keys, keys)
 
     @mcp.tool()
     async def set_joystick(x: int | None = None, y: int | None = None, button0: bool | None = None,

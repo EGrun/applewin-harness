@@ -360,6 +360,125 @@ TEST_CASE("input: TypeText throws when the keyboard is not read and leaves nothi
     KeybClearStrobe();
 }
 
+TEST_CASE("press_keys: each key waits for the previous read and its delay, and reports applied and read cycles")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    (void)e.TakeAppliedInputs();
+
+    // "B" 30 ms after "A"; "C" as soon as BASIC has read "B" (delay 0 never overwrites an unread key).
+    const uint64_t id = e.QueueKeys({{KeySpec(uint8_t('A')), 0, 0}, {KeySpec(uint8_t('B')), 30, 0},
+                                     {KeySpec(uint8_t('C')), 0, 0}});
+    CHECK(e.ScheduledCycle(id) == std::optional<uint64_t>(e.EmulatedCycles()));   // strobe clear, no first delay
+    REQUIRE(e.RunFrames(30));
+
+    const auto rows = Rows(e);
+    INFO("text page 1 (trimmed):" << Screen(rows));
+    CHECK(LastNonEmptyRow(rows) == "]ABC");
+
+    const auto a = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(a.has_value());
+    CHECK(!a->discarded);
+    REQUIRE(a->keys.size() == 3);
+    for (const KeyTiming& k : a->keys)
+        CHECK(k.appliedCycle < k.readCycle);
+    CHECK(a->firstCycle == a->keys[0].appliedCycle);
+    CHECK(a->keys[1].appliedCycle >= a->keys[0].appliedCycle + MsToCycles(30));
+    CHECK(a->keys[1].appliedCycle >= a->keys[0].readCycle);
+    CHECK(a->keys[1].appliedCycle < a->keys[0].appliedCycle + MsToCycles(30) + MsToCycles(2));   // a step or two
+    CHECK(a->keys[2].appliedCycle >= a->keys[1].readCycle);
+    CHECK(a->keys[2].appliedCycle < a->keys[1].readCycle + MsToCycles(2));   // delay 0: at the next step
+    CHECK(a->lastCycle == a->keys[2].readCycle);
+}
+
+TEST_CASE("press_keys: a hold may run past the next key, and the sequence completes at the last release")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    (void)e.TakeAppliedInputs();
+
+    const uint64_t id = e.QueueKeys({{KeySpec(uint8_t('A')), 0, 200}, {KeySpec(uint8_t('B')), 0, 0}});
+    REQUIRE(e.RunFrames(6));   // ~100 ms: "B" pressed and read, "A" still held
+    CHECK(!FindApplied(e.TakeAppliedInputs(), id).has_value());
+    REQUIRE(e.RunFrames(12));   // ~300 ms
+    const auto a = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(a.has_value());
+    REQUIRE(a->keys.size() == 2);
+    CHECK(a->keys[1].appliedCycle < a->keys[0].appliedCycle + MsToCycles(200));
+    CHECK(a->lastCycle >= a->keys[0].appliedCycle + MsToCycles(200));
+    CHECK(a->lastCycle < a->keys[0].appliedCycle + MsToCycles(200) + MsToCycles(2));
+
+    const auto rows = Rows(e);
+    INFO("text page 1 (trimmed):" << Screen(rows));
+    CHECK(LastNonEmptyRow(rows) == "]AB");
+}
+
+TEST_CASE("press_keys: a last key left unread for 600 frames discards the sequence and the queue drains")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+    KeybClearStrobe();
+
+    const uint64_t id = e.QueueKeys({{KeySpec(ArrowKey::Left), 0, 0}});
+    const uint64_t joy = e.QueueJoystick(X(10), 0);
+    REQUIRE(e.RunFrames(598));
+    CHECK(e.TakeAppliedInputs().empty());   // waiting for "LEFT" to be read; the joystick change waits behind it
+    REQUIRE(e.RunFrames(4));
+    const auto applied = e.TakeAppliedInputs();
+    const auto a = FindApplied(applied, id), j = FindApplied(applied, joy);
+    REQUIRE(a.has_value());
+    CHECK(a->discarded);
+    CHECK(a->keys.empty());
+    REQUIRE(j.has_value());
+    CHECK(e.PendingInputEvents() == 0);
+    KeybClearStrobe();
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("press_keys: a first-key delay counts from the queueing, and the applied cycle is then not known")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));
+    (void)e.TakeAppliedInputs();
+    KeybClearStrobe();
+
+    const uint64_t queuedAt = e.EmulatedCycles();
+    const uint64_t id = e.QueueKeys({{KeySpec(uint8_t('A')), 50, 0}});
+    CHECK(e.ScheduledCycle(id) == std::nullopt);
+    REQUIRE(e.RunFrames(2));   // ~33 ms
+    CHECK((KeybReadData() & 0x80) == 0);
+    REQUIRE(e.RunFrames(2));   // ~67 ms
+    CHECK(int(KeybReadData()) == int(0x80 | 'A'));
+    const auto first = e.ScheduledCycle(id);
+    REQUIRE(first.has_value());
+    CHECK(*first >= queuedAt + MsToCycles(50));
+    CHECK(*first < queuedAt + MsToCycles(52));
+    KeybClearStrobe();
+    REQUIRE(e.RunFrames(1));
+    CHECK(FindApplied(e.TakeAppliedInputs(), id).has_value());
+}
+
+TEST_CASE("press_keys: invalid sequences throw std::invalid_argument and queue nothing")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));
+
+    CHECK_THROWS_AS(e.QueueKeys({}), std::invalid_argument);
+    CHECK_THROWS_AS(e.QueueKeys({{KeySpec(uint8_t('A')), 0, 0}, {KeySpec(ResetKey{}), 0, 0}}), std::invalid_argument);
+    CHECK_THROWS_AS(e.QueueKeys({{KeySpec(uint8_t(128)), 0, 0}}), std::invalid_argument);
+    CHECK(e.PendingInputEvents() == 0);
+}
+
 TEST_CASE("input: RESET returns to the BASIC prompt without waiting for the strobe")
 {
     auto& e = StartedEmulator();

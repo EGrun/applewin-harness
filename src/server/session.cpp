@@ -35,6 +35,8 @@ constexpr DWORD kIdleWaitMs = 50;
 constexpr uint64_t kMaxHoldMs = 10000;            // press_key.hold_ms
 constexpr uint64_t kMaxDurationMs = 60000;        // set_joystick.duration_ms
 constexpr uint64_t kMaxInterKeyDelayMs = 1000;    // type_text.inter_key_delay_ms
+constexpr uint64_t kMaxKeyDelayMs = 10000;        // press_keys delay_ms
+constexpr size_t kMaxSequenceKeys = 256;          // press_keys keys
 constexpr uint64_t kMaxPendingInputEvents = 4096;
 constexpr size_t kMaxStringUnits = 32767;         // any string parameter, in UTF-16 code units
 
@@ -291,7 +293,7 @@ bool IsKnownMethod(const std::string& m)
 {
     static const char* const kNames[] = {
         "create_session", "close_session", "pause", "resume", "step_frames", "get_frame", "get_text_screen",
-        "subscribe_frames", "type_text", "press_key", "set_joystick", "set_speed", "get_speed", "get_audio",
+        "subscribe_frames", "type_text", "press_key", "press_keys", "set_joystick", "set_speed", "get_speed", "get_audio",
         "subscribe_audio", "checkpoint", "restore_checkpoint", "list_checkpoints", "delete_checkpoint",
         "get_state_checksum", "step_cycles", "list_disks", "export_disk", "insert_disk", "eject_disk",
         "subscribe_disk_writes", "unsubscribe_disk_writes"};
@@ -351,6 +353,7 @@ void Session::Dispatch(const Command& command)
         else if (m == "subscribe_frames") result = SubscribeFrames(conn, params);
         else if (m == "type_text") result = TypeText(conn, params);
         else if (m == "press_key") result = PressKey(conn, params);
+        else if (m == "press_keys") result = PressKeys(conn, params);
         else if (m == "set_joystick") result = SetJoystick(conn, params);
         else if (m == "set_speed") result = SetSpeed(params);
         else if (m == "get_speed") result = GetSpeed(params);
@@ -401,6 +404,12 @@ void Session::SendInputApplied()
             } else {
                 params["first_cycle"] = a.firstCycle;
                 params["last_cycle"] = a.lastCycle;
+                if (!a.keys.empty()) {   // press_keys (D10, "Key sequences")
+                    json keys = json::array();
+                    for (const KeyTiming& k : a.keys)
+                        keys.push_back(json{{"applied_cycle", k.appliedCycle}, {"read_cycle", k.readCycle}});
+                    params["keys"] = std::move(keys);
+                }
             }
             conn->Send(MakeNotification("input_applied", params));
         } catch (...) {
@@ -764,6 +773,31 @@ json Session::PressKey(const ConnectionPtr& connection, const json& params)
     const uint64_t hold = GetUint(params, "hold_ms", 0, kMaxHoldMs, kDefaultHoldMs);
     RequireInputRoom(1);
     const uint64_t id = emulator_.QueueKey(key, uint32_t(hold));
+    inputOwners_[id] = connection;
+    return InputReply(id, emulator_.ScheduledCycle(id));
+}
+
+// press_keys { keys: [key | { key, delay_ms = 0, hold_ms = 50 }] } (D10, "Key sequences"). All or nothing.
+json Session::PressKeys(const ConnectionPtr& connection, const json& params)
+{
+    if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
+    RequireUsable();
+    const json* list = Field(params, "keys");
+    if (!list) InvalidParams("keys is required");
+    if (!list->is_array()) InvalidParams("keys must be an array");
+    if (list->empty() || list->size() > kMaxSequenceKeys) InvalidParams("keys must have 1 to 256 entries");
+    std::vector<SequenceKey> keys;
+    for (const json& entry : *list) {
+        const json item = entry.is_object() ? entry : json{{"key", entry}};
+        SequenceKey k;
+        k.key = ParseKey(item);
+        if (std::holds_alternative<ResetKey>(k.key)) InvalidParams("RESET is not allowed in press_keys; use press_key");
+        k.delayMs = uint32_t(GetUint(item, "delay_ms", 0, kMaxKeyDelayMs, 0));
+        k.holdMs = uint32_t(GetUint(item, "hold_ms", 0, kMaxHoldMs, kDefaultHoldMs));
+        keys.push_back(k);
+    }
+    RequireInputRoom(keys.size());
+    const uint64_t id = emulator_.QueueKeys(std::move(keys));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
 }

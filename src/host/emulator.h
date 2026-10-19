@@ -56,8 +56,8 @@ struct SequenceKey {
     uint32_t holdMs = 50;
 };
 
-// A sequence key's applied cycle (put in the keyboard latch) and read cycle (the first step boundary at which the
-// program had cleared the strobe after that). EmulatedCycles() values.
+// A sequence key's applied cycle (put in the keyboard latch) and read cycle (the first step boundary after the program's
+// first keyboard read, $C000-$C00F, since then; 0: never read). EmulatedCycles() values.
 struct KeyTiming {
     uint64_t appliedCycle = 0, readCycle = 0;
 };
@@ -74,8 +74,8 @@ struct JoystickChange {
 // duration. press_keys: the first press, and the later of the last read and the last release, with keys holding each
 // key's timing. Cycles are EmulatedCycles() values. discarded (ruling D1, docs/specs/m4.md "Restore purity"; D10): the
 // input was still pending when LoadSnapshot ran, or was a text or sequence with a key unread for 600 frames, and never
-// took (full) effect; firstCycle and lastCycle are then 0 and meaningless (the session reports them as null) and keys is
-// empty.
+// took (full) effect; firstCycle and lastCycle are then 0 and meaningless (the session reports them as null), and keys
+// holds the keys a timed-out press_keys pressed (the unread one with readCycle 0) and is otherwise empty.
 struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
     bool discarded = false;
@@ -166,12 +166,12 @@ public:
     // holdMs later (vk: the key's own VK where one exists, VK_SPACE otherwise). An ASCII code above 127 throws
     // std::invalid_argument.
     uint64_t QueueKey(KeySpec key, uint32_t holdMs);
-    // press_keys (D10, "Key sequences"): the same queue entry as a text, with a delay and a hold per key. Key i is due
-    // at the later of the previous key's applied cycle plus its delayMs (key 0: the queueing plus its delayMs) and the
-    // moment the strobe clears; holds as for QueueKey, and they may outlast later keys. It completes once the last key
-    // is read and every hold released, reporting KeyTiming per key; a key due for 600 frames with the strobe set, or a
-    // last key unread for 600 frames, discards it. Throws std::invalid_argument for no keys, RESET or an ASCII code
-    // above 127.
+    // press_keys (D10, "Key sequences"): the same queue entry as a text, with a delay and a hold per key. Key i > 0 is
+    // due at the later of the previous key's applied cycle plus its delayMs and the program's first keyboard read
+    // ($C000-$C00F) since the previous key was pressed; key 0 at the queueing plus its delayMs, waiting for nothing
+    // else. Holds as for QueueKey, and they may outlast later keys. It completes once the last key is read and every
+    // hold released, reporting KeyTiming per key; a key unread 600 frames after its press discards it (reporting the
+    // keys pressed). Throws std::invalid_argument for no keys, RESET or an ASCII code above 127.
     uint64_t QueueKeys(std::vector<SequenceKey> keys);
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);

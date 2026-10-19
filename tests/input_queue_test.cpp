@@ -424,7 +424,7 @@ TEST_CASE("press_keys: a last key left unread for 600 frames discards the sequen
     (void)e.TakeAppliedInputs();
     KeybClearStrobe();
 
-    const uint64_t id = e.QueueKeys({{KeySpec(ArrowKey::Left), 0, 0}});
+    const uint64_t id = e.QueueKeys({{KeySpec(ArrowKey::Left), 0, 0}, {KeySpec(ArrowKey::Right), 0, 0}});
     const uint64_t joy = e.QueueJoystick(X(10), 0);
     REQUIRE(e.RunFrames(598));
     CHECK(e.TakeAppliedInputs().empty());   // waiting for "LEFT" to be read; the joystick change waits behind it
@@ -433,7 +433,9 @@ TEST_CASE("press_keys: a last key left unread for 600 frames discards the sequen
     const auto a = FindApplied(applied, id), j = FindApplied(applied, joy);
     REQUIRE(a.has_value());
     CHECK(a->discarded);
-    CHECK(a->keys.empty());
+    REQUIRE(a->keys.size() == 1);   // the keys pressed: "LEFT", never read; "RIGHT" was never pressed
+    CHECK(a->keys[0].appliedCycle > 0);
+    CHECK(a->keys[0].readCycle == 0);
     REQUIRE(j.has_value());
     CHECK(e.PendingInputEvents() == 0);
     KeybClearStrobe();
@@ -462,8 +464,50 @@ TEST_CASE("press_keys: a first-key delay counts from the queueing, and the appli
     CHECK(*first >= queuedAt + MsToCycles(50));
     CHECK(*first < queuedAt + MsToCycles(52));
     KeybClearStrobe();
+}
+
+TEST_CASE("press_keys: the first key does not wait for a key an earlier input left unread")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+
+    KeybQueueKeypress(WPARAM('X'), ASCII);   // a stale key: the strobe is set
+    const uint64_t id = e.QueueKeys({{KeySpec(uint8_t('Y')), 0, 0}});
+    CHECK(e.ScheduledCycle(id) == std::optional<uint64_t>(e.EmulatedCycles()));
     REQUIRE(e.RunFrames(1));
-    CHECK(FindApplied(e.TakeAppliedInputs(), id).has_value());
+    CHECK(int(KeybReadData()) == int(0x80 | 'Y'));   // replaced, as press_key does
+    KeybClearStrobe();
+}
+
+TEST_CASE("press_keys: a keyboard read counts as read even when the program never clears the strobe")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    e.QueueText("10 GOTO 10\rRUN\r", 0);
+    REQUIRE(e.RunFrames(60));
+    (void)e.TakeAppliedInputs();
+
+    // Applesoft's Ctrl-C check (ISCNTC) reads $C000 between statements and never clears the strobe for other keys.
+    const uint64_t id = e.QueueKeys({{KeySpec(ArrowKey::Left), 0, 0}, {KeySpec(ArrowKey::Left), 0, 0},
+                                     {KeySpec(uint8_t('Q')), 0, 0}});
+    REQUIRE(e.RunFrames(10));
+    const auto a = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(a.has_value());
+    CHECK(!a->discarded);
+    REQUIRE(a->keys.size() == 3);
+    for (size_t i = 0; i < a->keys.size(); ++i) {
+        CHECK(a->keys[i].appliedCycle < a->keys[i].readCycle);
+        CHECK(a->keys[i].readCycle - a->keys[i].appliedCycle < MsToCycles(2));   // read within a step or two
+        if (i > 0)
+            CHECK(a->keys[i].appliedCycle >= a->keys[i - 1].readCycle);
+    }
+    CHECK((KeybReadData() & 0x80) != 0);   // the strobe is still set: only the reads counted
+    e.QueueKey(ResetKey{}, 0);
+    CHECK(e.RunFrames(30));
 }
 
 TEST_CASE("press_keys: invalid sequences throw std::invalid_argument and queue nothing")

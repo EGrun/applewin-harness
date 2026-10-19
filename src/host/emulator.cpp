@@ -149,7 +149,7 @@ struct QueuedOp {
     std::vector<SeqStep> steps;
     size_t next = 0;
     uint64_t earliest = 0;      // the next key is not due before this cycle
-    std::optional<uint64_t> waitingSince;   // waiting on the program (strobe set) since this cycle
+    std::optional<uint64_t> waitingSince;   // type_text: waiting on the program (strobe set) since this cycle
     bool timed = false;         // press_keys: completes once the last key is read, with timings
     std::vector<KeyTiming> timings;   // timed: one per applied key; readCycle 0 until read (a read follows its apply)
     // Key
@@ -197,6 +197,26 @@ bool StrobeClear()
     return (KeybReadData() & 0x80) == 0;
 }
 
+// The program's keyboard reads ($C000-$C00F; D10, "Read is a keyboard read"), seen through a pass-through on AppleWin's
+// IORead[0]: it only notes the read, so the value and the timing are AppleWin's own.
+iofunction g_appleC00xRead = nullptr;   // AppleWin's handler
+bool g_keyboardRead = false;            // a $C00x read since a timed sequence last pressed a key
+
+BYTE __stdcall KeyboardReadTap(WORD pc, WORD addr, BYTE writeFlag, BYTE writeValue, ULONG executedCycles)
+{
+    g_keyboardRead = true;
+    return g_appleC00xRead(pc, addr, writeFlag, writeValue, executedCycles);
+}
+
+// AppleWin rebuilds IORead at MemInitialize and on a snapshot load (MemInitializeFromSnapshot): re-tap when it did.
+void TapKeyboardReads()
+{
+    if (IORead[0] == KeyboardReadTap)
+        return;
+    g_appleC00xRead = IORead[0];
+    IORead[0] = KeyboardReadTap;
+}
+
 // The key's own VK where AppleWin's AKD table accepts one, VK_SPACE otherwise.
 WPARAM VkForAscii(uint8_t c)
 {
@@ -234,13 +254,14 @@ void Complete(uint64_t id, uint64_t first, uint64_t last)
     g_input.applied.push_back(InputApplied{id, first, last});
 }
 
-// Reports an input that never took (full) effect (ruling D1; D10's sequence timeout).
-void ReportDiscarded(uint64_t id)
+// Reports an input that never took (full) effect (ruling D1; D10's sequence timeout, with the keys it pressed).
+void ReportDiscarded(uint64_t id, std::vector<KeyTiming> keys = {})
 {
     InputApplied a;
     a.inputId = id;
     a.discarded = true;
-    g_input.applied.push_back(a);
+    a.keys = std::move(keys);
+    g_input.applied.push_back(std::move(a));
 }
 
 void ApplyJoy(const JoyState& s)
@@ -361,6 +382,7 @@ void ProcessDueInput()
 {
     const uint64_t now = EmulatedNow();
     const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
+    TapKeyboardReads();   // before the step runs, so every keyboard read in it is seen
 
     for (;;) {   // timed releases, restores and completions, earliest first
         auto best = g_input.timed.end();
@@ -396,43 +418,62 @@ void ProcessDueInput()
                 g_input.fifo.pop_front();
                 continue;
             }
-            if (op.timed && op.next > 0 && op.timings.back().readCycle == 0 && StrobeClear())
-                op.timings.back().readCycle = now;   // the program took the last applied key
-            if (op.next >= op.steps.size()) {   // a timed sequence, every key applied: it waits for the last read
-                if (op.timings.back().readCycle != 0) {
+            if (op.timed) {
+                // press_keys (D10): a key is read at the program's first keyboard read after it was pressed, and the
+                // next key waits for that. The first key waits for nothing.
+                if (op.next > 0 && op.timings.back().readCycle == 0) {
+                    KeyTiming& last = op.timings.back();
+                    if (g_keyboardRead) {
+                        last.readCycle = now;
+                    } else if (now - last.appliedCycle >= timeout) {
+                        // unread 600 frames after its press: the rest is dropped, reported with the keys pressed
+                        ReportDiscarded(op.id, std::move(op.timings));
+                        g_input.fifo.pop_front();
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                if (op.next >= op.steps.size()) {   // the last key has been read
                     FinishTimedSequence(op, now);
                     g_input.fifo.pop_front();
                     continue;
                 }
-            } else if (now < op.earliest) {
-                break;
-            } else if (StrobeClear()) {
-                op.waitingSince.reset();
-                const SeqStep& s = op.steps[op.next];
-                PressKey(s.key, s.holdCycles, op.id, now, false);
-                if (!op.started) {
-                    op.started = true;
-                    op.first = now;
-                    NoteFirst(op.id, now);
-                }
-                if (op.timed)
-                    op.timings.push_back(KeyTiming{now, 0});
-                ++op.next;
-                if (op.next < op.steps.size()) {
-                    op.earliest = now + op.steps[op.next].delayCycles;
-                } else if (!op.timed) {   // type_text completes when its last key is applied
-                    Complete(op.id, op.first, now);
+                if (now < op.earliest)
+                    break;
+            } else {
+                // type_text: each key waits until the strobe is clear.
+                if (now < op.earliest)
+                    break;
+                if (!StrobeClear()) {
+                    if (!op.waitingSince)
+                        op.waitingSince = now;
+                    if (now - *op.waitingSince < timeout)
+                        break;
+                    ReportDiscarded(op.id);   // unread for 600 frames: the rest of the text is dropped (D10)
                     g_input.fifo.pop_front();
+                    continue;
                 }
-                continue;
+                op.waitingSince.reset();
             }
-            // Waiting on the program: a key due with the strobe set, or a timed sequence's unread last key.
-            if (!op.waitingSince)
-                op.waitingSince = now;
-            if (now - *op.waitingSince < timeout)
-                break;
-            ReportDiscarded(op.id);   // unread for 600 frames: the rest of the sequence is dropped (D10)
-            g_input.fifo.pop_front();
+            const SeqStep& s = op.steps[op.next];
+            PressKey(s.key, s.holdCycles, op.id, now, false);
+            if (!op.started) {
+                op.started = true;
+                op.first = now;
+                NoteFirst(op.id, now);
+            }
+            if (op.timed) {
+                op.timings.push_back(KeyTiming{now, 0});
+                g_keyboardRead = false;
+            }
+            ++op.next;
+            if (op.next < op.steps.size()) {
+                op.earliest = now + op.steps[op.next].delayCycles;
+            } else if (!op.timed) {   // type_text completes when its last key is applied
+                Complete(op.id, op.first, now);
+                g_input.fifo.pop_front();
+            }
         } else if (op.kind == QueuedOp::Kind::Key) {
             if (std::holds_alternative<ResetKey>(op.key)) {
                 CtrlReset();
@@ -1214,12 +1255,13 @@ std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t inputId) const
     RequireStarted();
     if (const auto it = g_input.firstCycles.find(inputId); it != g_input.firstCycles.end())
         return it->second;
-    // Not applied yet: known only when nothing is queued ahead and, for a sequence key, it is due and the strobe is clear.
+    // Not applied yet: known only when nothing is queued ahead and, for a sequence key, it is due and (type_text) the
+    // strobe is clear. A press_keys first key waits for nothing else.
     if (g_input.fifo.empty() || g_input.fifo.front().id != inputId)
         return std::nullopt;
     const QueuedOp& op = g_input.fifo.front();
     const bool waits = op.kind == QueuedOp::Kind::Sequence && op.next < op.steps.size();
-    if (waits && (EmulatedNow() < op.earliest || !StrobeClear()))
+    if (waits && (EmulatedNow() < op.earliest || (!op.timed && !StrobeClear())))
         return std::nullopt;
     return EmulatedNow();
 }

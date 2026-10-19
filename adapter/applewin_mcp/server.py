@@ -156,6 +156,22 @@ def cycles_to_ms(cycles):
     return cycles * 1000.0 / BASE_CLOCK_HZ
 
 
+def key_report(keys, timings):
+    """press_keys' result, one line per key, in ms from the first press: when it was pressed and read, "never read",
+    or "not pressed" (a timed-out sequence lists only the keys it pressed)."""
+    start = timings[0]["applied_cycle"] if timings else 0
+    lines = []
+    for i, k in enumerate(keys, 1):
+        name = k.get("key") if isinstance(k, dict) else k
+        if i > len(timings):
+            lines.append("{}. {}  not pressed".format(i, name))
+            continue
+        t = timings[i - 1]
+        read = "never read" if t["read_cycle"] is None else "read {:.1f} ms".format(cycles_to_ms(t["read_cycle"] - start))
+        lines.append("{}. {}  applied {:.1f} ms  {}".format(i, name, cycles_to_ms(t["applied_cycle"] - start), read))
+    return "\n".join(lines)
+
+
 def log(message):
     _logger.info(message)
 
@@ -279,10 +295,11 @@ class Machine:
         else:
             time.sleep(ms / 1000.0)
 
-    def await_input(self, input_id, expected_ms, keys=1):
+    def await_input(self, input_id, expected_ms, keys=1, describe=None):
         """Lets time pass, a frame at a time, until input_applied arrives for input_id, and returns its params. The
         cap counts frames beyond expected_ms, the time the input itself takes (keys x delay, or the hold): 600 per key,
-        since the harness may wait that long on each key before it drops the rest (D10). It is only a safety net."""
+        since the harness may wait that long on each key before it drops the rest (D10). It is only a safety net.
+        describe(params), when given, adds lines to the error for a dropped input."""
         frames = 0
         allowed = math.ceil(expected_ms * FRAMES_PER_SECOND / 1000) + INPUT_FRAME_CAP * max(1, keys)
         while True:
@@ -290,9 +307,10 @@ class Machine:
             if input_id in self.applied:
                 params = self.applied.pop(input_id)
                 if params.get("discarded"):   # the harness dropped keys the program did not read (D10)
-                    raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
-                                    "(it may be busy), and the rest of the keys were dropped. Call wait to let time "
-                                    "pass, then look.".format(INPUT_FRAME_CAP))
+                    message = ("the keyboard wasn't read within {} frames: the program may not be reading keys (it "
+                               "may be busy), and the rest of the keys were dropped. Call wait to let time pass, then "
+                               "look.".format(INPUT_FRAME_CAP))
+                    raise ToolError(message + ("\n" + describe(params) if describe else ""))
                 self.advance(SETTLE_FRAMES)   # let the program echo the last key
                 return params
             if frames >= allowed:
@@ -325,15 +343,9 @@ class Machine:
             for k in keys:
                 entry = k if isinstance(k, dict) else {}
                 expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
-            applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys))
-        timings = applied.get("keys") or []
-        start = timings[0]["applied_cycle"] if timings else 0
-        lines = []
-        for i, (k, t) in enumerate(zip(keys, timings), 1):
-            name = k.get("key") if isinstance(k, dict) else k
-            lines.append("{}. {}  applied {:.1f} ms  read {:.1f} ms".format(
-                i, name, cycles_to_ms(t["applied_cycle"] - start), cycles_to_ms(t["read_cycle"] - start)))
-        return "\n".join(lines)
+            applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys),
+                                       describe=lambda params: key_report(keys, params.get("keys") or []))
+        return key_report(keys, applied.get("keys") or [])
 
     def set_joystick(self, x, y, button0, button1, duration_ms):
         params = {}
@@ -464,10 +476,12 @@ def build_server(args, machine):
         Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
         delay_ms (default 0, up to 10000) is the gap after the previous key was pressed (for the first key, after
         this call); hold_ms (default 50, up to 10000) is how long the key is held, and may outlast later keys. Each
-        key also waits until the program has read the previous one, so fast keys are never lost (LEFT, LEFT stays two
-        presses). At most 256 keys. Returns, per key, when it was pressed (applied) and when the program read it, in
-        ms from the first press: a program acts on a key when it reads it. Returns once the last key is read and
-        released. If the program stops reading keys for 600 frames the rest are dropped and this fails."""
+        key after the first also waits until the program has read the keyboard since the previous one, so fast keys
+        are never lost (LEFT, LEFT stays two presses); the first key goes in at once, replacing any key left unread.
+        At most 256 keys. Returns, per key, when it was pressed (applied) and when the program read it, in ms from the
+        first press: a program acts on a key when it reads it. Returns once the last key is read and released. If the
+        program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
+        (the unread one marked "never read") and those not pressed."""
         return await asyncio.to_thread(machine.press_keys, keys)
 
     @mcp.tool()

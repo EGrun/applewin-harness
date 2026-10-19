@@ -223,8 +223,9 @@ class EndToEndTest(AdapterTestCase):
         self.run_async(go)
 
     def test_press_keys_sends_a_timed_sequence_and_reports_each_key(self):
-        """press_keys (D10, "Key sequences"): one call, each key's applied and read time; a sequence the program
-        stops reading is a tool error and leaves the machine usable."""
+        """press_keys (D10, "Key sequences"): one call, each key's applied and read time; a program that reads the
+        keyboard without clearing the strobe still reads the keys; a sequence the program stops reading is a tool
+        error that reports the keys pressed, and leaves the machine usable."""
         async def go():
             async with mcp_session(self.errlog) as s:
                 await call(s, "wait", ms=12000)   # boot DOS 3.3
@@ -239,10 +240,22 @@ class EndToEndTest(AdapterTestCase):
                 self.assertIn("]PRINT", text_of(await call(s, "read_screen")))
 
                 await call(s, "type_text", text="\n10 GOTO 10\n")
-                await call(s, "type_text", text="RUN\n")   # Applesoft's Ctrl-C check never clears the strobe
+                await call(s, "type_text", text="RUN\n")   # Applesoft's Ctrl-C check reads $C000, never clears it
+                polled = await call(s, "press_keys", keys=["LEFT", "LEFT", "Q"])
+                self.assertFalse(polled.is_error, text_of(polled))
+                self.assertEqual(len(text_of(polled).splitlines()), 3)
+                await call(s, "press_key", key="RESET")
+                await call(s, "press_key", key="RETURN")   # replaces the unread "Q" before BASIC's prompt takes it
+
+                # JMP $0300 for ever: nothing reads the keyboard.
+                await call(s, "type_text", text="POKE 768,76:POKE 769,0:POKE 770,3:CALL 768\n")
+                await call(s, "wait", ms=500)   # until CALL 768: BASIC's Ctrl-C check reads $C000 between statements
                 stuck = await call(s, "press_keys", keys=["A", "B"])
-                self.assertTrue(stuck.is_error)
-                self.assertIn("keyboard", text_of(stuck))
+                self.assertTrue(stuck.is_error, text_of(stuck) + "\n" + text_of(await call(s, "read_screen")))
+                report = text_of(stuck)
+                self.assertIn("keyboard", report)
+                self.assertRegex(report, r"1\. A\s+applied 0\.0 ms\s+never read")
+                self.assertRegex(report, r"2\. B\s+not pressed")
                 reset = await call(s, "press_key", key="RESET")
                 self.assertFalse(reset.is_error, text_of(reset))
         self.run_async(go)

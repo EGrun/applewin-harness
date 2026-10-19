@@ -319,6 +319,7 @@ class SessionTest(PipeTestCase):
         self.assertRpcError(-32002, agent, "subscribe_frames", every_n_frames=1)
         self.assertRpcError(-32002, agent, "type_text", text="A")
         self.assertRpcError(-32002, agent, "press_key", key="A")
+        self.assertRpcError(-32002, agent, "press_keys", keys=["A"])
         self.assertRpcError(-32002, agent, "set_joystick", x=1)
 
     def test_missing_disk_gets_32005(self):
@@ -692,6 +693,40 @@ class AgentMethodsTest(PipeTestCase):
         note = agent.next_notification(timeout=5.0)
         self.assertEqual(note["params"], {"input_id": waiting["input_id"], "first_cycle": None, "last_cycle": None,
                                           "discarded": True})
+
+    def test_press_keys_reports_applied_and_read_cycles_per_key(self):
+        h = self.launch()
+        op = self.stepped_session(h, disks=dos_disks())
+        op.call("step_frames", frames=720, timeout=60.0)   # DOS 3.3 boots to the BASIC prompt, which reads keys
+        agent = h.connect("agent")
+        sent = agent.call("press_keys", keys=["A", {"key": "B", "delay_ms": 30, "hold_ms": 0}, {"key": "LEFT"}])
+        self.assertIn("input_id", sent)
+        op.call("step_frames", frames=30)
+        note = agent.next_notification(timeout=5.0)
+        self.assertEqual(note["method"], "input_applied")
+        params = note["params"]
+        self.assertEqual(params["input_id"], sent["input_id"])
+        self.assertNotIn("discarded", params)
+        keys = params["keys"]
+        self.assertEqual(len(keys), 3)
+        for k in keys:
+            self.assertLess(k["applied_cycle"], k["read_cycle"])
+        self.assertEqual(params["first_cycle"], keys[0]["applied_cycle"])
+        self.assertGreaterEqual(keys[1]["applied_cycle"] - keys[0]["applied_cycle"], ms_to_cycles(30))
+        self.assertGreaterEqual(keys[2]["applied_cycle"], keys[1]["read_cycle"])
+        # the default 50 ms hold of "LEFT" outlasts its read, so its release is the last effect
+        self.assertGreaterEqual(params["last_cycle"] - keys[2]["applied_cycle"], ms_to_cycles(50))
+
+    def test_press_keys_parameters_are_validated(self):
+        h = self.launch()
+        self.stepped_session(h)
+        agent = h.connect("agent")
+        for keys in (None, [], ["A"] * 257, ["RESET"], ["FOO"], [{"key": "A", "delay_ms": 10001}],
+                     [{"key": "A", "hold_ms": 10001}], [{"delay_ms": 5}], [["A"]], "AB"):
+            with self.subTest(keys=keys):
+                params = {} if keys is None else {"keys": keys}
+                self.assertRpcError(-32602, agent, "press_keys", **params)
+        self.assertIn("input_id", agent.call("press_keys", keys=["A"] * 256))
 
     def test_input_parameters_are_validated(self):
         h = self.launch()

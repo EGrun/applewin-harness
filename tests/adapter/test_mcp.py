@@ -38,8 +38,8 @@ ADAPTER_DIR = os.path.join(REPO_ROOT, "adapter")
 CALL_TIMEOUT = 120.0
 TEST_TIMEOUT = 300.0
 
-ALL_TOOLS = ["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "read_screen", "set_joystick",
-             "set_speed", "type_text", "wait"]
+ALL_TOOLS = ["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "press_keys", "read_screen",
+             "set_joystick", "set_speed", "type_text", "wait"]
 NO_TEXT_TOOLS = [t for t in ALL_TOOLS if t != "read_screen"]
 
 
@@ -220,6 +220,31 @@ class EndToEndTest(AdapterTestCase):
                 await call(s, "wait", ms=500)
                 rows = [r.strip() for r in text_of(await call(s, "read_screen")).splitlines()[1:] if r.strip()]
                 self.assertTrue(rows[-1].startswith("]"), rows[-3:])   # back at the prompt (the cursor may follow)
+        self.run_async(go)
+
+    def test_press_keys_sends_a_timed_sequence_and_reports_each_key(self):
+        """press_keys (D10, "Key sequences"): one call, each key's applied and read time; a sequence the program
+        stops reading is a tool error and leaves the machine usable."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                sent = await call(s, "press_keys", keys=["P", "R", {"key": "I", "delay_ms": 100}, "N", "T"])
+                self.assertFalse(sent.is_error, text_of(sent))
+                lines = text_of(sent).splitlines()
+                self.assertEqual(len(lines), 5, lines)
+                times = [tuple(float(v) for v in re.findall(r"(?:applied|read) (\d+(?:\.\d+)?) ms", l)) for l in lines]
+                self.assertEqual(times[0][0], 0.0)
+                self.assertTrue(all(applied < read for applied, read in times), lines)
+                self.assertGreaterEqual(times[2][0] - times[1][0], 100.0)
+                self.assertIn("]PRINT", text_of(await call(s, "read_screen")))
+
+                await call(s, "type_text", text="\n10 GOTO 10\n")
+                await call(s, "type_text", text="RUN\n")   # Applesoft's Ctrl-C check never clears the strobe
+                stuck = await call(s, "press_keys", keys=["A", "B"])
+                self.assertTrue(stuck.is_error)
+                self.assertIn("keyboard", text_of(stuck))
+                reset = await call(s, "press_key", key="RESET")
+                self.assertFalse(reset.is_error, text_of(reset))
         self.run_async(go)
 
     def test_stdout_is_clean_mcp_only(self):

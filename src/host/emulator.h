@@ -48,6 +48,20 @@ struct ResetKey {};                               // CTRL-RESET: AppleWin's Ctrl
 // An ASCII code 0..127 (sent with KeybQueueKeypress(code, ASCII)), an arrow key, or RESET.
 using KeySpec = std::variant<uint8_t, ArrowKey, ResetKey>;
 
+// One key of a press_keys sequence (D10, "Key sequences"): delayMs after the previous key was applied (the first: after
+// queueing), and held holdMs.
+struct SequenceKey {
+    KeySpec key{uint8_t(0)};
+    uint32_t delayMs = 0;
+    uint32_t holdMs = 50;
+};
+
+// A sequence key's applied cycle (put in the keyboard latch) and read cycle (the first step boundary at which the
+// program had cleared the strobe after that). EmulatedCycles() values.
+struct KeyTiming {
+    uint64_t appliedCycle = 0, readCycle = 0;
+};
+
 // Joystick 0 through AppleWin's mouse-as-joystick seam (J0C_MOUSE). Fields left out keep their values; positions
 // start at 127 (centre).
 struct JoystickChange {
@@ -57,12 +71,15 @@ struct JoystickChange {
 
 // An input that has fully taken effect. type_text: the cycles at which the first and the last key were applied.
 // press_key and set_joystick: the press (or change) and the release (or restore); equal when there is no hold or
-// duration. Cycles are EmulatedCycles() values. discarded (ruling D1, docs/specs/m4.md "Restore purity"; D10): the input
-// was still pending when LoadSnapshot ran, or was a text whose next key stayed unread for 600 frames, and never took
-// (full) effect; firstCycle and lastCycle are then 0 and meaningless (the session reports them as null).
+// duration. press_keys: the first press, and the later of the last read and the last release, with keys holding each
+// key's timing. Cycles are EmulatedCycles() values. discarded (ruling D1, docs/specs/m4.md "Restore purity"; D10): the
+// input was still pending when LoadSnapshot ran, or was a text or sequence with a key unread for 600 frames, and never
+// took (full) effect; firstCycle and lastCycle are then 0 and meaningless (the session reports them as null) and keys is
+// empty.
 struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
     bool discarded = false;
+    std::vector<KeyTiming> keys;   // press_keys only
 };
 
 // Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is the session speed, applied to AppleWin's g_dwSpeed for realtime steps only (0..40; 10 = authentic,
@@ -149,10 +166,17 @@ public:
     // holdMs later (vk: the key's own VK where one exists, VK_SPACE otherwise). An ASCII code above 127 throws
     // std::invalid_argument.
     uint64_t QueueKey(KeySpec key, uint32_t holdMs);
+    // press_keys (D10, "Key sequences"): the same queue entry as a text, with a delay and a hold per key. Key i is due
+    // at the later of the previous key's applied cycle plus its delayMs (key 0: the queueing plus its delayMs) and the
+    // moment the strobe clears; holds as for QueueKey, and they may outlast later keys. It completes once the last key
+    // is read and every hold released, reporting KeyTiming per key; a key due for 600 frames with the strobe set, or a
+    // last key unread for 600 frames, discards it. Throws std::invalid_argument for no keys, RESET or an ASCII code
+    // above 127.
+    uint64_t QueueKeys(std::vector<SequenceKey> keys);
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);
-    // The input events still pending (M6 queue cap): each queued key is 1, each key of a queued text still to be
-    // applied is 1 (an empty text counts 1), a queued joystick change is 1 plus 1 more when it has a duration, and an applied joystick
+    // The input events still pending (M6 queue cap): each queued key is 1, each key of a queued text or sequence still
+    // to be applied is 1 (an empty text, or a sequence waiting for its last read, counts 1), a queued joystick change is 1 plus 1 more when it has a duration, and an applied joystick
     // change's restore still pending is 1. A key's release is not counted.
     uint64_t PendingInputEvents() const;
     // The cycle at which the input takes effect when that is already known: once applied, its first cycle; before

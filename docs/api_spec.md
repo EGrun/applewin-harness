@@ -66,12 +66,12 @@ The first message on every connection must be `hello`:
 Before a session exists, every agent method returns `-32002`.
 
 ### Input replies
-`type_text`, `press_key` and `set_joystick` reply straight away with `{ input_id, applied_at_cycle }`. They never wait for the input to take effect, because in stepped mode that only happens during a step, and a single-threaded client would deadlock.
-- Input takes effect at the start of the next step (D10). `applied_at_cycle` is the cycle at which it will take effect when that is already known: nothing is queued ahead of it and, for `type_text`, the keyboard strobe is clear. Then it equals the current `emulated_cycles`. Otherwise it is `null`.
-- When an input has fully taken effect, that connection receives the notification `input_applied { input_id, first_cycle, last_cycle }`. For `type_text`, these are the cycles of the first and last key. For a held key or a joystick `duration_ms`, they are the press and the release.
-- An input that `restore_checkpoint` throws away (still queued, or waiting for a release) is reported once as `input_applied { input_id, first_cycle: null, last_cycle: null, discarded: true }` (D1). So is a `type_text` that times out (below). The `discarded` field appears only then.
-- Inputs are applied in order. A `type_text` key also waits until the keyboard strobe is clear; `press_key` does not (D10).
-- If a `type_text` key is due but the program has not taken the previous key within 600 frames, the rest of that text is dropped and reported as discarded, and the queue moves on. Keys already typed stay typed.
+`type_text`, `press_key`, `press_keys` and `set_joystick` reply straight away with `{ input_id, applied_at_cycle }`. They never wait for the input to take effect, because in stepped mode that only happens during a step, and a single-threaded client would deadlock.
+- Input takes effect at the start of the next step (D10). `applied_at_cycle` is the cycle at which it will take effect when that is already known: nothing is queued ahead of it and, for `type_text` and `press_keys`, the keyboard strobe is clear (and, for `press_keys`, the first key has no `delay_ms`). Then it equals the current `emulated_cycles`. Otherwise it is `null`.
+- When an input has fully taken effect, that connection receives the notification `input_applied { input_id, first_cycle, last_cycle }`. For `type_text`, these are the cycles of the first and last key. For a held key or a joystick `duration_ms`, they are the press and the release. For `press_keys`, see below.
+- An input that `restore_checkpoint` throws away (still queued, or waiting for a release) is reported once as `input_applied { input_id, first_cycle: null, last_cycle: null, discarded: true }` (D1). So is a `type_text` or `press_keys` that times out (below). The `discarded` field appears only then.
+- Inputs are applied in order. A `type_text` or `press_keys` key also waits until the keyboard strobe is clear; `press_key` does not (D10).
+- If a `type_text` or `press_keys` key is due but the program has not taken the previous key within 600 frames, the rest of that text or sequence is dropped and reported as discarded, and the queue moves on. Keys already typed stay typed. A `press_keys` whose last key stays unread for 600 frames is discarded the same way.
 - Auto-repeat on held keys is not implemented.
 
 ### Keyboard
@@ -88,6 +88,13 @@ Presses a single key.
 - `RESET` sends CTRL-RESET.
 - `hold_ms` sets how long the //e any-key-down flag ($C010 bit 7) stays set.
 - `hold_ms` is 0 to 10,000, otherwise `-32602`. A key counts as one pending input event (`-32010` when the queue is full).
+
+**`press_keys`** `{ keys: [ key | { key, delay_ms?: int = 0, hold_ms?: int = 50 } ] }`
+Presses a timed sequence of keys, as one input: a whole game manoeuvre in one call, timed in emulated time (D10, "Key sequences").
+- Each entry is a key exactly as for `press_key` (a bare entry has the defaults), or an object with that `key` and its own `delay_ms` and `hold_ms`. `RESET` is not allowed in a sequence. `keys` has 1 to 256 entries; `delay_ms` and `hold_ms` are 0 to 10,000; otherwise `-32602` and nothing is queued. Each key counts as one pending input event.
+- Key *i* is applied at the later of the previous key's applied cycle plus its `delay_ms` (at the base clock) and the moment the program has read the previous key (the strobe clears). The first key's `delay_ms` counts from the call. With `delay_ms: 0` the keys follow as fast as the program reads them, and no key replaces an unread one.
+- `hold_ms` is how long that key's any-key-down flag stays set. A hold may run past the next key's press.
+- When the last key has been read and every hold released, the connection receives `input_applied { input_id, first_cycle, last_cycle, keys }`. `first_cycle` is the first key's press and `last_cycle` the later of the last read and the last release. `keys` has one `{ applied_cycle, read_cycle }` per key: the cycle it was put in the keyboard latch, and the first step boundary at which the program had cleared the strobe after that (within one step, about 1 ms; a program acts on a key when it reads it, which can be frames after it was applied).
 
 The Open-Apple and Solid-Apple keys are joystick buttons 0 and 1; use `set_joystick` for them.
 
@@ -250,7 +257,7 @@ A checkpoint is an AppleWin save state plus copies of the working disks, stored 
 - Frame ids and `frame_ready` cadence continue across a restore; they are not reset. `frame_id` only counts up: the re-rendered frame straight after a restore keeps the last id (its pixels are the restored screen), no `frame_ready` is sent for it, and the `every_n_frames` phase carries on from before the restore.
 - AppleWin looks each disk image up by its bare file name in the process's current directory before its absolute path. The harness makes the checkpoint's own directory current for the load and puts the previous one back, so the server's working directory may hold files of any name.
 - **Failure before the load** (for example a missing checkpoint disk copy): `-32004`. The session stays usable and unchanged: `get_state_checksum` equals its value before the call (D7). Every check that does not need the drives empty (the save state, the disk copies, the image names) runs before the drives are ejected, so those failures leave the drives untouched. A failure after ejecting (a disk copy that can't be read or written) rolls the working disks back and re-inserts them; such a failure may reset the drive's rotational position. If the working disks can't be put back or re-inserted, the reply is still `-32004` and the session is then unusable, as below.
-- **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `export_disk`, `insert_disk` and `eject_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
+- **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `press_keys`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `export_disk`, `insert_disk` and `eject_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
 
 **`list_checkpoints`** `{}` — returns `[ { checkpoint_id, name, created_at, emulated_cycles } ]`, oldest first. `created_at` is ISO 8601 UTC; `name` may be `null`.
 
@@ -320,9 +327,9 @@ Error objects look like `{ code, message, data? }`. `-32603` carries the C++ exc
 - Request size: 1 MiB. A length prefix above that on an incoming request closes the connection before the body is read, and logs one warning. Replies and notifications keep a 16 MiB frame limit (`get_frame` BGRA32 needs it); a larger length prefix closes the connection.
 - Send backlog: 64 MiB of unsent data per connection; beyond that the server closes it.
 - Connections: at most 8 at once.
-- Input values: `hold_ms` 0 to 10,000; `duration_ms` 0 to 60,000; `inter_key_delay_ms` 0 to 1,000; `text` 4,096 characters. Each is `-32602` outside its range.
+- Input values: `hold_ms` 0 to 10,000; `duration_ms` 0 to 60,000; `inter_key_delay_ms` 0 to 1,000; `press_keys` `delay_ms` 0 to 10,000; `text` 4,096 characters; `press_keys` `keys` 1 to 256 entries. Each is `-32602` outside its range.
 - Strings: any string parameter, at any depth, is at most 32,767 UTF-16 code units (`-32602`).
-- Pending input events: 4,096 per session. A key counts 1; a joystick change counts 1, or 2 with a `duration_ms` above 0; a `type_text` of *n* characters counts *n*, or 1 when `text` is empty. A request that would take the queue past 4,096 is rejected whole with `-32010` "Input queue full" and `data { pending, limit }`, and nothing from it is queued. `restore_checkpoint` empties the queue. There is no limit per emulated second: in stepped mode a client queues while emulated time stands still.
+- Pending input events: 4,096 per session. A key counts 1; a joystick change counts 1, or 2 with a `duration_ms` above 0; a `type_text` of *n* characters counts *n*, or 1 when `text` is empty; a `press_keys` of *n* keys counts *n*. A request that would take the queue past 4,096 is rejected whole with `-32010` "Input queue full" and `data { pending, limit }`, and nothing from it is queued. `restore_checkpoint` empties the queue. There is no limit per emulated second: in stepped mode a client queues while emulated time stands still.
 - Paths: disk paths must be absolute.
 
 ## Example: the M2 scenario over the API

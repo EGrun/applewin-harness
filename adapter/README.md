@@ -38,6 +38,7 @@ The server starts the harness (`--serve`), creates the session and serves MCP on
 |---|---|---|
 | `type_text` | `text`, `inter_key_delay_ms?` | Types on the keyboard (`\n` is RETURN; printable ASCII, up to 4096 characters). |
 | `press_key` | `key`, `hold_ms?` | Presses one key: a character, an ASCII code, or a name such as RETURN, ESC, TAB, DELETE, LEFT, RIGHT, UP, DOWN, CTRL-A to CTRL-Z, or RESET. |
+| `press_keys` | `keys` (list of keys, or `{key, delay_ms?, hold_ms?}`) | Presses a timed key sequence in one call, in emulated time: each key `delay_ms` after the previous one and after the program has read it, held `hold_ms`. Returns each key's applied and read time. For game manoeuvres, especially with `--realtime`, where the agent's think time would otherwise land between keys. |
 | `set_joystick` | `x?`, `y?` (0-255), `button0?`, `button1?`, `duration_ms?` | Moves joystick 0. Returns at once. |
 | `wait` | `ms` (1-60000) | Lets emulated time pass. |
 | `look` | none | Returns the screen as a 560x384 PNG image. |

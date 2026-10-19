@@ -106,6 +106,7 @@ private:
     void RequireInputRoom(uint64_t events);   // -32010 unless that many more input events fit (4,096 pending)
     nlohmann::json TypeText(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json PressKey(const ConnectionPtr& connection, const nlohmann::json& params);
+    nlohmann::json PressKeys(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json SetJoystick(const ConnectionPtr& connection, const nlohmann::json& params);
     nlohmann::json SetSpeed(const nlohmann::json& params);
     nlohmann::json GetSpeed(const nlohmann::json& params);

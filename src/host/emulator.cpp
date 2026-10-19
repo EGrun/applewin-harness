@@ -136,31 +136,40 @@ struct JoyState {
     bool b0 = false, b1 = false;
 };
 
+// One key of a sequence: due delayCycles after the previous key was applied (the first: after queueing).
+struct SeqStep {
+    KeySpec key{uint8_t(0)};
+    uint64_t delayCycles = 0, holdCycles = 0;
+};
+
 struct QueuedOp {
-    enum class Kind { Text, Key, Joy } kind = Kind::Key;
+    enum class Kind { Sequence, Key, Joy } kind = Kind::Key;
     uint64_t id = 0;
-    // Text
-    std::string text;
+    // Sequence: type_text (one step per character) and press_keys (D10, "Key sequences").
+    std::vector<SeqStep> steps;
     size_t next = 0;
-    uint64_t delayCycles = 0;
-    uint64_t earliest = 0;      // the next text key is not due before this cycle
-    std::optional<uint64_t> waitingSince;   // the next text key has been due, with the strobe set, since this cycle
+    uint64_t earliest = 0;      // the next key is not due before this cycle
+    std::optional<uint64_t> waitingSince;   // waiting on the program (strobe set) since this cycle
+    bool timed = false;         // press_keys: completes once the last key is read, with timings
+    std::vector<KeyTiming> timings;   // timed: one per applied key; readCycle 0 until read (a read follows its apply)
     // Key
     KeySpec key{uint8_t(0)};
     uint64_t holdCycles = 0;
     // Joy
     JoystickChange change;
     uint64_t durationCycles = 0;
-    // Text and Key: set once the first key has been applied.
+    // Sequence and Key: set once the first key has been applied.
     bool started = false;
     uint64_t first = 0;
 };
 
 struct TimedOp {
-    enum class Kind { KeyUp, JoyRestore } kind = Kind::KeyUp;
+    enum class Kind { KeyUp, JoyRestore, Done } kind = Kind::KeyUp;
     uint64_t id = 0, due = 0, first = 0;
     WPARAM vk = 0;
     JoyState restore;
+    bool completes = true;          // KeyUp: false for a sequence key (the sequence completes on its own)
+    std::vector<KeyTiming> keys;    // Done: a timed sequence's completion, once its last hold is released
 };
 
 struct InputState {
@@ -225,7 +234,7 @@ void Complete(uint64_t id, uint64_t first, uint64_t last)
     g_input.applied.push_back(InputApplied{id, first, last});
 }
 
-// Reports an input that never took (full) effect (ruling D1; D10's text timeout).
+// Reports an input that never took (full) effect (ruling D1; D10's sequence timeout).
 void ReportDiscarded(uint64_t id)
 {
     InputApplied a;
@@ -260,14 +269,16 @@ void ClearInput()
 }
 
 // Drops every queued input and releases held keys, reporting each dropped id once as discarded (ruling D1): the inputs
-// still queued and those whose release or restore is still pending. LoadSnapshot.
+// still queued and those whose release, restore or completion is still pending. LoadSnapshot. A sequence key's release
+// is not one: its sequence is still queued, has a pending Done, or was already reported (the 600-frame timeout).
 void DiscardInput()
 {
     std::vector<uint64_t> ids;
     for (const QueuedOp& op : g_input.fifo)
         ids.push_back(op.id);
     for (const TimedOp& t : g_input.timed)
-        ids.push_back(t.id);
+        if (t.completes)
+            ids.push_back(t.id);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     for (const uint64_t id : ids)
@@ -298,20 +309,72 @@ bool AnyKeyDown()
                        [](const TimedOp& t) { return t.kind == TimedOp::Kind::KeyUp; });
 }
 
+// Puts a key in the keyboard latch; with a hold, sets its any-key-down flag and queues the release (completes: the
+// release completes input id). Returns whether it is held.
+bool PressKey(const KeySpec& key, uint64_t holdCycles, uint64_t id, uint64_t now, bool completes)
+{
+    WPARAM vk;
+    if (const ArrowKey* a = std::get_if<ArrowKey>(&key)) {
+        vk = VkForArrow(*a);
+        KeybQueueKeypress(vk, NOT_ASCII);
+    } else {
+        const uint8_t c = std::get<uint8_t>(key);
+        vk = VkForAscii(c);
+        KeybQueueKeypress(WPARAM(c), ASCII);
+    }
+    if (holdCycles == 0)
+        return false;
+    KeybAnyKeyDown(WM_KEYDOWN, vk, false);
+    TimedOp t;
+    t.kind = TimedOp::Kind::KeyUp;
+    t.id = id;
+    t.due = now + holdCycles;
+    t.first = now;
+    t.vk = vk;
+    t.completes = completes;
+    g_input.timed.push_back(t);
+    return true;
+}
+
+// A timed sequence whose last key has been read: complete now, or with a Done once its last hold is released.
+void FinishTimedSequence(QueuedOp& op, uint64_t now)
+{
+    uint64_t lastRelease = 0;
+    for (const TimedOp& t : g_input.timed)
+        if (t.kind == TimedOp::Kind::KeyUp && t.id == op.id)
+            lastRelease = (std::max)(lastRelease, t.due);
+    if (lastRelease <= now) {
+        g_input.applied.push_back(InputApplied{op.id, op.first, now, false, std::move(op.timings)});
+        return;
+    }
+    TimedOp done;
+    done.kind = TimedOp::Kind::Done;
+    done.id = op.id;
+    done.due = lastRelease;   // after that release in the timed queue: equal dues go in push order
+    done.first = op.first;
+    done.keys = std::move(op.timings);
+    g_input.timed.push_back(std::move(done));
+}
+
 // Applies every event that is due at the current step boundary.
 void ProcessDueInput()
 {
     const uint64_t now = EmulatedNow();
+    const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
 
-    for (;;) {   // timed releases and restores, earliest first
+    for (;;) {   // timed releases, restores and completions, earliest first
         auto best = g_input.timed.end();
         for (auto it = g_input.timed.begin(); it != g_input.timed.end(); ++it)
             if (it->due <= now && (best == g_input.timed.end() || it->due < best->due))
                 best = it;
         if (best == g_input.timed.end())
             break;
-        const TimedOp t = *best;
+        TimedOp t = std::move(*best);
         g_input.timed.erase(best);
+        if (t.kind == TimedOp::Kind::Done) {
+            g_input.applied.push_back(InputApplied{t.id, t.first, now, false, std::move(t.keys)});
+            continue;
+        }
         if (t.kind == TimedOp::Kind::KeyUp) {
             // AppleWin keeps one down flag per VK: a key pressed again while held stays down until its last release.
             if (std::none_of(g_input.timed.begin(), g_input.timed.end(), [&t](const TimedOp& o) {
@@ -320,42 +383,56 @@ void ProcessDueInput()
                 KeybAnyKeyDown(WM_KEYUP, t.vk, false);
         } else
             ApplyJoy(t.restore);
-        Complete(t.id, t.first, now);
+        if (t.completes)
+            Complete(t.id, t.first, now);
     }
 
     while (!g_input.fifo.empty()) {   // first in, first out: the first event that is not due blocks the rest
         QueuedOp& op = g_input.fifo.front();
-        if (op.kind == QueuedOp::Kind::Text) {
-            if (op.next >= op.text.size()) {   // empty text
+        if (op.kind == QueuedOp::Kind::Sequence) {
+            if (op.steps.empty()) {   // empty text
                 NoteFirst(op.id, now);
                 Complete(op.id, now, now);
                 g_input.fifo.pop_front();
                 continue;
             }
-            if (now < op.earliest)
+            if (op.timed && op.next > 0 && op.timings.back().readCycle == 0 && StrobeClear())
+                op.timings.back().readCycle = now;   // the program took the last applied key
+            if (op.next >= op.steps.size()) {   // a timed sequence, every key applied: it waits for the last read
+                if (op.timings.back().readCycle != 0) {
+                    FinishTimedSequence(op, now);
+                    g_input.fifo.pop_front();
+                    continue;
+                }
+            } else if (now < op.earliest) {
                 break;
-            if (!StrobeClear()) {
-                if (!op.waitingSince)
-                    op.waitingSince = now;
-                if (now - *op.waitingSince < uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame())
-                    break;
-                ReportDiscarded(op.id);   // unread for 600 frames: the rest of the text is dropped (D10)
-                g_input.fifo.pop_front();
+            } else if (StrobeClear()) {
+                op.waitingSince.reset();
+                const SeqStep& s = op.steps[op.next];
+                PressKey(s.key, s.holdCycles, op.id, now, false);
+                if (!op.started) {
+                    op.started = true;
+                    op.first = now;
+                    NoteFirst(op.id, now);
+                }
+                if (op.timed)
+                    op.timings.push_back(KeyTiming{now, 0});
+                ++op.next;
+                if (op.next < op.steps.size()) {
+                    op.earliest = now + op.steps[op.next].delayCycles;
+                } else if (!op.timed) {   // type_text completes when its last key is applied
+                    Complete(op.id, op.first, now);
+                    g_input.fifo.pop_front();
+                }
                 continue;
             }
-            op.waitingSince.reset();
-            KeybQueueKeypress(WPARAM(static_cast<unsigned char>(op.text[op.next])), ASCII);
-            if (!op.started) {
-                op.started = true;
-                op.first = now;
-                NoteFirst(op.id, now);
-            }
-            ++op.next;
-            op.earliest = now + op.delayCycles;
-            if (op.next >= op.text.size()) {
-                Complete(op.id, op.first, now);
-                g_input.fifo.pop_front();
-            }
+            // Waiting on the program: a key due with the strobe set, or a timed sequence's unread last key.
+            if (!op.waitingSince)
+                op.waitingSince = now;
+            if (now - *op.waitingSince < timeout)
+                break;
+            ReportDiscarded(op.id);   // unread for 600 frames: the rest of the sequence is dropped (D10)
+            g_input.fifo.pop_front();
         } else if (op.kind == QueuedOp::Kind::Key) {
             if (std::holds_alternative<ResetKey>(op.key)) {
                 CtrlReset();
@@ -368,28 +445,9 @@ void ProcessDueInput()
                 continue;
             }
             // No strobe wait (D10): like a real //e keypress, it overwrites a key the program has not read.
-            WPARAM vk;
-            if (const ArrowKey* a = std::get_if<ArrowKey>(&op.key)) {
-                vk = VkForArrow(*a);
-                KeybQueueKeypress(vk, NOT_ASCII);
-            } else {
-                const uint8_t c = std::get<uint8_t>(op.key);
-                vk = VkForAscii(c);
-                KeybQueueKeypress(WPARAM(c), ASCII);
-            }
             NoteFirst(op.id, now);
-            if (op.holdCycles > 0) {
-                KeybAnyKeyDown(WM_KEYDOWN, vk, false);
-                TimedOp t;
-                t.kind = TimedOp::Kind::KeyUp;
-                t.id = op.id;
-                t.due = now + op.holdCycles;
-                t.first = now;
-                t.vk = vk;
-                g_input.timed.push_back(t);
-            } else {
+            if (!PressKey(op.key, op.holdCycles, op.id, now, true))
                 Complete(op.id, now, now);
-            }
             g_input.fifo.pop_front();
         } else {   // Joy
             const JoyState previous = g_input.joy;
@@ -1075,11 +1133,35 @@ uint64_t Emulator::QueueText(std::string_view text, uint32_t interKeyDelayMs)
         if (u != 0x0D && (u < 0x20 || u > 0x7E))
             throw std::invalid_argument("QueueText: only 0x0D and 0x20-0x7E can be typed");
     }
+    // A key sequence of its characters: no hold, interKeyDelayMs between keys (D10, "Key sequences").
     QueuedOp op;
-    op.kind = QueuedOp::Kind::Text;
+    op.kind = QueuedOp::Kind::Sequence;
     op.id = g_input.nextId++;
-    op.text = std::string(text);
-    op.delayCycles = MsToBaseCycles(interKeyDelayMs);
+    const uint64_t delay = MsToBaseCycles(interKeyDelayMs);
+    for (const char c : text)
+        op.steps.push_back(SeqStep{KeySpec(uint8_t(static_cast<unsigned char>(c))), op.steps.empty() ? 0 : delay, 0});
+    op.earliest = EmulatedNow();
+    g_input.fifo.push_back(std::move(op));
+    return g_input.fifo.back().id;
+}
+
+uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys)
+{
+    RequireStarted();
+    if (keys.empty())
+        throw std::invalid_argument("QueueKeys: no keys");
+    QueuedOp op;
+    op.kind = QueuedOp::Kind::Sequence;
+    op.timed = true;
+    for (const SequenceKey& k : keys) {
+        if (std::holds_alternative<ResetKey>(k.key))
+            throw std::invalid_argument("QueueKeys: RESET is not allowed in a sequence");
+        if (const uint8_t* c = std::get_if<uint8_t>(&k.key); c && *c > 127)
+            throw std::invalid_argument("QueueKeys: ASCII code above 127");
+        op.steps.push_back(SeqStep{k.key, MsToBaseCycles(k.delayMs), MsToBaseCycles(k.holdMs)});
+    }
+    op.id = g_input.nextId++;
+    op.earliest = EmulatedNow() + op.steps.front().delayCycles;
     g_input.fifo.push_back(std::move(op));
     return g_input.fifo.back().id;
 }
@@ -1116,7 +1198,8 @@ uint64_t Emulator::PendingInputEvents() const
     uint64_t n = 0;
     for (const QueuedOp& op : g_input.fifo) {
         switch (op.kind) {
-        case QueuedOp::Kind::Text: n += std::max<size_t>(1, op.text.size() - op.next); break;   // an empty text still occupies a slot
+        // an empty text, and a timed sequence waiting for its last read, still occupy a slot
+        case QueuedOp::Kind::Sequence: n += std::max<size_t>(1, op.steps.size() - op.next); break;
         case QueuedOp::Kind::Key: n += 1; break;
         case QueuedOp::Kind::Joy: n += op.durationCycles > 0 ? 2 : 1; break;
         }
@@ -1131,12 +1214,12 @@ std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t inputId) const
     RequireStarted();
     if (const auto it = g_input.firstCycles.find(inputId); it != g_input.firstCycles.end())
         return it->second;
-    // Not applied yet: known only when nothing is queued ahead and, for a text key, the strobe is clear.
+    // Not applied yet: known only when nothing is queued ahead and, for a sequence key, it is due and the strobe is clear.
     if (g_input.fifo.empty() || g_input.fifo.front().id != inputId)
         return std::nullopt;
     const QueuedOp& op = g_input.fifo.front();
-    const bool waitsForStrobe = op.kind == QueuedOp::Kind::Text && op.next < op.text.size();
-    if (waitsForStrobe && !StrobeClear())
+    const bool waits = op.kind == QueuedOp::Kind::Sequence && op.next < op.steps.size();
+    if (waits && (EmulatedNow() < op.earliest || !StrobeClear()))
         return std::nullopt;
     return EmulatedNow();
 }

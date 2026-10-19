@@ -51,7 +51,7 @@ AppleWin already provides the seams this needs:
 **Update (M3 Part A, protocol 0.3):**
 - With `--serve`, the harness prints one announcement line on stdout, `{"pipe", "agent_token", "operator_token", "pid"}`, and nothing else. That line is how the tokens reach whoever launched it. They are never written to disk. Remote pipe clients are rejected, and the DACL has one allow ACE for the launching user.
 - `hello` carries `protocol_version: "0.3"`.
-- Input methods (`type_text`, `press_key`, `set_joystick`) reply at once with `{ input_id, applied_at_cycle }`, where `applied_at_cycle` is `null` unless it is already known. The exact cycles arrive in an `input_applied` notification. A reply deferred until the input was applied would deadlock a single-threaded client in stepped mode, because the input only takes effect during a step. D10 is met through the notification.
+- Input methods (`type_text`, `press_key`, `press_keys`, `set_joystick`) reply at once with `{ input_id, applied_at_cycle }`, where `applied_at_cycle` is `null` unless it is already known. The exact cycles arrive in an `input_applied` notification. A reply deferred until the input was applied would deadlock a single-threaded client in stepped mode, because the input only takes effect during a step. D10 is met through the notification.
 - A connection whose outgoing backlog passes 64 MiB is closed, so a stalled client can't freeze emulation.
 
 ## D4 — Agent API vs operator API
@@ -185,6 +185,12 @@ Input is applied between bursts or steps. Every input response reports `applied_
 - **`type_text` still waits for the strobe**, key by key, so typed text arrives whole and in order (like AppleWin's paste).
 - **A `type_text` key that is due but not taken within 600 frames is dropped with the rest of its text**, reported once as `input_applied { …, discarded: true }` (the D1 shape). Nothing else in the queue waits on the program, so the queue always drains on its own.
 - RESET stays in queue order: with the two rules above it can wait at most for one text timeout.
+
+**Key sequences (post-M6, 2026-10-19):** in a realtime session an agent's think time between calls is seconds, so a manoeuvre sent as separate `press_key` calls (Conan: ESC, LEFT, LEFT, then a running jump Q at a precise spot, then A for the ladder) landed with about 0.25 s of jitter. `press_keys` queues the whole sequence as one input, timed in emulated time:
+- **It is the same queue entry as `type_text`.** A text is a key sequence built from its characters (gap `inter_key_delay_ms`, no hold); `press_keys` sets a gap and a hold per key. Both wait for the strobe before each key, so a fast sequence never overwrites a key the program has not read (LEFT, LEFT stays two presses), and both drop the rest after 600 frames unread.
+- **Applied and read are different moments.** A key is *applied* when the harness puts it in the keyboard latch; the program *reads* it when it clears the strobe, which can be frames later if it polls slowly, and that is when it acts. `press_keys` reports both cycles per key, so an agent can measure the gap the program actually saw. "Read" is observed at step boundaries (within one step, about 1 ms) without patching AppleWin.
+- **A sequence is done when its last key is read** (and every hold released), so the read cycle of the last key is known; a last key unread for 600 frames discards the sequence. `type_text` still completes when its last key is applied (unchanged M3 timing) and reports no per-key cycles.
+- RESET is not allowed in a sequence; it stays a single `press_key`.
 
 ## D11 — Speed controls mirror AppleWin exactly
 **Status:** Accepted

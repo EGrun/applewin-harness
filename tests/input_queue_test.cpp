@@ -276,6 +276,90 @@ TEST_CASE("input: named keys reach the keyboard latch")
     KeybClearStrobe();
 }
 
+TEST_CASE("input: press_key overwrites a key the program has not read (D10)")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard while the Disk II boot ROM waits for a disk
+    (void)e.TakeAppliedInputs();
+
+    KeybQueueKeypress(WPARAM('X'), ASCII);   // unread: the strobe is set
+    REQUIRE((KeybReadData() & 0x80) != 0);
+    const uint64_t id = e.QueueKey(KeySpec(uint8_t('Y')), 0);
+    CHECK(e.ScheduledCycle(id) == std::optional<uint64_t>(e.EmulatedCycles()));   // does not wait for the strobe
+    REQUIRE(e.RunFrames(1));
+    CHECK(int(KeybReadData()) == int(0x80 | 'Y'));
+    CHECK(FindApplied(e.TakeAppliedInputs(), id).has_value());
+    KeybClearStrobe();
+}
+
+TEST_CASE("input: an unread type_text times out and the queue behind it drains (D10)")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+    KeybClearStrobe();
+
+    const uint64_t text = e.QueueText("AB", 0);   // "A" is applied; "B" then waits for the strobe for ever
+    const uint64_t key = e.QueueKey(KeySpec(uint8_t('Z')), 0);
+    const uint64_t joy = e.QueueJoystick(X(10), 0);
+    REQUIRE(e.RunFrames(598));
+    {
+        const auto applied = e.TakeAppliedInputs();
+        CHECK(applied.empty());   // still waiting: nothing behind the text has moved
+        CHECK(int(KeybReadData()) == int(0x80 | 'A'));
+    }
+    REQUIRE(e.RunFrames(4));   // past 600 frames since "B" was due
+    const auto applied = e.TakeAppliedInputs();
+    const auto t = FindApplied(applied, text), k = FindApplied(applied, key), j = FindApplied(applied, joy);
+    REQUIRE(t.has_value());
+    CHECK(t->discarded);
+    REQUIRE(k.has_value());
+    CHECK(!k->discarded);
+    REQUIRE(j.has_value());
+    CHECK(!j->discarded);
+    CHECK(int(KeybReadData()) == int(0x80 | 'Z'));   // "B" never typed; the key behind it overwrote "A"
+    CHECK(e.PendingInputEvents() == 0);
+    KeybClearStrobe();
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("input: overlapping holds of the same key keep the any-key-down flag until the last release")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));
+    (void)e.TakeAppliedInputs();
+
+    e.QueueKey(KeySpec(uint8_t('A')), 100);
+    REQUIRE(e.RunFrames(3));   // ~50 ms
+    e.QueueKey(KeySpec(uint8_t('A')), 100);   // pressed again while the first is held: released at ~150 ms
+    REQUIRE(e.RunFrames(4));   // ~117 ms: the first hold has ended
+    CHECK((KeybReadFlag() & 0x80) != 0);
+    REQUIRE(e.RunFrames(4));   // ~183 ms
+    CHECK((KeybReadFlag() & 0x80) == 0);
+}
+
+TEST_CASE("input: TypeText throws when the keyboard is not read and leaves nothing queued")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+    KeybClearStrobe();
+
+    CHECK_THROWS_AS(e.TypeText("AB"), std::runtime_error);
+    CHECK(e.PendingInputEvents() == 0);
+    CHECK(e.TakeAppliedInputs().empty());   // TypeText consumes its own report
+    KeybClearStrobe();
+}
+
 TEST_CASE("input: RESET returns to the BASIC prompt without waiting for the strobe")
 {
     auto& e = StartedEmulator();

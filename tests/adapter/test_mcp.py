@@ -199,6 +199,29 @@ class EndToEndTest(AdapterTestCase):
                 await m5_end_to_end(self, s)
         self.run_async(go)
 
+    def test_input_never_locks_up_when_the_program_stops_reading_keys(self):
+        """A program that does not read the keyboard (Applesoft's Ctrl-C check peeks $C000 without clearing the
+        strobe) must not block later input: press_key replaces an unread key, an unread type_text fails and is
+        dropped, and RESET still gets through (D10, "Keys and the strobe")."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                for text in ("10 GOTO 10\n", "RUN\n"):
+                    typed = await call(s, "type_text", text=text)
+                    self.assertFalse(typed.is_error, text_of(typed))
+                for key in ("A", "B", "LEFT"):   # "A" stays unread; the others replace it
+                    pressed = await call(s, "press_key", key=key)
+                    self.assertFalse(pressed.is_error, "{}: {}".format(key, text_of(pressed)))
+                typed = await call(s, "type_text", text="X")
+                self.assertTrue(typed.is_error)
+                self.assertIn("keyboard", text_of(typed))
+                reset = await call(s, "press_key", key="RESET")
+                self.assertFalse(reset.is_error, text_of(reset))
+                await call(s, "wait", ms=500)
+                rows = [r.strip() for r in text_of(await call(s, "read_screen")).splitlines()[1:] if r.strip()]
+                self.assertTrue(rows[-1].startswith("]"), rows[-3:])   # back at the prompt (the cursor may follow)
+        self.run_async(go)
+
     def test_stdout_is_clean_mcp_only(self):
         """Review Focus 1: a stray byte on stdout would break the session; a round trip must work."""
         async def go():

@@ -67,10 +67,11 @@ Before a session exists, every agent method returns `-32002`.
 
 ### Input replies
 `type_text`, `press_key` and `set_joystick` reply straight away with `{ input_id, applied_at_cycle }`. They never wait for the input to take effect, because in stepped mode that only happens during a step, and a single-threaded client would deadlock.
-- Input takes effect at the start of the next step (D10). `applied_at_cycle` is the cycle at which it will take effect when that is already known: nothing is queued ahead of it and, for a key, the keyboard strobe is clear. Then it equals the current `emulated_cycles`. Otherwise it is `null`.
+- Input takes effect at the start of the next step (D10). `applied_at_cycle` is the cycle at which it will take effect when that is already known: nothing is queued ahead of it and, for `type_text`, the keyboard strobe is clear. Then it equals the current `emulated_cycles`. Otherwise it is `null`.
 - When an input has fully taken effect, that connection receives the notification `input_applied { input_id, first_cycle, last_cycle }`. For `type_text`, these are the cycles of the first and last key. For a held key or a joystick `duration_ms`, they are the press and the release.
-- An input that `restore_checkpoint` throws away (still queued, or waiting for a release) is reported once as `input_applied { input_id, first_cycle: null, last_cycle: null, discarded: true }` (D1). The `discarded` field appears only then.
-- Inputs are applied in order. A key also waits until the keyboard strobe is clear.
+- An input that `restore_checkpoint` throws away (still queued, or waiting for a release) is reported once as `input_applied { input_id, first_cycle: null, last_cycle: null, discarded: true }` (D1). So is a `type_text` that times out (below). The `discarded` field appears only then.
+- Inputs are applied in order. A `type_text` key also waits until the keyboard strobe is clear; `press_key` does not (D10).
+- If a `type_text` key is due but the program has not taken the previous key within 600 frames, the rest of that text is dropped and reported as discarded, and the queue moves on. Keys already typed stay typed.
 - Auto-repeat on held keys is not implemented.
 
 ### Keyboard
@@ -82,8 +83,9 @@ Sends each character as one keypress. `text` may contain only characters 0x20 to
 
 **`press_key`** `{ key: string | int, hold_ms?: int = 50 }`
 Presses a single key.
+- Like a keypress on a real //e, it does not wait for the program to read the previous key: it replaces a key still waiting in the keyboard latch.
 - `key` is either one character from 0x20 to 0x7E, an ASCII code from 0 to 127, or one of these names: `RETURN` (0x0D), `ESC` (0x1B), `TAB` (0x09), `DELETE` (0x7F), `LEFT`, `RIGHT`, `UP`, `DOWN`, `CTRL-A` to `CTRL-Z` (0x01 to 0x1A), `RESET`. Anything else is `-32602`.
-- `RESET` sends CTRL-RESET. It does not wait for the strobe.
+- `RESET` sends CTRL-RESET.
 - `hold_ms` sets how long the //e any-key-down flag ($C010 bit 7) stays set.
 - `hold_ms` is 0 to 10,000, otherwise `-32602`. A key counts as one pending input event (`-32010` when the queue is full).
 

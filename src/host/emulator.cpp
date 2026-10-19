@@ -127,7 +127,7 @@ void Boot()
     g_nAppMode = MODE_RUNNING;
 }
 
-constexpr uint32_t kTypeTimeoutFrames = 600;   // spec: TypeText gives up after 600 frames of emulated time
+constexpr uint32_t kTypeTimeoutFrames = 600;   // spec (D10): a text key unread this long drops the rest of its text
 
 // ---- Input queue (spec: docs/specs/m3.md "Input queue"; D10). Cycles here are EmulatedCycles() values.
 
@@ -144,6 +144,7 @@ struct QueuedOp {
     size_t next = 0;
     uint64_t delayCycles = 0;
     uint64_t earliest = 0;      // the next text key is not due before this cycle
+    std::optional<uint64_t> waitingSince;   // the next text key has been due, with the strobe set, since this cycle
     // Key
     KeySpec key{uint8_t(0)};
     uint64_t holdCycles = 0;
@@ -169,7 +170,6 @@ struct InputState {
     std::map<uint64_t, uint64_t> firstCycles;    // id -> cycle of the first effect (bounded)
     JoyState joy;
     uint64_t nextId = 1;
-    uint64_t keysApplied = 0;                    // text and key events applied (TypeText's progress counter)
 };
 InputState g_input;
 
@@ -225,6 +225,15 @@ void Complete(uint64_t id, uint64_t first, uint64_t last)
     g_input.applied.push_back(InputApplied{id, first, last});
 }
 
+// Reports an input that never took (full) effect (ruling D1; D10's text timeout).
+void ReportDiscarded(uint64_t id)
+{
+    InputApplied a;
+    a.inputId = id;
+    a.discarded = true;
+    g_input.applied.push_back(a);
+}
+
 void ApplyJoy(const JoyState& s)
 {
     g_input.joy = s;
@@ -261,12 +270,8 @@ void DiscardInput()
         ids.push_back(t.id);
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-    for (const uint64_t id : ids) {
-        InputApplied a;
-        a.inputId = id;
-        a.discarded = true;
-        g_input.applied.push_back(a);
-    }
+    for (const uint64_t id : ids)
+        ReportDiscarded(id);
     ClearInput();
 }
 
@@ -307,9 +312,13 @@ void ProcessDueInput()
             break;
         const TimedOp t = *best;
         g_input.timed.erase(best);
-        if (t.kind == TimedOp::Kind::KeyUp)
-            KeybAnyKeyDown(WM_KEYUP, t.vk, false);
-        else
+        if (t.kind == TimedOp::Kind::KeyUp) {
+            // AppleWin keeps one down flag per VK: a key pressed again while held stays down until its last release.
+            if (std::none_of(g_input.timed.begin(), g_input.timed.end(), [&t](const TimedOp& o) {
+                    return o.kind == TimedOp::Kind::KeyUp && o.vk == t.vk;
+                }))
+                KeybAnyKeyDown(WM_KEYUP, t.vk, false);
+        } else
             ApplyJoy(t.restore);
         Complete(t.id, t.first, now);
     }
@@ -323,10 +332,19 @@ void ProcessDueInput()
                 g_input.fifo.pop_front();
                 continue;
             }
-            if (now < op.earliest || !StrobeClear())
+            if (now < op.earliest)
                 break;
+            if (!StrobeClear()) {
+                if (!op.waitingSince)
+                    op.waitingSince = now;
+                if (now - *op.waitingSince < uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame())
+                    break;
+                ReportDiscarded(op.id);   // unread for 600 frames: the rest of the text is dropped (D10)
+                g_input.fifo.pop_front();
+                continue;
+            }
+            op.waitingSince.reset();
             KeybQueueKeypress(WPARAM(static_cast<unsigned char>(op.text[op.next])), ASCII);
-            ++g_input.keysApplied;
             if (!op.started) {
                 op.started = true;
                 op.first = now;
@@ -340,7 +358,7 @@ void ProcessDueInput()
             }
         } else if (op.kind == QueuedOp::Kind::Key) {
             if (std::holds_alternative<ResetKey>(op.key)) {
-                CtrlReset();   // does not wait for the strobe
+                CtrlReset();
                 // CtrlReset sets g_bFreshReset, which makes KeybQueueKeypress swallow the next CTRL-C (a Win32
                 // CTRL-BREAK artefact). Harness input never produces that spurious key, so clear it.
                 GetFrame().g_bFreshReset = false;
@@ -349,8 +367,7 @@ void ProcessDueInput()
                 g_input.fifo.pop_front();
                 continue;
             }
-            if (!StrobeClear())
-                break;
+            // No strobe wait (D10): like a real //e keypress, it overwrites a key the program has not read.
             WPARAM vk;
             if (const ArrowKey* a = std::get_if<ArrowKey>(&op.key)) {
                 vk = VkForArrow(*a);
@@ -360,7 +377,6 @@ void ProcessDueInput()
                 vk = VkForAscii(c);
                 KeybQueueKeypress(WPARAM(c), ASCII);
             }
-            ++g_input.keysApplied;
             NoteFirst(op.id, now);
             if (op.holdCycles > 0) {
                 KeybAnyKeyDown(WM_KEYDOWN, vk, false);
@@ -1030,27 +1046,19 @@ bool Emulator::TypeText(std::string_view text, Pacing pacing)
     if (text.empty())
         return true;
     // M2's behaviour on the input queue: queue the text with no delay and run until its last key has been applied. A key
-    // that is not applied within 600 frames of emulated time of the previous one (the strobe never clears) is a timeout.
+    // that stays unread for 600 frames of emulated time makes the queue drop the text as discarded: a timeout.
     const uint64_t id = QueueText(text, 0);
     Stepper stepper(pacing);
-    const uint64_t timeout = uint64_t(kTypeTimeoutFrames) * NTSC_GetCyclesPerFrame();
-    uint64_t seen = g_input.keysApplied;
-    uint64_t progressAt = g_nCumulativeCycles;
     for (;;) {
         ProcessDueInput();
-        if (g_input.keysApplied != seen) {
-            seen = g_input.keysApplied;
-            progressAt = g_nCumulativeCycles;
-        }
         auto done = std::find_if(g_input.applied.begin(), g_input.applied.end(),
                                  [id](const InputApplied& a) { return a.inputId == id; });
         if (done != g_input.applied.end()) {
+            const bool discarded = done->discarded;
             g_input.applied.erase(done);   // TypeText consumes its own completion
+            if (discarded)
+                throw std::runtime_error("TypeText: keyboard not read");
             return true;
-        }
-        if (g_nCumulativeCycles - progressAt >= timeout) {
-            std::erase_if(g_input.fifo, [id](const QueuedOp& o) { return o.id == id; });
-            throw std::runtime_error("TypeText: keyboard not read");
         }
         if (stepper.Step(UINT64_MAX)) {
             std::erase_if(g_input.fifo, [id](const QueuedOp& o) { return o.id == id; });   // window closed
@@ -1123,15 +1131,11 @@ std::optional<uint64_t> Emulator::ScheduledCycle(uint64_t inputId) const
     RequireStarted();
     if (const auto it = g_input.firstCycles.find(inputId); it != g_input.firstCycles.end())
         return it->second;
-    // Not applied yet: known only when nothing is queued ahead and, for a key, the strobe is clear.
+    // Not applied yet: known only when nothing is queued ahead and, for a text key, the strobe is clear.
     if (g_input.fifo.empty() || g_input.fifo.front().id != inputId)
         return std::nullopt;
     const QueuedOp& op = g_input.fifo.front();
-    bool waitsForStrobe = false;
-    if (op.kind == QueuedOp::Kind::Text)
-        waitsForStrobe = op.next < op.text.size();
-    else if (op.kind == QueuedOp::Kind::Key)
-        waitsForStrobe = !std::holds_alternative<ResetKey>(op.key);
+    const bool waitsForStrobe = op.kind == QueuedOp::Kind::Text && op.next < op.text.size();
     if (waitsForStrobe && !StrobeClear())
         return std::nullopt;
     return EmulatedNow();

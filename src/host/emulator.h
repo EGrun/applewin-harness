@@ -44,7 +44,7 @@ struct SnapshotPreLoadError : std::runtime_error {
 // Every method except Instance, Start and Shutdown throws std::logic_error before Start.
 // Input queue (spec: docs/specs/m3.md, Part A "Input queue"; D10).
 enum class ArrowKey { Left, Right, Up, Down };   // KeybQueueKeypress(VK_LEFT..VK_DOWN, NOT_ASCII)
-struct ResetKey {};                               // CTRL-RESET: AppleWin's CtrlReset(); does not wait for the strobe
+struct ResetKey {};                               // CTRL-RESET: AppleWin's CtrlReset()
 // An ASCII code 0..127 (sent with KeybQueueKeypress(code, ASCII)), an arrow key, or RESET.
 using KeySpec = std::variant<uint8_t, ArrowKey, ResetKey>;
 
@@ -57,9 +57,9 @@ struct JoystickChange {
 
 // An input that has fully taken effect. type_text: the cycles at which the first and the last key were applied.
 // press_key and set_joystick: the press (or change) and the release (or restore); equal when there is no hold or
-// duration. Cycles are EmulatedCycles() values. discarded (ruling D1, docs/specs/m4.md "Restore purity"): the input was
-// still pending when LoadSnapshot ran and never took (full) effect; firstCycle and lastCycle are then 0 and meaningless
-// (the session reports them as null).
+// duration. Cycles are EmulatedCycles() values. discarded (ruling D1, docs/specs/m4.md "Restore purity"; D10): the input
+// was still pending when LoadSnapshot ran, or was a text whose next key stayed unread for 600 frames, and never took
+// (full) effect; firstCycle and lastCycle are then 0 and meaningless (the session reports them as null).
 struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
     bool discarded = false;
@@ -131,20 +131,23 @@ public:
     void SetPresentObserver(std::function<void()> observer);
     // Types bytes 0x0D or 0x20-0x7E with the emulated keyboard (std::invalid_argument before typing anything
     // otherwise). Waits for the strobe to clear before each byte; throws std::runtime_error("TypeText: keyboard not
-    // read") after 600 frames of emulated time. Returns right after queueing the last byte; false if the window closed.
+    // read") when a byte stays unread for 600 frames of emulated time (the queue drops the rest). Returns right after
+    // queueing the last byte; false if the window closed.
     bool TypeText(std::string_view text, Pacing pacing = Pacing::Stepped);
 
     // ---- Input queue. Every run (RunFrames, RunRealtime, TypeText) applies the events that are due at each step
     // boundary, so input queued between runs takes effect at the start of the next step (D10). Each Queue* call
     // returns a new input id (unique, increasing, never 0). PowerCycle discards queued input (and releases held keys).
-    // Keys are first in, first out, and each key also waits until the keyboard strobe is clear. Text: bytes 0x0D and
-    // 0x20-0x7E (std::invalid_argument before queueing anything otherwise). Key i of the text is due at the later of
-    // the previous key's applied cycle plus interKeyDelayMs (converted at the base clock, CLK_6502_NTSC) and the
-    // moment the strobe clears; with 0 this is TypeText's behaviour.
+    // Events are first in, first out. Text: bytes 0x0D and 0x20-0x7E (std::invalid_argument before queueing anything
+    // otherwise). Each text key waits until the keyboard strobe is clear: key i is due at the later of the previous
+    // key's applied cycle plus interKeyDelayMs (converted at the base clock, CLK_6502_NTSC) and the moment the strobe
+    // clears; with 0 this is TypeText's behaviour. A key due for 600 frames with the strobe still set drops the rest of
+    // the text, reported as discarded (D10).
     uint64_t QueueText(std::string_view text, uint32_t interKeyDelayMs);
-    // One key. While it is held the //e any-key-down flag ($C010 bit 7) is set: KeybAnyKeyDown(WM_KEYDOWN, vk) when
-    // applied and WM_KEYUP holdMs later (vk: the key's own VK where one exists, VK_SPACE otherwise). An ASCII code
-    // above 127 throws std::invalid_argument.
+    // One key. It does not wait for the strobe: like a real //e keypress it overwrites an unread key (D10). While it is
+    // held the //e any-key-down flag ($C010 bit 7) is set: KeybAnyKeyDown(WM_KEYDOWN, vk) when applied and WM_KEYUP
+    // holdMs later (vk: the key's own VK where one exists, VK_SPACE otherwise). An ASCII code above 127 throws
+    // std::invalid_argument.
     uint64_t QueueKey(KeySpec key, uint32_t holdMs);
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);
@@ -153,7 +156,7 @@ public:
     // change's restore still pending is 1. A key's release is not counted.
     uint64_t PendingInputEvents() const;
     // The cycle at which the input takes effect when that is already known: once applied, its first cycle; before
-    // that, EmulatedCycles() when nothing is queued ahead of it and, for a key, the strobe is clear (it then applies
+    // that, EmulatedCycles() when nothing is queued ahead of it and, for a text, the strobe is clear (it then applies
     // at the start of the next step). Otherwise, or for an unknown id, nullopt.
     std::optional<uint64_t> ScheduledCycle(uint64_t inputId) const;
     // The inputs that have fully taken effect since the last call, in the order they completed.

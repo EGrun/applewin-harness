@@ -1,6 +1,6 @@
 # applewin_mcp: an MCP server for the Apple II harness
 
-`applewin_mcp` lets an LLM agent use an emulated Apple //e through AppleWin Harness. It is an MCP server over stdio. It offers only what a person at the machine could do: type, press keys, move the joystick, look at the screen, listen, let time pass, and swap floppy disks. Other operator concerns (the disk loaded at launch, the run mode, export, checkpoints) are not tools; they are set at launch (decision D4 in [docs/decisions.md](../docs/decisions.md)). The spec is [docs/specs/m5.md](../docs/specs/m5.md).
+`applewin_mcp` lets an LLM agent use an emulated Apple //e through AppleWin Harness. It is an MCP server over stdio. It offers only what a person at the machine could do: type, press keys, move the joystick, look at the screen, listen, let time pass, swap floppy disks, and save a floppy to an image file. Other operator concerns (the disk loaded at launch, the run mode, checkpoints) are not tools; they are set at launch (decision D4 in [docs/decisions.md](../docs/decisions.md)). The spec is [docs/specs/m5.md](../docs/specs/m5.md).
 
 ## Install
 You need Python 3.12 or later and a built `AppleWinHarness.exe` (see the [main README](../README.md)).
@@ -16,7 +16,7 @@ Run it from the `adapter` directory, or put that directory on `PYTHONPATH`:
 
 ```
 cd adapter
-python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk <image>] [--realtime] [--text-screen] [--log-format text|json]
+python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk <image>] [--realtime [--speed <0..40|authentic|max>] [--no-disk-boost]] [--text-screen] [--log-format text|json]
 ```
 
 | Flag | Meaning |
@@ -24,7 +24,9 @@ python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk 
 | `--exe <path>` | Required. The harness executable. |
 | `--headless` | No window and no audio device. Without it the harness shows a view-only window and plays the sound. |
 | `--disk <image>` | A disk image for slot 6, drive 1. The harness works on a copy; the original is never written to. Without it the machine starts with no disk. |
-| `--realtime` | Run in realtime mode. The default is stepped mode. |
+| `--realtime` | Run in realtime mode: the Apple runs on the wall clock and never waits for the agent. The default is stepped mode. |
+| `--speed <0..40\|authentic\|max>` | Realtime only. The harness's `machine_speed`: `authentic` (10) is the real 1.02 MHz, 20 is twice that, 40 or `max` is unthrottled. Without it the session keeps AppleWin's default (authentic). |
+| `--no-disk-boost` | Realtime only. Turns off `enhance_disk_speed`, so the speed stays constant while a drive is running. By default AppleWin runs at full speed whenever a drive motor is on (and always, with no disk inserted). |
 | `--log-format text\|json` | Format of the log lines on stderr (default `text`). It is also passed to the harness, whose stderr lines are forwarded unchanged, so in `json` mode every stderr line is one JSON object `{ts, level, msg, component, ...}` (`component` is `adapter` for the adapter's own lines). stdout is always MCP only. |
 | `--version` | Prints the adapter version and exits. |
 | `--text-screen` | Turn on the `read_screen` tool (the session is created with `allow_text_screen`). |
@@ -43,15 +45,18 @@ The server starts the harness (`--serve`), creates the session and serves MCP on
 | `listen` | `ms?` (0-60000, default 0) | Lets `ms` of time pass first (if above 0), then returns the `sound_started` and `sound_stopped` events (with duration and dominant frequency) since the last `listen`. |
 | `insert_disk` | `drive` (1 or 2), `path`, `write_protected?` | Puts a floppy image in slot 6 drive 1 or 2, replacing any disk there. A relative `path` is taken from the server's working directory. The harness works on a copy; the original is never written. Paths starting with `\` or `//` (UNC shares, `\?\` and `\.\` device paths) are rejected. |
 | `eject_disk` | `drive` (1 or 2) | Takes the floppy out of the drive. An empty drive is an error. |
+| `export_disk` | `drive` (1 or 2), `path` | Saves the floppy in the drive, with everything written to it so far, as a new image file in the disk's own format. The disk stays in the drive. |
+| `set_speed` | `speed?` (`authentic`, `max` or 0-40), `disk_boost?` | Realtime only (an error in stepped mode). Changes the speed while the machine runs, with the same values as `--speed` and `--no-disk-boost`. Anything left out is unchanged; with no arguments it reports the current speed. |
 
-No other operator method (sessions, checkpoints, export, speed, stepping) is reachable through the server.
+No other operator method (sessions, checkpoints, stepping) is reachable through the server.
 
 ## Behaviour notes
-- **Time.** The default is stepped mode: the emulator is paused, and time passes only through `wait` (and the short stretch `type_text` and `press_key` need, and `listen` with `ms`). A program does not run while the agent is thinking. With `--realtime` the emulator runs on the wall clock, and `wait` sleeps.
+- **Time.** The default is stepped mode: the emulator is paused, and time passes only through `wait` (and the short stretch `type_text` and `press_key` need, and `listen` with `ms`). A program does not run while the agent is thinking. With `--realtime` the emulator runs on the wall clock, and `wait` sleeps for that many real milliseconds (at a speed above authentic, set by `--speed` or `set_speed`, more emulated time passes).
 - **Booting.** Nothing happens until time passes. After launching with a DOS 3.3 disk, call `wait` for about 12000 ms (720 frames) to let the disk boot.
 - **Typing.** `type_text` and `press_key` block until the Apple has read the keys, plus a few frames for the program to echo them, so a `look` straight afterwards shows the result. If the keyboard isn't read within 600 frames beyond the time the typing itself takes, the tool returns an error (the program may be busy or not reading keys). Call `wait`, then look.
 - **Sound.** The server subscribes to audio at launch, so `listen` reports sound from launch onwards, not only from the previous `listen`. `listen` with no events reports "no sound events since the last listen".
 - **Swapping disks.** `insert_disk` and `eject_disk` do not reboot the machine or pause it. After a swap, DOS needs a command such as `CATALOG` (or `CATALOG,D2`) to see the new disk. Drives are numbered 1 and 2.
+- **Saving disks.** `export_disk` writes wherever the agent says, so only give it to an agent you trust with the filesystem. The harness refuses to overwrite a file, to write over a disk's original image, or to write into its own work directory; the adapter also rejects UNC and device paths. The directory must already exist. A relative `path` is taken from the adapter's working directory.
 - **Errors.** A harness error comes back as an MCP tool error with the harness message. That includes the harness limits (`-32602` for an out-of-range value such as `press_key` `hold_ms` over 10000, `-32010` when the input queue is full). The adapter's own caps (`wait`, `listen`) are unchanged.
 - **Version.** `applewin_mcp.__version__` is read from the `VERSION` file at the repository root, or from `adapter/VERSION` in the release bundle; if neither exists it is `0.0.0+unknown`.
 

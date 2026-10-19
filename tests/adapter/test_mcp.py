@@ -297,7 +297,10 @@ class ExportDiskTest(AdapterTestCase):
     def test_export_disk_copies_the_working_image_and_keeps_the_original(self):
         master_before = sha256_file(DOS_IMAGE)
         dest = os.path.join(FIXTURE_DIR, "exported.dsk")
-        relative = os.path.relpath(os.path.join(FIXTURE_DIR, "exported-relative.dsk"), REPO_ROOT)   # cwd is REPO_ROOT
+        # The adapter's cwd is REPO_ROOT; a relative path can't reach FIXTURE_DIR when %TEMP% is on another drive (CI)
+        scratch = tempfile.mkdtemp(prefix=".awh-export-", dir=REPO_ROOT)
+        self.addCleanup(shutil.rmtree, scratch, True)
+        relative = os.path.join(os.path.basename(scratch), "exported-relative.dsk")
 
         async def go():
             async with mcp_session(self.errlog) as s:

@@ -2,7 +2,7 @@
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
-and as agent (to type, look, listen), and serves nine tools over MCP stdio.
+and as agent (to type, look, listen), and serves eleven tools over MCP stdio.
 
 stdout carries MCP frames only: the harness child's stdout is a pipe that harness_client drains, and all logging goes
 to stderr. The adapter writes the line "harness pid <N>" to stderr once the harness is running.
@@ -155,17 +155,51 @@ def log(message):
     _logger.info(message)
 
 
+def _speed(text):
+    if text in ("authentic", "max"):
+        return text
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 40:
+        raise argparse.ArgumentTypeError("must be authentic, max or a number from 0 to 40 (got {!r})".format(text))
+    return value
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="applewin_mcp", description="MCP server for an emulated Apple //e")
     p.add_argument("--exe", required=True, help="path to AppleWinHarness.exe")
     p.add_argument("--headless", action="store_true", help="run the harness without a window")
     p.add_argument("--disk", help="disk image for slot 6 drive 1 (the harness works on a copy)")
     p.add_argument("--realtime", action="store_true", help="run in realtime mode (default: stepped)")
+    p.add_argument("--speed", type=_speed, metavar="0..40|authentic|max",
+                   help="machine speed (the harness's machine_speed): authentic is 10, 40 or max is unthrottled")
+    p.add_argument("--no-disk-boost", action="store_true",
+                   help="keep the pace constant while a disk drive runs (turns off enhance_disk_speed)")
     p.add_argument("--log-format", choices=("text", "json"), default="text",
                    help="stderr log format, also passed to the harness (default: text)")
     p.add_argument("--version", action="version", version="applewin_mcp " + __version__)
     p.add_argument("--text-screen", action="store_true", help="enable the read_screen tool")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if (args.speed is not None or args.no_disk_boost) and not args.realtime:
+        p.error("--speed and --no-disk-boost only apply with --realtime (stepped runs always use authentic speed)")
+    return args
+
+
+def session_params(args):
+    """The create_session parameters for the command line."""
+    params = {"run_mode": "realtime" if args.realtime else "stepped", "allow_text_screen": bool(args.text_screen)}
+    if args.disk:
+        params["disks"] = [{"slot": 6, "drive": 1, "path": os.path.abspath(args.disk)}]
+    speed = {}
+    if args.speed is not None:
+        speed["machine_speed"] = args.speed
+    if args.no_disk_boost:
+        speed["enhance_disk_speed"] = False
+    if speed:
+        params["speed"] = speed
+    return params
 
 
 def _check_range(name, value, low, high):
@@ -188,11 +222,7 @@ class Machine:
         log("harness pid {}".format(self.harness.pid))
         try:
             self.operator = self.harness.connect("operator")
-            params = {"run_mode": "stepped" if self.stepped else "realtime",
-                      "allow_text_screen": bool(args.text_screen)}
-            if args.disk:
-                params["disks"] = [{"slot": 6, "drive": 1, "path": os.path.abspath(args.disk)}]
-            self.operator.call("create_session", timeout=CALL_TIMEOUT, **params)
+            self.operator.call("create_session", timeout=CALL_TIMEOUT, **session_params(args))
             self.agent = self.harness.connect("agent")
             self.agent.call("subscribe_audio", timeout=CALL_TIMEOUT)
         except BaseException:
@@ -329,14 +359,43 @@ class Machine:
                     p.get("duration_ms"), p.get("peak_db"), p.get("dominant_hz")))
         return "\n".join(lines)
 
-    def insert_disk(self, drive, path, write_protected):
+    @staticmethod
+    def _local_path(path):
         path = os.path.abspath(path)   # relative paths are taken against the adapter's working directory
         if path.startswith(("\\\\", "//")):   # UNC shares and device paths (\?\, \.\): the agent is the untrusted side
             raise ToolError("UNC and device paths (starting with \\ or //) are not allowed; use a local path")
+        return path
+
+    def insert_disk(self, drive, path, write_protected):
+        path = self._local_path(path)
         with self.lock:
             self.rpc(self.operator, "insert_disk", slot=6, drive=drive, path=path,
                      write_protected=write_protected)
         return "inserted {} in drive {}".format(path, drive)
+
+    def export_disk(self, drive, path):
+        path = self._local_path(path)
+        with self.lock:
+            self.rpc(self.operator, "export_disk", slot=6, drive=drive, dest_path=path)
+        return "exported drive {} to {}".format(drive, path)
+
+    def set_speed(self, speed, disk_boost):
+        if self.stepped:
+            raise ToolError("set_speed needs a realtime session (start the server with --realtime); "
+                            "stepped runs always use authentic speed")
+        params = {}
+        if speed is not None:
+            try:
+                params["machine_speed"] = _speed(speed)
+            except argparse.ArgumentTypeError as e:
+                raise ToolError("speed " + str(e)) from None
+        if disk_boost is not None:
+            params["enhance_disk_speed"] = disk_boost
+        with self.lock:
+            result = self.rpc(self.operator, "set_speed" if params else "get_speed", **params)
+        return " ".join("{}={}".format(k, result.get(k)) for k in (
+            "machine_speed", "clock_multiplier", "effective_clock_hz", "enhance_disk_speed", "full_speed_override",
+            "full_speed_active"))
 
     def eject_disk(self, drive):
         with self.lock:
@@ -411,6 +470,24 @@ def build_server(args, machine):
         directory; paths starting with two backslashes or two slashes are rejected). The original file is never written to; the machine works on a copy. Set write_protected to
         stop the machine writing to the disk."""
         return await asyncio.to_thread(machine.insert_disk, drive, path, write_protected)
+
+    @mcp.tool()
+    async def export_disk(drive: int, path: str) -> str:
+        """Save the floppy currently in the disk drive (drive 1 or 2) to a new image file, including everything the
+        machine has written to it so far. The copy has the same format as the disk (.dsk, .po, .nib, .woz). path is
+        where to write it (a relative path is taken from the server's working directory; paths starting with two
+        backslashes or two slashes are rejected). The directory must exist and the file must not: it never
+        overwrites anything. The disk stays in the drive."""
+        return await asyncio.to_thread(machine.export_disk, drive, path)
+
+    @mcp.tool()
+    async def set_speed(speed: str | None = None, disk_boost: bool | None = None) -> str:
+        """Change how fast the machine runs (realtime sessions only). speed is "authentic" (the real 1.02 MHz, the
+        same as 10), "max" (unthrottled, the same as 40) or 0-40: 0-9 give 0.5x to 0.95x, 10-39 give speed/10 (20
+        is 2x). disk_boost false keeps the pace constant while a disk drive runs; true (the default) runs at full
+        speed whenever a drive motor is on. Anything left out keeps its value; with no arguments it just reports
+        the current speed. wait counts real time, so at a higher speed more of the machine's time passes."""
+        return await asyncio.to_thread(machine.set_speed, speed, disk_boost)
 
     @mcp.tool()
     async def eject_disk(drive: int) -> str:

@@ -11,6 +11,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -37,8 +38,8 @@ ADAPTER_DIR = os.path.join(REPO_ROOT, "adapter")
 CALL_TIMEOUT = 120.0
 TEST_TIMEOUT = 300.0
 
-ALL_TOOLS = ["eject_disk", "insert_disk", "listen", "look", "press_key", "read_screen", "set_joystick", "type_text",
-             "wait"]
+ALL_TOOLS = ["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "read_screen", "set_joystick",
+             "set_speed", "type_text", "wait"]
 NO_TEXT_TOOLS = [t for t in ALL_TOOLS if t != "read_screen"]
 
 
@@ -181,7 +182,7 @@ class ToolListTest(AdapterTestCase):
     def test_no_operator_method_is_reachable(self):
         async def go():
             async with mcp_session(self.errlog) as s:
-                for name in ("step_frames", "checkpoint", "restore_checkpoint", "export_disk", "set_speed",
+                for name in ("step_frames", "checkpoint", "restore_checkpoint",
                              "get_state_checksum", "create_session", "close_session", "pause", "resume"):
                     with self.subTest(tool=name):
                         result = await call(s, name)
@@ -292,6 +293,35 @@ class DiskSwapTest(AdapterTestCase):
         self.run_async(go)
 
 
+class ExportDiskTest(AdapterTestCase):
+    def test_export_disk_copies_the_working_image_and_keeps_the_original(self):
+        master_before = sha256_file(DOS_IMAGE)
+        dest = os.path.join(FIXTURE_DIR, "exported.dsk")
+        relative = os.path.relpath(os.path.join(FIXTURE_DIR, "exported-relative.dsk"), REPO_ROOT)   # cwd is REPO_ROOT
+
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                exported = await call(s, "export_disk", drive=1, path=dest)
+                self.assertFalse(exported.is_error, text_of(exported))
+                exported = await call(s, "export_disk", drive=1, path=relative)
+                self.assertFalse(exported.is_error, text_of(exported))
+                again = await call(s, "export_disk", drive=1, path=dest)   # the harness never overwrites
+                self.assertTrue(again.is_error)
+                self.assertIn("already exists", text_of(again))
+                empty = await call(s, "export_disk", drive=2, path=os.path.join(FIXTURE_DIR, "empty.dsk"))
+                self.assertTrue(empty.is_error)
+                self.assertIn("empty", text_of(empty))
+                bad_drive = await call(s, "export_disk", drive=3, path=os.path.join(FIXTURE_DIR, "x.dsk"))
+                self.assertTrue(bad_drive.is_error)
+                unc = await call(s, "export_disk", drive=1, path="\\\\server\\share\\x.dsk")
+                self.assertTrue(unc.is_error)
+                self.assertIn("not allowed", text_of(unc))   # rejected by the adapter, never sent to the harness
+        self.run_async(go)
+        self.assertEqual(sha256_file(dest), master_before)   # nothing was written to the disk yet
+        self.assertEqual(sha256_file(os.path.join(REPO_ROOT, relative)), master_before)
+        self.assertEqual(sha256_file(DOS_IMAGE), master_before)
+
+
 class ShutdownTest(AdapterTestCase):
     def test_closing_the_client_ends_the_harness(self):
         """Review Focus 2: the harness process does not outlive the MCP connection."""
@@ -393,6 +423,77 @@ class AdapterLoggingTest(AdapterTestCase):
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertEqual(r.stdout, b"")
+
+
+class SpeedOptionTest(AdapterTestCase):
+    def parse(self, *argv):
+        from applewin_mcp import server
+        return server.parse_args(["--exe", "x.exe", *argv])
+
+    def session_params(self, *argv):
+        from applewin_mcp import server
+        return server.session_params(self.parse(*argv))
+
+    def test_no_speed_flags_leave_the_session_speed_alone(self):
+        self.assertNotIn("speed", self.session_params("--realtime"))
+
+    def test_speed_and_disk_boost_flags_go_into_create_session(self):
+        self.assertEqual(self.session_params("--realtime", "--speed", "20")["speed"], {"machine_speed": 20})
+        self.assertEqual(self.session_params("--realtime", "--speed", "max")["speed"], {"machine_speed": "max"})
+        self.assertEqual(self.session_params("--realtime", "--no-disk-boost")["speed"], {"enhance_disk_speed": False})
+        self.assertEqual(self.session_params("--realtime", "--speed", "authentic", "--no-disk-boost")["speed"],
+                         {"machine_speed": "authentic", "enhance_disk_speed": False})
+
+    def test_bad_speed_values_are_usage_errors(self):
+        for bad in ("41", "-1", "fast", "1.5"):
+            with self.subTest(speed=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.parse("--realtime", "--speed", bad)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_speed_flags_need_realtime(self):
+        for flags in (["--speed", "20"], ["--no-disk-boost"]):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.parse(*flags)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_set_speed_changes_the_speed_while_running(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
+                current = await call(s, "set_speed")   # no arguments: reports the speed
+                self.assertFalse(current.is_error, text_of(current))
+                self.assertIn("machine_speed=10", text_of(current))
+                faster = await call(s, "set_speed", speed="20", disk_boost=False)
+                self.assertFalse(faster.is_error, text_of(faster))
+                self.assertIn("machine_speed=20", text_of(faster))
+                self.assertIn("enhance_disk_speed=False", text_of(faster))
+                unthrottled = await call(s, "set_speed", speed="max")
+                self.assertIn("machine_speed=40", text_of(unthrottled))
+                self.assertIn("enhance_disk_speed=False", text_of(unthrottled))   # left out: unchanged
+                for bad in ("41", "fast"):
+                    with self.subTest(speed=bad):
+                        result = await call(s, "set_speed", speed=bad)
+                        self.assertTrue(result.is_error)
+                        self.assertIn("0 to 40", text_of(result))
+                waited = await call(s, "wait", ms=100)
+                self.assertFalse(waited.is_error, text_of(waited))
+        self.run_async(go)
+
+    def test_set_speed_is_an_error_in_stepped_mode(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                result = await call(s, "set_speed", speed="20")
+                self.assertTrue(result.is_error)
+                self.assertIn("--realtime", text_of(result))
+        self.run_async(go)
+
+    def test_the_harness_accepts_the_speed_settings(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime", "--speed", "20", "--no-disk-boost"]) as s:
+                waited = await call(s, "wait", ms=200)
+                self.assertFalse(waited.is_error, text_of(waited))
+        self.run_async(go)
 
 
 class StderrWriterTest(unittest.TestCase):

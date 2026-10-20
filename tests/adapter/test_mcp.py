@@ -530,6 +530,11 @@ class WaitUntilChangeTest(AdapterTestCase):
         for _ in range(2):
             text = machine.wait_until_change(200, None, False)
             self.assertRegex(text, r"no change in \d+ ms")
+        while True:   # replies and notifications are in order: what is queued now predates the unsubscribe
+            try:
+                machine.agent.next_notification(timeout=0)
+            except TimeoutError:
+                break
         deadline = time.monotonic() + 0.7
         late = []
         while time.monotonic() < deadline:

@@ -403,7 +403,7 @@ class EndToEndTest(AdapterTestCase):
                 self.assertFalse(r.is_error, text_of(r))
                 self.assertEqual([c.type for c in r.content], ["text", "image"])
                 lines = r.content[0].text.splitlines()
-                self.assertRegex(lines[0], r"^1\. A  applied 0\.0 ms  read \d+\.\d ms$")
+                self.assertRegex(lines[0], r"^1\. A  applied 0\.0 ms  read \d+\.\d ms \(latency \d+\.\d ms\)$")
                 m = re.fullmatch(r"tile times from the last key's press: ([\d.]+), ([\d.]+), ([\d.]+) ms", lines[-1])
                 self.assertTrue(m, lines)
                 t = [float(v) for v in m.groups()]
@@ -446,7 +446,7 @@ class EndToEndTest(AdapterTestCase):
                 self.assertEqual(len(lines), 5, lines)
                 times = [tuple(float(v) for v in re.findall(r"(?:applied|read) (\d+(?:\.\d+)?) ms", l)) for l in lines]
                 self.assertEqual(times[0][0], 0.0)
-                self.assertTrue(all(applied < read for applied, read in times), lines)
+                self.assertTrue(all(applied <= read for applied, read in times), lines)   # a read can be on the apply cycle
                 self.assertGreaterEqual(times[2][0] - times[1][0], 100.0)
                 self.assertIn("]PRINT", text_of(await call(s, "read_screen")))
 
@@ -481,7 +481,7 @@ class EndToEndTest(AdapterTestCase):
                 lines = text_of(mixed).splitlines()
                 self.assertEqual(len(lines), 2, lines)
                 self.assertRegex(lines[0], r"^1\. joystick\s+applied 0\.0 ms$")
-                self.assertRegex(lines[1], r"^2\. A\s+applied \d+(\.\d+)? ms\s+read \d+(\.\d+)? ms$")
+                self.assertRegex(lines[1], r"^2\. A\s+applied \d+(\.\d+)? ms\s+read \d+(\.\d+)? ms \(latency \d+\.\d ms\)$")
                 alone = await call(s, "press_keys", keys=[{"joystick": {"x": 0}, "duration_ms": 100}])
                 self.assertFalse(alone.is_error, text_of(alone))
                 self.assertRegex(text_of(alone), r"^1\. joystick\s+applied 0\.0 ms$")
@@ -676,6 +676,86 @@ class WaitUntilChangeTest(AdapterTestCase):
                     with self.subTest(**kwargs):
                         r = await call(s, "wait_until_change", **kwargs)
                         self.assertTrue(r.is_error, kwargs)
+        self.run_async(go)
+
+
+class ReadAnchoredTimingTest(AdapterTestCase):
+    """press_keys delay_from "read" (D10, "Read-anchored delays") against a 6502 loop that polls $C000 every 92,240
+    cycles (about 90.4 ms) without clearing the strobe, like a slowly polling title screen."""
+
+    POLL_LOOP = ":".join("POKE {},{}".format(768 + i, b) for i, b in enumerate(
+        [173, 0, 192, 162, 72, 160, 255, 136, 208, 253, 202, 208, 248, 76, 0, 3])) + "\n"
+
+    async def start_loop(self, s):
+        await call(s, "wait", ms=12000)   # boot DOS 3.3
+        await call(s, "type_text", text=self.POLL_LOOP)
+        await call(s, "type_text", text="CALL 768\n")
+        await call(s, "wait", ms=500)
+
+    @staticmethod
+    def times(text):
+        """[(applied ms, read ms or None, latency ms or None)] per report line."""
+        rows = []
+        for line in text.splitlines():
+            m = re.search(r"applied ([\d.]+) ms(?:\s+read ([\d.]+) ms \(latency ([\d.]+) ms\))?", line)
+            rows.append((float(m.group(1)), None if m.group(2) is None else float(m.group(2)),
+                         None if m.group(3) is None else float(m.group(3))))
+        return rows
+
+    def test_the_gap_the_program_sees_does_not_depend_on_the_phase(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                gaps = {"applied": set(), "read": set()}
+                for offset in range(0, 100, 20):   # the phase at which the keys arrive
+                    await call(s, "wait", ms=offset)
+                    for delay_from in ("applied", "read"):
+                        r = await call(s, "press_keys", keys=["A", {"key": "B", "delay_ms": 200}],
+                                       delay_from=delay_from)
+                        self.assertFalse(r.is_error, text_of(r))
+                        (_, read_a, _), (_, read_b, _) = self.times(text_of(r))
+                        gaps[delay_from].add(round(read_b - read_a, 1))
+                self.assertGreater(len(gaps["applied"]), 1)   # from the apply: it flips by a whole loop period
+                self.assertEqual(len(gaps["read"]), 1, gaps)    # from the read: it never does
+                self.assertAlmostEqual(next(iter(gaps["read"])), 3 * 92240 * 1000.0 / 1020484.5, delta=0.2)
+        self.run_async(go)
+
+    def test_the_report_shows_the_latency_and_a_per_entry_override(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "press_keys", delay_from="read",
+                               keys=["A", {"key": "B", "delay_ms": 100}, {"key": "C", "delay_ms": 100,
+                                                                       "delay_from": "applied"}])
+                self.assertFalse(r.is_error, text_of(r))
+                rows = self.times(text_of(r))
+                for applied, read, latency in rows:
+                    self.assertAlmostEqual(latency, read - applied, delta=0.15)
+                # B counts from A's read, C (delay_from applied) from B's apply
+                self.assertAlmostEqual(rows[1][0], rows[0][1] + 100, delta=0.15)
+                self.assertAlmostEqual(rows[2][0], rows[1][0] + 100, delta=0.15)
+        self.run_async(go)
+
+    def test_a_bad_delay_from_is_an_error_and_presses_nothing(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                screen = text_of(await call(s, "read_screen"))
+                for kwargs in ({"keys": ["Z"], "delay_from": "later"},
+                               {"keys": [{"key": "Z", "delay_from": "now"}]},
+                               {"keys": [{"key": "Z", "delay_from": "read", "wait_for_read": False}]}):
+                    with self.subTest(**kwargs):
+                        r = await call(s, "press_keys", **kwargs)
+                        self.assertTrue(r.is_error)
+                self.assertEqual(text_of(await call(s, "read_screen")), screen)
+        self.run_async(go)
+
+    def test_press_keys_describes_delay_from(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                tools = {t.name: t.description for t in (await s.list_tools()).tools}
+                self.assertIn("delay_from", tools["press_keys"])
+                self.assertIn("latency", tools["press_keys"])
         self.run_async(go)
 
 

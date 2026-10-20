@@ -143,6 +143,7 @@ struct SeqStep {
     bool waitForRead = true;                 // press_keys key: waits for the read of the most recent key before it
     std::optional<JoystickChange> joystick;  // press_keys joystick entry (key, hold and waitForRead unused)
     uint64_t durationCycles = 0;             // joystick entry: restore the previous state after this long
+    bool fromRead = false;                   // press_keys: delayCycles counts from that key's read (D10)
 };
 
 struct QueuedOp {
@@ -204,11 +205,18 @@ bool StrobeClear()
 // The program's keyboard reads ($C000-$C00F; D10, "Read is a keyboard read"), seen through a pass-through on AppleWin's
 // IORead[0]: it only notes the read, so the value and the timing are AppleWin's own.
 iofunction g_appleC00xRead = nullptr;   // AppleWin's handler
-bool g_keyboardRead = false;            // a $C00x read since a timed sequence last pressed a key
+bool g_awaitingRead = false;                // a timed sequence pressed a key and waits for the program's read of it
+std::optional<uint64_t> g_keyboardReadAt;   // the cycle of that read, once it happened
 
 BYTE __stdcall KeyboardReadTap(WORD pc, WORD addr, BYTE writeFlag, BYTE writeValue, ULONG executedCycles)
 {
-    g_keyboardRead = true;
+    if (g_awaitingRead) {
+        // The read's own cycle, as AppleWin's I/O handlers time themselves (JoyReadPosition): CpuCalcCycles brings
+        // g_nCumulativeCycles up to this instruction and is safe to call again in the same handler (D10).
+        CpuCalcCycles(executedCycles);
+        g_keyboardReadAt = EmulatedNow();
+        g_awaitingRead = false;
+    }
     return g_appleC00xRead(pc, addr, writeFlag, writeValue, executedCycles);
 }
 
@@ -291,6 +299,8 @@ void ClearInput()
             KeybAnyKeyDown(WM_KEYUP, t.vk, false);
     g_input.timed.clear();
     g_input.fifo.clear();
+    g_awaitingRead = false;   // no sequence waits for a read any more
+    g_keyboardReadAt.reset();
 }
 
 // Drops every queued input and releases held keys, reporting each dropped id once as discarded (ruling D1): the inputs
@@ -379,8 +389,9 @@ void FinishTimedSequence(QueuedOp& op, uint64_t now)
     for (const TimedOp& t : g_input.timed)
         if ((t.kind == TimedOp::Kind::KeyUp || t.kind == TimedOp::Kind::JoyRestore) && t.id == op.id)
             lastRelease = (std::max)(lastRelease, t.due);
-    if (lastRelease <= now) {
-        g_input.applied.push_back(InputApplied{op.id, op.first, now, false, std::move(op.timings)});
+    if (lastRelease <= now) {   // done at the last key's read (its own cycle), or now for joystick entries only
+        const uint64_t last = op.lastKey >= 0 ? (std::max)(op.timings[op.lastKey].readCycle, lastRelease) : now;
+        g_input.applied.push_back(InputApplied{op.id, op.first, last, false, std::move(op.timings)});
         return;
     }
     TimedOp done;
@@ -390,6 +401,24 @@ void FinishTimedSequence(QueuedOp& op, uint64_t now)
     done.first = op.first;
     done.keys = std::move(op.timings);
     g_input.timed.push_back(std::move(done));
+}
+
+// After the program's first read of a key, the earliest an entry waiting for that read goes in: a program typically
+// checks $C000 and fetches the key and clears the strobe a few instructions later, so a key put in right after the
+// check would replace the one it is about to fetch (D10, "Read-anchored delays").
+const uint64_t kReadGuardCycles = MsToBaseCycles(1);
+
+// The cycle at which a timed sequence's next entry is due once the read it may wait for has been recorded: with
+// delay_from read, the read cycle of the most recent key plus the delay; otherwise the previous entry's applied cycle
+// plus the delay (op.earliest); an entry that waits for the read, not before kReadGuardCycles after it.
+uint64_t SequenceDue(const QueuedOp& op)
+{
+    const SeqStep& s = op.steps[op.next];
+    const bool waitsForRead = (s.fromRead || (!s.joystick && s.waitForRead)) && op.lastKey >= 0;
+    if (!waitsForRead || op.timings[op.lastKey].readCycle == 0)
+        return op.earliest;
+    const uint64_t read = op.timings[op.lastKey].readCycle;
+    return (std::max)(s.fromRead ? read + s.delayCycles : op.earliest, read + kReadGuardCycles);
 }
 
 // Applies every event that is due at the current step boundary.
@@ -437,10 +466,14 @@ void ProcessDueInput()
                 // press_keys (D10): a key is read at the program's first keyboard read after it was pressed. The most
                 // recent key is the only one that can still be read (a later key overwrote the earlier ones), and a
                 // key with waitForRead waits for it; so does the end of the sequence. The first key waits for nothing.
-                if (op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0 && g_keyboardRead)
-                    op.timings[op.lastKey].readCycle = now;
+                if (op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0 && g_keyboardReadAt)
+                    op.timings[op.lastKey].readCycle = *g_keyboardReadAt;   // the read's own cycle (the tap)
                 const bool atEnd = op.next >= op.steps.size();
-                const bool dependsOnRead = atEnd || (!op.steps[op.next].joystick && op.steps[op.next].waitForRead);
+                // delay_from read: the delay counts from the read of the most recent key, so the entry waits for it
+                // too; with no key before it, the entry counts as delay_from applied (D10, "Read-anchored delays").
+                const bool fromRead = !atEnd && op.steps[op.next].fromRead && op.lastKey >= 0;
+                const bool dependsOnRead =
+                    atEnd || fromRead || (!op.steps[op.next].joystick && op.steps[op.next].waitForRead);
                 if (dependsOnRead && op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0) {
                     if (now - op.timings[op.lastKey].appliedCycle >= timeout) {
                         // unread 600 frames after its press: the rest is dropped, reported with the entries applied
@@ -455,7 +488,7 @@ void ProcessDueInput()
                     g_input.fifo.pop_front();
                     continue;
                 }
-                if (now < op.earliest)
+                if (now < SequenceDue(op))
                     break;
             } else {
                 // type_text: each key waits until the strobe is clear.
@@ -500,7 +533,8 @@ void ProcessDueInput()
                 op.timings.push_back(timing);
                 if (!s.joystick) {
                     op.lastKey = int(op.timings.size()) - 1;
-                    g_keyboardRead = false;
+                    g_awaitingRead = true;   // the tap records the program's next keyboard read
+                    g_keyboardReadAt.reset();
                 }
             }
             ++op.next;
@@ -765,6 +799,48 @@ void CanonicalClock()
 // speed. The capture timeline is in emulated time, so at any other rate it cannot play in step with the wall clock,
 // and the feedback (up to +/-200 samples' worth of cycles per 1 ms step) would pull the emulation back to the base
 // clock. Otherwise the buffer is stopped (silence; it resyncs when playback resumes). Capture is never affected.
+// The next cycle at which press_keys input is known to be due: a sequence's next entry (once any read it waits for is
+// recorded), or a sequence's hold release, joystick restore or completion. press_key, set_joystick and type_text keep
+// taking effect at the start of the next step (D10).
+std::optional<uint64_t> NextSequenceDue()
+{
+    std::optional<uint64_t> best;
+    const auto consider = [&best](uint64_t cycle) {
+        if (!best || cycle < *best)
+            best = cycle;
+    };
+    for (const TimedOp& t : g_input.timed)
+        if (!t.completes || t.kind == TimedOp::Kind::Done)
+            consider(t.due);
+    if (!g_input.fifo.empty()) {
+        const QueuedOp& op = g_input.fifo.front();
+        if (op.kind == QueuedOp::Kind::Sequence && op.timed && op.next < op.steps.size()) {
+            const SeqStep& s = op.steps[op.next];
+            const bool waitsForRead = (s.fromRead || (!s.joystick && s.waitForRead)) && op.lastKey >= 0;
+            if (!waitsForRead || op.timings[op.lastKey].readCycle != 0)
+                consider(SequenceDue(op));
+        }
+    }
+    return best;
+}
+
+// Executes `cycles`, ending a chunk at each press_keys due cycle inside them and applying the input due there, so a
+// sequence entry goes in on its own cycle (to within one instruction) instead of at the next step boundary, in both
+// run modes (D10, "Read-anchored delays"). With nothing due inside, it is one TrackedExecuteStep, as before.
+void ExecuteWithExactInput(uint64_t cycles, bool fullSpeed)
+{
+    do {
+        uint64_t chunk = cycles;
+        const uint64_t now = EmulatedNow();
+        if (const auto due = NextSequenceDue(); due && *due > now && *due - now < chunk)
+            chunk = *due - now;
+        const uint64_t executed = TrackedExecuteStep(uint32_t(chunk), fullSpeed);
+        cycles -= (std::min)(cycles, executed ? executed : chunk);   // CpuExecute ends on an instruction boundary
+        if (cycles > 0)
+            ProcessDueInput();
+    } while (cycles > 0);
+}
+
 class Stepper {
 public:
     explicit Stepper(Pacing pacing)
@@ -797,7 +873,7 @@ public:
         ProcessDueInput();   // input takes effect at the start of the step (D10)
         if (!realtime_) {
             ApplyClock(SPEED_NORMAL);   // a no-op after the first step
-            TrackedExecuteStep(uint32_t((std::min)(uint64_t(period_), remaining)));
+            ExecuteWithExactInput((std::min)(uint64_t(period_), remaining), false);
             return WindowClosed();
         }
 
@@ -827,7 +903,7 @@ public:
         }
         if (cycles > remaining)
             cycles = remaining;
-        TrackedExecuteStep(uint32_t(cycles), fullSpeed_);
+        ExecuteWithExactInput(cycles, fullSpeed_);
         if (!fullSpeed_) {
             if (g_audioOutput)
                 g_audioOutput->Pump(Capture(), CaptureClock());
@@ -1231,9 +1307,11 @@ uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys)
                 throw std::invalid_argument("QueueKeys: RESET is not allowed in a sequence");
             if (const uint8_t* c = std::get_if<uint8_t>(&k.key); c && *c > 127)
                 throw std::invalid_argument("QueueKeys: ASCII code above 127");
+            if (k.delayFromRead && !k.waitForRead)
+                throw std::invalid_argument("QueueKeys: a key cannot count from a read it does not wait for");
         }
         op.steps.push_back(SeqStep{k.key, MsToBaseCycles(k.delayMs), MsToBaseCycles(k.holdMs), k.waitForRead,
-                                   k.joystick, MsToBaseCycles(k.durationMs)});
+                                   k.joystick, MsToBaseCycles(k.durationMs), k.delayFromRead});
     }
     op.id = g_input.nextId++;
     op.earliest = EmulatedNow() + op.steps.front().delayCycles;

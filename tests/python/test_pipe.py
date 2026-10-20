@@ -710,10 +710,10 @@ class AgentMethodsTest(PipeTestCase):
         keys = params["keys"]
         self.assertEqual(len(keys), 3)
         for k in keys:
-            self.assertLess(k["applied_cycle"], k["read_cycle"])
+            self.assertLessEqual(k["applied_cycle"], k["read_cycle"])   # the read's own cycle: it can be the same one
         self.assertEqual(params["first_cycle"], keys[0]["applied_cycle"])
         self.assertGreaterEqual(keys[1]["applied_cycle"] - keys[0]["applied_cycle"], ms_to_cycles(30))
-        self.assertGreaterEqual(keys[2]["applied_cycle"], keys[1]["read_cycle"])
+        self.assertGreaterEqual(keys[2]["applied_cycle"], keys[1]["read_cycle"] + ms_to_cycles(1))   # the 1 ms guard
         # the default 50 ms hold of "LEFT" outlasts its read, so its release is the last effect
         self.assertGreaterEqual(params["last_cycle"] - keys[2]["applied_cycle"], ms_to_cycles(50))
 
@@ -773,6 +773,63 @@ class AgentMethodsTest(PipeTestCase):
                 params = {} if keys is None else {"keys": keys}
                 self.assertRpcError(-32602, agent, "press_keys", **params)
         self.assertIn("input_id", agent.call("press_keys", keys=["A"] * 256))
+
+    def test_press_keys_delay_from_is_validated(self):
+        h = self.launch()
+        self.stepped_session(h)
+        agent = h.connect("agent")
+        for params in ({"keys": ["A"], "delay_from": "later"}, {"keys": ["A"], "delay_from": 1},
+                       {"keys": [{"key": "A", "delay_from": "now"}]},
+                       {"keys": ["A", {"key": "B", "delay_from": "read", "wait_for_read": False}]}):
+            with self.subTest(**params):
+                self.assertRpcError(-32602, agent, "press_keys", **params)
+        for params in ({"keys": ["A", "B"], "delay_from": "read"}, {"keys": ["A"], "delay_from": "applied"},
+                       {"keys": ["A", {"key": "B", "wait_for_read": False}], "delay_from": "read"},
+                       {"keys": ["A", {"joystick": {"x": 1}, "delay_from": "read"}]}):
+            with self.subTest(**params):
+                self.assertIn("input_id", agent.call("press_keys", **params))
+
+    def poll_loop_gap(self, run_mode):
+        """A 6502 loop polling $C000 every 92,240 cycles; returns (read(B) - read(A), applied(B) - read(A)) for
+        press_keys A, B +200 ms counted from the read (D10, "Read-anchored delays")."""
+        h = self.launch()
+        op = h.connect("operator")
+        op.call("create_session", timeout=30.0, run_mode=run_mode, disks=dos_disks())
+        agent = h.connect("agent")
+
+        def let_time_pass(frames):
+            if run_mode == "stepped":
+                op.call("step_frames", frames=frames, timeout=60.0)
+            else:
+                time.sleep(frames / 60.0)
+
+        def applied(input_id):
+            while True:
+                note = agent.next_notification(timeout=10.0)
+                if note.get("method") == "input_applied" and note["params"]["input_id"] == input_id:
+                    return note["params"]
+
+        let_time_pass(780)   # boot DOS 3.3
+        code = [173, 0, 192, 162, 72, 160, 255, 136, 208, 253, 202, 208, 248, 76, 0, 3]
+        pokes = ":".join("POKE {},{}".format(768 + i, b) for i, b in enumerate(code))
+        for text in (pokes + "\n", "CALL 768\n"):
+            sent = agent.call("type_text", text=text, inter_key_delay_ms=0)
+            let_time_pass(90)
+            applied(sent["input_id"])
+        sent = agent.call("press_keys", keys=["A", {"key": "B", "delay_ms": 200}], delay_from="read")
+        let_time_pass(60)
+        keys = applied(sent["input_id"])["keys"]
+        return (keys[1]["read_cycle"] - keys[0]["read_cycle"], keys[1]["applied_cycle"] - keys[0]["read_cycle"])
+
+    def test_read_anchored_timing_is_the_same_stepped_and_realtime(self):
+        """Counted from the program's read, a sequence keeps the same timing relative to the program whatever cycle
+        it starts at: a realtime run (started at a wall-clock-dependent phase) matches a stepped one to the cycle."""
+        stepped, realtime = self.poll_loop_gap("stepped"), self.poll_loop_gap("realtime")
+        self.assertEqual(stepped[0], 3 * 92240)   # 200 ms after a poll: the third poll after it
+        self.assertEqual(realtime[0], stepped[0])
+        for gap in (stepped[1], realtime[1]):
+            self.assertGreaterEqual(gap, ms_to_cycles(200))
+            self.assertLess(gap, ms_to_cycles(200) + 8)   # on its due cycle, in both modes
 
     def test_input_parameters_are_validated(self):
         h = self.launch()

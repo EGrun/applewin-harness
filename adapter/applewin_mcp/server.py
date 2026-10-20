@@ -318,10 +318,16 @@ class Machine:
             time.sleep(ms / 1000.0)
 
     def note_input_sent(self):
-        """Keeps the screen as it is just after an input was sent: the program cannot have reacted on screen yet (input
-        takes effect at the next step, and a reaction only shows in a later frame). wait_until_change's
-        since="last_input" compares against it. Call with self.lock held, right after the input RPC."""
-        self.input_screen = self.frame_rgb()
+        """Keeps the screen as it is just after an input was sent, for wait_until_change's since="last_input". In a
+        stepped session the program cannot have reacted yet (input takes effect at the next step); in realtime the
+        fetch takes a few ms, so a program fast enough to draw within them may already show its reaction. Best
+        effort: the input was sent, so a failed fetch only drops the reference. Call with self.lock held, right
+        after the input RPC."""
+        try:
+            self.input_screen = self.frame_rgb()
+        except ToolError as e:
+            self.input_screen = None
+            log("could not keep the screen after an input: {}".format(e))
 
     def await_input(self, input_id, expected_ms, keys=1, describe=None, settle=True):
         """Lets time pass, a frame at a time, until input_applied arrives for input_id, and returns its params. The
@@ -382,6 +388,13 @@ class Machine:
             raise ToolError("region and zoom need look or frames")
         if strip:
             box, zoom = self._strip_args(region, zoom, frames, every_ms)
+        elif look and (region is not None or zoom is not None):
+            try:   # as _look_locked checks them, but before any key is pressed
+                box, scale = check_region(region), 2 if zoom is None else zoom
+                check_zoom(scale)
+                check_size(box[2] * scale, box[3] * scale)
+            except ScreenError as e:
+                raise ToolError(str(e)) from None
         with self.lock:
             reply = self.rpc(self.agent, "press_keys", keys=keys)   # the harness validates every entry
             self.note_input_sent()
@@ -404,7 +417,7 @@ class Machine:
             else:
                 return report
         if strip:
-            last = timings[-1]["applied_cycle"]
+            last = timings[-1]["applied_cycle"] if timings else cycles[0]   # the harness reports one per entry
             times = ", ".join("{:.1f}".format(cycles_to_ms(c - last)) for c in cycles)
             report += "\ntile times from the last key's press: {} ms".format(times)
         return [report, png]
@@ -465,7 +478,9 @@ class Machine:
             else:
                 ref, ref_cycles, changed = cur, start, False
             cycles, waited = start, 0.0   # waited: emulated time in this call, which timeout_ms bounds
-            if self.stepped:
+            if changed:
+                pass   # since="last_input" and the screen already differs: no waiting
+            elif self.stepped:
                 while not changed and waited < timeout_ms:
                     self.advance(1)
                     cur, cycles = self.frame_rgb()
@@ -711,7 +726,8 @@ def build_server(args, machine):
     async def look(region: list[int] | None = None, zoom: int | None = None, frames: int = 1,
                    every_ms: int | None = None):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
-        (x 0-279, y 0-191), so halve coordinates read off a 560x384 screenshot. To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
+        (x 0-279, y 0-191), so halve coordinates read off a 560x384 screenshot.
+        To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
         the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
         is 7x8 Apple pixels. The image may not exceed 1120x768. At zoom 2 or more every dot of the 560-dot line is shown (Double Hi-Res,
         80-column text); zoom 1 shows every other one. To watch something change, give frames (2-16) and

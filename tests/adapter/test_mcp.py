@@ -376,7 +376,8 @@ class EndToEndTest(AdapterTestCase):
                 await call(s, "wait", ms=12000)   # boot DOS 3.3
                 screen = text_of(await call(s, "read_screen"))
                 for bad in ({"look": True, "frames": 2, "every_ms": 10}, {"frames": 2},
-                            {"frames": 17, "every_ms": 10}, {"region": [0, 0, 10, 10]}):
+                            {"frames": 17, "every_ms": 10}, {"region": [0, 0, 10, 10]},
+                            {"look": True, "region": [270, 0, 20, 10]}, {"look": True, "zoom": 9}):
                     with self.subTest(**bad):
                         r = await call(s, "press_keys", keys=["Z"], **bad)
                         self.assertTrue(r.is_error, bad)
@@ -710,6 +711,21 @@ class MachineUnitTest(unittest.TestCase):
         from mcp.server.mcpserver.exceptions import ToolError
         with self.assertRaisesRegex(ToolError, "unsubscribe failed"):
             self.stub_wait(False).wait_until_change(1, None, False)
+
+    def test_a_failed_screen_fetch_after_an_input_does_not_fail_the_input(self):
+        """The input was sent: the tool still succeeds, and since="last_input" then has no reference rather than an
+        older input's screen."""
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.machine()
+        m.input_screen = (b"old", 0)
+
+        def no_frame():
+            raise ToolError("get_frame failed")
+        m.frame_rgb = no_frame
+        m.rpc = lambda conn, method, **params: {}
+        m.agent = object()
+        self.assertEqual(m.set_joystick(10, None, None, None, 0), "joystick set; call wait to let time pass")
+        self.assertIsNone(m.input_screen)
 
 
 class DiskSwapTest(AdapterTestCase):

@@ -517,17 +517,43 @@ class WaitUntilChangeTest(AdapterTestCase):
         self.run_async(go)
 
     def test_wait_until_change_unsubscribes(self):
+        """After a realtime wait the harness must have stopped sending frame_ready: observed on the agent connection
+        of an in-process Machine (the MCP client cannot see notifications)."""
+        from applewin_mcp import server
+        args = server.parse_args(["--exe", os.path.abspath(exe_path()), "--headless", "--disk", DOS_IMAGE,
+                                  "--realtime"])
+        machine = server.Machine(args)
+        self.addCleanup(machine.shutdown)
+        machine.wait(12000)   # boot DOS 3.3
+        machine.type_text("POKE 768,76:POKE 769,0:POKE 770,3:CALL 768\n", 0)
+        machine.wait(500)
+        for _ in range(2):
+            text = machine.wait_until_change(200, None, False)
+            self.assertRegex(text, r"no change in \d+ ms")
+        deadline = time.monotonic() + 0.7
+        late = []
+        while time.monotonic() < deadline:
+            try:
+                note = machine.agent.next_notification(timeout=0.1)
+            except TimeoutError:
+                continue
+            if note.get("method") == "frame_ready":
+                late.append(note)
+        self.assertEqual(late, [], "frame_ready still arriving after wait_until_change")
+
+    def test_wait_until_change_sees_printed_text_realtime(self):
         async def go():
             async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
-                await self.start_loop(s)
-                for _ in range(2):
-                    r = await call(s, "wait_until_change", timeout_ms=200)
-                    self.assertFalse(r.is_error, text_of(r))
-                    self.assertRegex(r.content[0].text, r"no change in \d+ ms")
-                started = time.monotonic()
-                heard = await call(s, "listen")
-                self.assertFalse(heard.is_error, text_of(heard))
-                self.assertLess(time.monotonic() - started, 2.0)
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                await call(s, "type_text", text='10 FOR I=1 TO 300:NEXT:PRINT "X"\n')
+                await call(s, "type_text", text="RUN\n")
+                r = await call(s, "wait_until_change", timeout_ms=5000)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                m = re.fullmatch(r"changed after (\d+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                self.assertGreater(int(m.group(1)), 0)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
         self.run_async(go)
 
     def test_wait_until_change_ranges_and_region(self):

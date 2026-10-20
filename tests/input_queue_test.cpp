@@ -713,7 +713,7 @@ TEST_CASE("press_keys: overlapping joystick durations restore in due order, each
 
     // The later restore re-applied the earlier move: x stays 0 although the first entry had ended.
     auto check = [&](const std::string& expr, const std::string& expected) {
-        e.QueueText("PRINT " + expr + "", 0);
+        e.QueueText("PRINT " + expr + "\r", 0);
         REQUIRE(e.RunFrames(60));
         const auto rows = Rows(e);
         INFO("text page 1 (trimmed):" << Screen(rows));

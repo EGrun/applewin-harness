@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import zlib
@@ -470,14 +471,17 @@ class WaitUntilChangeTest(AdapterTestCase):
         async def go():
             async with mcp_session(self.errlog) as s:
                 await call(s, "wait", ms=12000)   # boot DOS 3.3
-                await call(s, "type_text", text='10 FOR I=1 TO 500:NEXT:PRINT "X"\n')
+                await call(s, "type_text", text='10 FOR I=1 TO 4000:NEXT:PRINT "X"\n')
                 await call(s, "type_text", text="RUN\n")
+                await call(s, "wait", ms=100)   # the echo of RUN is on the screen before the reference is taken
+                before = text_of(await call(s, "read_screen")).splitlines()
+                self.assertNotIn("X", [l.strip() for l in before])
                 r = await call(s, "wait_until_change", timeout_ms=5000)
                 self.assertFalse(r.is_error, text_of(r))
                 self.assertEqual([c.type for c in r.content], ["text", "image"])
                 m = re.fullmatch(r"changed after (\d+) ms", r.content[0].text)
                 self.assertTrue(m, r.content[0].text)
-                self.assertGreater(int(m.group(1)), 0)
+                self.assertGreater(int(m.group(1)), 50)   # the program's own PRINT, well after the reference
                 self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
                 self.assertIn("X", [l.strip() for l in text_of(await call(s, "read_screen")).splitlines()])
         self.run_async(go)
@@ -570,6 +574,57 @@ class WaitUntilChangeTest(AdapterTestCase):
                         r = await call(s, "wait_until_change", **kwargs)
                         self.assertTrue(r.is_error, kwargs)
         self.run_async(go)
+
+
+class MachineUnitTest(unittest.TestCase):
+    """Machine methods against a stub (no harness)."""
+
+    def machine(self):
+        from applewin_mcp import server
+        m = object.__new__(server.Machine)
+        m.lock = threading.Lock()
+        m.stepped = False
+        m.frame_ready = []
+        m.collect_frames = False
+        return m
+
+    def test_whole_screen_zoom_8_is_rejected_before_a_frame_is_fetched(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.machine()
+
+        def no_frame():
+            raise AssertionError("frame_rgb must not be called")
+        m.frame_rgb = no_frame
+        with self.assertRaisesRegex(ToolError, "1120x768"):
+            m._look_locked(None, 8)
+        with self.assertRaisesRegex(ToolError, "1120x768"):
+            m._look_locked([0, 0, 200, 100], 8)
+
+    def stub_wait(self, pump_raises):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.machine()
+        m.frame_rgb = lambda: (b"", 0)
+
+        def rpc(conn, method, **params):
+            if method == "subscribe_frames" and params["every_n_frames"] == 0:
+                raise ToolError("unsubscribe failed")
+
+        def pump(timeout=0.0):
+            if pump_raises:
+                raise ToolError("original failure")
+            time.sleep(0.01)
+        m.rpc, m.pump, m.agent = rpc, pump, object()
+        return m
+
+    def test_a_failing_unsubscribe_does_not_mask_the_original_error(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        with self.assertRaisesRegex(ToolError, "original failure"):
+            self.stub_wait(True).wait_until_change(100, None, False)
+
+    def test_a_failing_unsubscribe_is_an_error_when_the_wait_succeeded(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        with self.assertRaisesRegex(ToolError, "unsubscribe failed"):
+            self.stub_wait(False).wait_until_change(1, None, False)
 
 
 class DiskSwapTest(AdapterTestCase):

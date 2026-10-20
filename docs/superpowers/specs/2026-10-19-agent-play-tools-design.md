@@ -110,7 +110,7 @@ call: whether the MCP SDK lets a tool error carry an image; if not, the error is
   clock's.
 
 ### 5. `wait_until_change { region?: [x, y, w, h], timeout_ms: int, look?: bool = true }` (adapter)
-- Takes the current frame as the reference, then checks every presented frame until any pixel in `region` (Apple
+- Takes the current frame as the reference, then checks frames as they are presented (in realtime a change lasting a single frame can be missed) until any pixel in `region` (Apple
   pixels, default the whole screen; compared as frame pixels, the region scaled ×2) differs from the reference, or `timeout_ms` (1–60,000) passes.
 - Returns text: `changed after N ms` or `no change in N ms` (a timeout is not an error), plus the screen as a PNG when
   `look` is true (the default). `region` crops nothing in the returned image: it only selects what is watched.

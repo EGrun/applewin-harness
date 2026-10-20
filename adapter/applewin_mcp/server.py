@@ -432,7 +432,13 @@ class Machine:
                 finally:
                     self.collect_frames = False
                     self.frame_ready = []
-                    self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
+                    failing = sys.exc_info()[0] is not None   # an exception is already propagating
+                    try:
+                        self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
+                    except ToolError as e:
+                        if not failing:
+                            raise    # the wait itself succeeded: the failed unsubscribe is the error
+                        log("unsubscribe after a failed wait_until_change also failed: {}".format(e))
         text = "{} {} ms".format("changed after" if changed else "no change in", int(round(elapsed)))
         if not look:
             return text
@@ -446,9 +452,10 @@ class Machine:
         try:
             box = check_region(region)
             zoom = 2 if zoom is None else zoom
+            check_zoom(zoom)
+            check_size(box[2] * zoom, box[3] * zoom)   # before the frame is fetched or cropped
             rgb, _ = self.frame_rgb()
             width, height, pixels = crop_zoom(rgb, box, zoom)
-            check_size(width, height)
             return encode_png(width, height, pixels)
         except ScreenError as e:
             raise ToolError(str(e)) from None
@@ -478,10 +485,7 @@ class Machine:
                 if i:
                     self.advance_ms(every_ms)
                 rgb, emulated = self.frame_rgb()
-                try:
-                    tiles.append(crop_zoom(rgb, box, zoom))
-                except ScreenError as e:
-                    raise ToolError(str(e)) from None
+                tiles.append(crop_zoom(rgb, box, zoom))
                 cycles.append(emulated)
         width, height, pixels = contact_sheet(tiles, STRIP_PER_ROW, STRIP_GAP)
         times = ", ".join("{:.1f}".format(cycles_to_ms(c - cycles[0])) for c in cycles)
@@ -639,7 +643,8 @@ def build_server(args, machine):
         something is drawn. It compares the screen as it is now with each later frame, and stops at the first frame
         in which any pixel differs. region [x, y, w, h] (Apple pixels, x 0-279, y 0-191) only selects which part
         is watched; changes elsewhere are ignored. The result is "changed after N ms" or "no change in N ms" (N is
-        emulated time since the call); running out of time is not an error. With look true (the default) it also
+        emulated time since the call); running out of time is not an error. In a stepped session it steps frame by
+        frame, so a long timeout takes real time to run. With look true (the default) it also
         returns the whole screen at that moment as a 560x384 PNG (never cropped to region). In a realtime session
         the game keeps running while you wait. Anything that flickers in the watched region (a blinking cursor, an
         animation) counts as a change at once, so choose a region that excludes it."""

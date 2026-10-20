@@ -169,12 +169,15 @@ def key_report(keys, timings):
     start = timings[0]["applied_cycle"] if timings else 0
     lines = []
     for i, k in enumerate(keys, 1):
-        name = k.get("key") if isinstance(k, dict) else k
+        name = ("joystick" if "joystick" in k else k.get("key")) if isinstance(k, dict) else k
         if i > len(timings):
             lines.append("{}. {}  not pressed".format(i, name))
             continue
         t = timings[i - 1]
-        read = "never read" if t["read_cycle"] is None else "read {:.1f} ms".format(cycles_to_ms(t["read_cycle"] - start))
+        if "read_cycle" not in t:   # a joystick entry: nothing to read
+            lines.append("{}. {}  applied {:.1f} ms".format(i, name, cycles_to_ms(t["applied_cycle"] - start)))
+            continue
+        read ="never read" if t["read_cycle"] is None else "read {:.1f} ms".format(cycles_to_ms(t["read_cycle"] - start))
         lines.append("{}. {}  applied {:.1f} ms  {}".format(i, name, cycles_to_ms(t["applied_cycle"] - start), read))
     return "\n".join(lines)
 
@@ -353,7 +356,10 @@ class Machine:
             expected_ms = 0   # an upper bound: every delay and every hold, end to end
             for k in keys:
                 entry = k if isinstance(k, dict) else {}
-                expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
+                if "joystick" in entry:
+                    expected_ms += entry.get("delay_ms", 0) + entry.get("duration_ms", 0)
+                else:
+                    expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
             applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys),
                                        describe=lambda params: key_report(keys, params.get("keys") or []))
             report = key_report(keys, applied.get("keys") or [])
@@ -593,7 +599,13 @@ def build_server(args, machine):
         this call); hold_ms (default 50, up to 10000) is how long the key is held, and may outlast later keys. Each
         key after the first also waits until the program has read the keyboard since the previous one, so fast keys
         are never lost (LEFT, LEFT stays two presses); the first key goes in at once, replacing any key left unread.
-        At most 256 keys. Returns, per key, when it was pressed (applied) and when the program read it, in ms from the
+        Add "wait_for_read": false to a key to skip that wait: it then goes in on schedule and replaces a key the
+        program has not read yet, as press_key does (a replaced key is reported "never read"). An entry may instead
+        be a joystick move {"joystick": {"x": 0-255, "y": 0-255, "buttons": {"0": true, "1": false}}, "delay_ms": ...,
+        "duration_ms": 0-60000}: every field is optional, fields left out keep their value, and with duration_ms the
+        joystick then returns to its previous state. A joystick entry never waits for a keyboard read; it is timed
+        from the previous entry like delay_ms above, so it can land between or alongside keys. At most 256 entries.
+        Returns, per entry, when it was pressed (applied) and, for a key, when the program read it, in ms from the
         first press: a program acts on a key when it reads it. Returns once the last key is read and released. If the
         program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
         (the unread one marked "never read") and those not pressed. With look true it also returns the screen after the

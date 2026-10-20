@@ -417,6 +417,22 @@ class EndToEndTest(AdapterTestCase):
                 self.assertFalse(reset.is_error, text_of(reset))
         self.run_async(go)
 
+    def test_press_keys_with_joystick_entries(self):
+        """A joystick entry is reported as a "joystick" line with no read time; key lines are unchanged."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                mixed = await call(s, "press_keys", keys=[{"joystick": {"x": 0}, "duration_ms": 100}, "A"])
+                self.assertFalse(mixed.is_error, text_of(mixed))
+                lines = text_of(mixed).splitlines()
+                self.assertEqual(len(lines), 2, lines)
+                self.assertRegex(lines[0], r"^1\. joystick\s+applied 0\.0 ms$")
+                self.assertRegex(lines[1], r"^2\. A\s+applied \d+(\.\d+)? ms\s+read \d+(\.\d+)? ms$")
+                alone = await call(s, "press_keys", keys=[{"joystick": {"x": 0}, "duration_ms": 100}])
+                self.assertFalse(alone.is_error, text_of(alone))
+                self.assertRegex(text_of(alone), r"^1\. joystick\s+applied 0\.0 ms$")
+        self.run_async(go)
+
     def test_stdout_is_clean_mcp_only(self):
         """Review Focus 1: a stray byte on stdout would break the session; a round trip must work."""
         async def go():

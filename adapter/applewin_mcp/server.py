@@ -658,6 +658,7 @@ class Machine:
 
     def checkpoint(self, name=None):
         self._require_stepped()
+        name = name or None   # an empty name is no name
         params = {} if name is None else {"name": name}
         with self.lock:
             saved = self.rpc(self.operator, "checkpoint", **params)
@@ -670,13 +671,21 @@ class Machine:
         the last-input screen belong to that timeline."""
         self._require_stepped()
         with self.lock:
+            try:   # the name is only for the message: looked up first, so the restore's result is what counts
+                rows = self.rpc(self.operator, "list_checkpoints")
+                name = next((c.get("name") for c in rows if c["checkpoint_id"] == checkpoint_id), None)
+            except ToolError:
+                name = None
             restored = self.rpc(self.operator, "restore_checkpoint", checkpoint_id=checkpoint_id)
-            self.pump(0.0)   # the discarded inputs' notices arrived before the reply
+            # The discarded-input notices and the old timeline's last sound events come on the agent connection,
+            # which may not have been read yet. A reply there follows that connection's earlier notifications, so
+            # once this no-op unsubscribe returns they have all arrived and can be drained.
+            self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
+            self.pump(0.0)
             self.applied = {}
             self.events = []
             self.input_screen = None
-            names = {c["checkpoint_id"]: c.get("name") for c in self.rpc(self.operator, "list_checkpoints")}
-        return "restored {} at {:.1f} ms".format(self._checkpoint_label(checkpoint_id, names.get(checkpoint_id)),
+        return "restored {} at {:.1f} ms".format(self._checkpoint_label(checkpoint_id, name),
                                                  cycles_to_ms(restored["emulated_cycles"]))
 
     def list_checkpoints(self):
@@ -856,7 +865,7 @@ def build_server(args, machine):
         async def checkpoint(name: str | None = None) -> str:
             """Save the whole machine (memory, CPU, video, sound, joystick, and the floppies in both drives) as a
             checkpoint you can return to with restore_checkpoint, e.g. before a risky jump. name is an optional label
-            (up to 64 characters). Returns the checkpoint id (cp-1, cp-2, ...) and the emulated time. Up to 256
+            (up to 64 printable characters). Returns the checkpoint id (cp-1, cp-2, ...) and the emulated time. Up to 256
             checkpoints; they last as long as this session. Only in a stepped session."""
             return await asyncio.to_thread(machine.checkpoint, name)
 
@@ -866,7 +875,7 @@ def build_server(args, machine):
             checkpoint or list_checkpoints). Input still waiting to take effect is dropped, and the time continues
             from the checkpoint's. Replaying the same input from the same checkpoint gives exactly the same result,
             so you can retry a manoeuvre with different timing. The checkpoint is kept; restore it as often as you
-            like. Only in a stepped session."""
+            like. Only in a stepped session. If a restore itself fails, the session cannot be used any further."""
             return await asyncio.to_thread(machine.restore_checkpoint, checkpoint_id)
 
         @mcp.tool()

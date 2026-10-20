@@ -781,6 +781,42 @@ class MachineUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "unsubscribe failed"):
             self.stub_wait(False).wait_until_change(1, None, False)
 
+    def test_restore_drains_late_notices_from_the_old_timeline(self):
+        """The harness sends the discarded-input notices (and any last sound events) on the agent connection, so they
+        may still be unread when the restore reply arrives on the operator connection. An agent-connection call after
+        the reply is a barrier: once it returns they have arrived, and the restore drains and forgets them."""
+        m = self.machine()
+        m.stepped = True
+        m.applied, m.events, m.input_screen = {7: {"input_id": 7}}, [("sound_started", {})], (b"old", 0)
+        queue, late = [], []   # late: sent by the harness, not yet read from the agent connection
+
+        def arrive():
+            queue.extend(late)
+            late.clear()
+
+        class Agent:
+            def next_notification(self, timeout=0.0):
+                if not queue:
+                    raise TimeoutError
+                return queue.pop(0)
+        m.agent, m.operator = Agent(), object()
+
+        def rpc(conn, method, **params):
+            if conn is m.agent:
+                arrive()   # an agent-connection reply comes after that connection's earlier notifications
+            if method == "restore_checkpoint":
+                late.extend([{"method": "input_applied", "params": {"input_id": 8, "discarded": True}},
+                             {"method": "sound_stopped", "params": {}}])
+                return {"emulated_cycles": 0}
+            if method == "list_checkpoints":
+                return [{"checkpoint_id": "cp-1", "name": None, "emulated_cycles": 0}]
+            return {}
+        m.rpc = rpc
+        self.assertEqual(m.restore_checkpoint("cp-1"), "restored cp-1 at 0.0 ms")
+        arrive()      # whatever was still in flight has arrived by now
+        m.pump(0.0)
+        self.assertEqual((m.applied, m.events, m.input_screen), ({}, [], None))
+
     def test_a_failed_screen_fetch_after_an_input_does_not_fail_the_input(self):
         """The input was sent: the tool still succeeds, and since="last_input" then has no reference rather than an
         older input's screen."""

@@ -49,8 +49,12 @@ The server starts the harness (`--serve`), creates the session and serves MCP on
 | `eject_disk` | `drive` (1 or 2) | Takes the floppy out of the drive. An empty drive is an error. |
 | `export_disk` | `drive` (1 or 2), `path` | Saves the floppy in the drive, with everything written to it so far, as a new image file in the disk's own format. The disk stays in the drive. |
 | `set_speed` | `speed?` (`authentic`, `max` or 0-40), `disk_boost?` | Realtime only (an error in stepped mode). Changes the speed while the machine runs, with the same values as `--speed` and `--no-disk-boost`. Anything left out is unchanged; with no arguments it reports the current speed. |
+| `checkpoint` | `name?` (up to 64 characters) | Stepped only (absent with `--realtime`). Saves the whole machine and both floppies (AppleWin's save state plus the working disks) and returns its id (`cp-1`, `cp-2`, ...) and emulated time. Up to 256 per session. |
+| `restore_checkpoint` | `checkpoint_id` | Stepped only. Puts the machine and its floppies back as they were at the checkpoint; input still waiting is dropped. The same input after the same checkpoint gives the same result, so a manoeuvre can be retried with different timing. |
+| `list_checkpoints` | none | Stepped only. The session's checkpoints, oldest first: id, name (`-` if none), emulated time. |
+| `delete_checkpoint` | `checkpoint_id` | Stepped only. Deletes a checkpoint. |
 
-No other operator method (sessions, checkpoints, stepping) is reachable through the server.
+No other operator method (sessions, stepping, state checksums) is reachable through the server, and no checkpoint tool exists in a realtime session.
 
 ## Behaviour notes
 - **Time.** The default is stepped mode: the emulator is paused, and time passes only through `wait` (and the short stretch `type_text` and `press_key` need, and `listen` with `ms`). A program does not run while the agent is thinking. With `--realtime` the emulator runs on the wall clock, and `wait` sleeps for that many real milliseconds (at a speed above authentic, set by `--speed` or `set_speed`, more emulated time passes).

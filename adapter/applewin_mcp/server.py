@@ -2,7 +2,7 @@
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
-and as agent (to type, look, listen), and serves thirteen tools over MCP stdio.
+and as agent (to type, look, listen), and serves thirteen tools over MCP stdio, plus four checkpoint tools in a stepped session.
 
 stdout carries MCP frames only: the harness child's stdout is a pipe that harness_client drains, and all logging goes
 to stderr. The adapter writes the line "harness pid <N>" to stderr once the harness is running.
@@ -646,6 +646,63 @@ class Machine:
             self.rpc(self.operator, "eject_disk", slot=6, drive=drive)
         return "ejected the disk from drive {}".format(drive)
 
+    # ---- checkpoints: stepped sessions only (user ruling 2026-10-20; the tools are not registered in realtime) ----
+
+    def _require_stepped(self):
+        if not self.stepped:
+            raise ToolError("checkpoints are only available in a stepped session")
+
+    @staticmethod
+    def _checkpoint_label(checkpoint_id, name):
+        return checkpoint_id if name is None else "{} ({})".format(checkpoint_id, name)
+
+    def checkpoint(self, name=None):
+        self._require_stepped()
+        name = name or None   # an empty name is no name
+        params = {} if name is None else {"name": name}
+        with self.lock:
+            saved = self.rpc(self.operator, "checkpoint", **params)
+        return "saved {} at {:.1f} ms".format(self._checkpoint_label(saved["checkpoint_id"], name),
+                                              cycles_to_ms(saved["emulated_cycles"]))
+
+    def restore_checkpoint(self, checkpoint_id):
+        """Restores the machine and its disks. Everything the adapter kept from the thrown-away timeline goes too:
+        the harness reports the input it discarded (drained here), and the sound events not yet given to listen and
+        the last-input screen belong to that timeline."""
+        self._require_stepped()
+        with self.lock:
+            try:   # the name is only for the message: looked up first, so the restore's result is what counts
+                rows = self.rpc(self.operator, "list_checkpoints")
+                name = next((c.get("name") for c in rows if c["checkpoint_id"] == checkpoint_id), None)
+            except ToolError:
+                name = None
+            restored = self.rpc(self.operator, "restore_checkpoint", checkpoint_id=checkpoint_id)
+            # The discarded-input notices and the old timeline's last sound events come on the agent connection,
+            # which may not have been read yet. A reply there follows that connection's earlier notifications, so
+            # once this no-op unsubscribe returns they have all arrived and can be drained.
+            self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
+            self.pump(0.0)
+            self.applied = {}
+            self.events = []
+            self.input_screen = None
+        return "restored {} at {:.1f} ms".format(self._checkpoint_label(checkpoint_id, name),
+                                                 cycles_to_ms(restored["emulated_cycles"]))
+
+    def list_checkpoints(self):
+        self._require_stepped()
+        with self.lock:
+            rows = self.rpc(self.operator, "list_checkpoints")
+        if not rows:
+            return "no checkpoints"
+        return "\n".join("{}  {}  {:.1f} ms".format(c["checkpoint_id"], c.get("name") or "-",
+                                                    cycles_to_ms(c["emulated_cycles"])) for c in rows)
+
+    def delete_checkpoint(self, checkpoint_id):
+        self._require_stepped()
+        with self.lock:
+            self.rpc(self.operator, "delete_checkpoint", checkpoint_id=checkpoint_id)
+        return "deleted {}".format(checkpoint_id)
+
     def shutdown(self):
         """close_session, then wait for the process to exit (Harness.close waits 5 s, then kills it)."""
         try:
@@ -802,6 +859,34 @@ def build_server(args, machine):
         speed whenever a drive motor is on. Anything left out keeps its value; with no arguments it just reports
         the current speed. wait counts real time, so at a higher speed more of the machine's time passes."""
         return await asyncio.to_thread(machine.set_speed, speed, disk_boost)
+
+    if not args.realtime:   # checkpoints are for stepped sessions only (user ruling 2026-10-20)
+        @mcp.tool()
+        async def checkpoint(name: str | None = None) -> str:
+            """Save the whole machine (memory, CPU, video, sound, joystick, and the floppies in both drives) as a
+            checkpoint you can return to with restore_checkpoint, e.g. before a risky jump. name is an optional label
+            (up to 64 printable characters). Returns the checkpoint id (cp-1, cp-2, ...) and the emulated time. Up to 256
+            checkpoints; they last as long as this session. Only in a stepped session."""
+            return await asyncio.to_thread(machine.checkpoint, name)
+
+        @mcp.tool()
+        async def restore_checkpoint(checkpoint_id: str) -> str:
+            """Put the machine and its floppies back exactly as they were at a checkpoint (an id such as cp-1 from
+            checkpoint or list_checkpoints). Input still waiting to take effect is dropped, and the time continues
+            from the checkpoint's. Replaying the same input from the same checkpoint gives exactly the same result,
+            so you can retry a manoeuvre with different timing. The checkpoint is kept; restore it as often as you
+            like. Only in a stepped session. If a restore itself fails, the session cannot be used any further."""
+            return await asyncio.to_thread(machine.restore_checkpoint, checkpoint_id)
+
+        @mcp.tool()
+        async def list_checkpoints() -> str:
+            """List this session's checkpoints, oldest first: id, name ("-" if none) and emulated time."""
+            return await asyncio.to_thread(machine.list_checkpoints)
+
+        @mcp.tool()
+        async def delete_checkpoint(checkpoint_id: str) -> str:
+            """Delete a checkpoint you no longer need (an id such as cp-1)."""
+            return await asyncio.to_thread(machine.delete_checkpoint, checkpoint_id)
 
     @mcp.tool()
     async def eject_disk(drive: int) -> str:

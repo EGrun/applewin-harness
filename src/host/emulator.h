@@ -48,25 +48,34 @@ struct ResetKey {};                               // CTRL-RESET: AppleWin's Ctrl
 // An ASCII code 0..127 (sent with KeybQueueKeypress(code, ASCII)), an arrow key, or RESET.
 using KeySpec = std::variant<uint8_t, ArrowKey, ResetKey>;
 
-// One key of a press_keys sequence (D10, "Key sequences"): delayMs after the previous key was applied (the first: after
-// queueing), and held holdMs.
-struct SequenceKey {
-    KeySpec key{uint8_t(0)};
-    uint32_t delayMs = 0;
-    uint32_t holdMs = 50;
-};
-
-// A sequence key's applied cycle (put in the keyboard latch) and read cycle (the first step boundary after the program's
-// first keyboard read, $C000-$C00F, since then; 0: never read). EmulatedCycles() values.
-struct KeyTiming {
-    uint64_t appliedCycle = 0, readCycle = 0;
-};
-
 // Joystick 0 through AppleWin's mouse-as-joystick seam (J0C_MOUSE). Fields left out keep their values; positions
 // start at 127 (centre).
 struct JoystickChange {
     std::optional<uint8_t> x, y;
     std::optional<bool> button0, button1;
+};
+
+// One entry of a press_keys sequence (D10, "Key sequences"): delayMs after the previous entry (of either kind) was
+// applied (the first: after queueing). A key entry is held holdMs and, when waitForRead, waits for the program to have
+// read the most recent key before it in the sequence (joystick entries in between do not reset that); with waitForRead
+// false it overwrites an unread key, as press_key does. A joystick entry has `joystick` set, ignores key, holdMs and
+// waitForRead, never waits for a read, and with durationMs > 0 returns the joystick to the state it had just before
+// it was applied, after that long (D10, "Joystick entries and wait_for_read").
+struct SequenceKey {
+    KeySpec key{uint8_t(0)};
+    uint32_t delayMs = 0;
+    uint32_t holdMs = 50;
+    bool waitForRead = true;
+    std::optional<JoystickChange> joystick;
+    uint32_t durationMs = 0;
+};
+
+// A sequence entry's applied cycle and, for a key, its read cycle (the first step boundary after the program's first
+// keyboard read, $C000-$C00F, since the key was pressed; 0: never read, also for a key a later key overwrote). A
+// joystick entry has joystick set and no read cycle. EmulatedCycles() values.
+struct KeyTiming {
+    uint64_t appliedCycle = 0, readCycle = 0;
+    bool joystick = false;
 };
 
 // An input that has fully taken effect. type_text: the cycles at which the first and the last key were applied.
@@ -166,12 +175,15 @@ public:
     // holdMs later (vk: the key's own VK where one exists, VK_SPACE otherwise). An ASCII code above 127 throws
     // std::invalid_argument.
     uint64_t QueueKey(KeySpec key, uint32_t holdMs);
-    // press_keys (D10, "Key sequences"): the same queue entry as a text, with a delay and a hold per key. Key i > 0 is
-    // due at the later of the previous key's applied cycle plus its delayMs and the program's first keyboard read
-    // ($C000-$C00F) since the previous key was pressed; key 0 at the queueing plus its delayMs, waiting for nothing
-    // else. Holds as for QueueKey, and they may outlast later keys. It completes once the last key is read and every
-    // hold released, reporting KeyTiming per key; a key unread 600 frames after its press discards it (reporting the
-    // keys pressed). Throws std::invalid_argument for no keys, RESET or an ASCII code above 127.
+    // press_keys (D10, "Key sequences"): the same queue entry as a text, with a delay and a hold per entry. Entry i > 0
+    // is due at the previous entry's applied cycle plus its delayMs and, for a key with waitForRead, not before the
+    // program's first keyboard read ($C000-$C00F) since the most recent key before it was pressed; entry 0 at the
+    // queueing plus its delayMs, waiting for nothing else. A joystick entry waits for no read. Holds as for QueueKey,
+    // and they may outlast later entries; a joystick durationMs restores as QueueJoystick does. It completes once the
+    // last key is read (if there is one) and every hold and restore finished, reporting one KeyTiming per entry in
+    // order; the last key, or a key a waiting entry depends on, unread 600 frames after its press discards the
+    // sequence (reporting the entries applied). Throws std::invalid_argument for no entries, RESET or an ASCII code
+    // above 127.
     uint64_t QueueKeys(std::vector<SequenceKey> keys);
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);

@@ -198,6 +198,11 @@ Input is applied between bursts or steps. Every input response reports `applied_
 - **The timeout is 600 frames after the unread key was pressed.** A timed-out sequence's discarded report lists the keys that were pressed, with the unread one's `read_cycle` null, so an agent can tell an ignored key from one that was acted on.
 - `type_text` is unchanged: it still waits for the strobe to clear before each key, which is what keeps typed text whole in a program that reads lines (GETLN clears the strobe).
 
+**Joystick entries and wait_for_read (2026-10-19):** a game manoeuvre often mixes keys with a joystick move or button, and sometimes needs a key pressed over one the game has not yet taken. `press_keys` entries may now be joystick changes or keys with `wait_for_read: false`:
+- **One list, one clock.** A joystick entry is queued in the same sequence, so `delay_ms` counts from the previous entry's applied cycle whatever its kind. It waits for no read. With `duration_ms` it queues a `JoyRestore` of the state just before it (as `set_joystick` does), marked `completes = false` and carrying the sequence id; the sequence completes only when its last such restore (like its last key release) is done, and a discard of the queue does not report it twice.
+- **"The previous key" is the most recent key entry.** A key with `wait_for_read` waits for the read of the most recent key before it; joystick entries in between do not reset that. A key overwritten by a later `wait_for_read: false` key keeps `read_cycle: null` and never times out; the 600-frame timeout applies only to a key a waiting entry depends on, or to the last key of the sequence.
+- **Wire shape.** `input_applied.keys` has one item per entry in request order; a joystick item is `{ applied_cycle, joystick: true }` with no `read_cycle`, so a never-read key (`read_cycle: null`) is not confused with it.
+
 ## D11 — Speed controls mirror AppleWin exactly
 **Status:** Accepted
 

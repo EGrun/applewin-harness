@@ -399,8 +399,6 @@ class Machine:
             return encode_png(width, height, pixels)
         except ScreenError as e:
             raise ToolError(str(e)) from None
-        except (TypeError, ValueError):
-            raise ToolError("region must be [x, y, w, h] inside 280x192 Apple pixels") from None
 
     def look(self, region=None, zoom=None):
         with self.lock:
@@ -539,7 +537,9 @@ def build_server(args, machine):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
         (x 0-279, y 0-191). To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
         the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
-        is 7x8 Apple pixels. The image may not exceed 1120x768."""
+        is 7x8 Apple pixels. The image may not exceed 1120x768. The cropped or zoomed image is the 280x192 Apple-pixel picture (the top-left pixel
+        of each 2x2 block), so it loses the extra horizontal detail of 80-column text, double-hires and NTSC
+        colour; a plain look shows the full 560x384 frame."""
         png = await asyncio.to_thread(machine.look, region, zoom)
         return Image(data=png, format="png")
 

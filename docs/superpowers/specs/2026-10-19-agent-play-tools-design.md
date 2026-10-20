@@ -94,7 +94,7 @@ call: whether the MCP SDK lets a tool error carry an image; if not, the error is
 - The output must stay at most 1,120×768 pixels (the whole screen at zoom 4); a larger request is a tool error saying
   the limit.
 - The adapter fetches `get_frame { format: "BGRA32" }` (560×384, top row first), samples one source pixel per Apple pixel
-  (the top-left of each 2×2 block), and encodes an RGB PNG itself.
+  (the top-left of each 2×2 block), and encodes an RGB PNG itself. The cropped or zoomed image is the 280x192 Apple-pixel picture (the top-left pixel of each 2x2 block), so it loses the extra horizontal detail of 80-column text, double-hires and NTSC colour; a plain look shows the full 560x384 frame.
 - With no arguments the result is byte-for-byte today's `look` (the harness's own PNG). *(my call: keeps the existing
   M5 behaviour and its tests unchanged.)*
 

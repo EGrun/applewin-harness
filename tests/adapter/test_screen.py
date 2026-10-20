@@ -52,6 +52,11 @@ class ScreenTests(unittest.TestCase):
                 screen.check_region(bad)
         self.assertEqual(screen.check_region(None), (0, 0, 280, 192))
 
+    def test_region_that_is_not_a_list_is_rejected(self):
+        for bad in (5, "abcd"):
+            with self.assertRaises(screen.ScreenError):
+                screen.check_region(bad)
+
     def test_crop_zoom_nearest_neighbour(self):
         buf = bytearray(280 * 192 * 3)
         buf[3 * (20 * 280 + 10):3 * (20 * 280 + 11)] = bytes([255, 0, 0])

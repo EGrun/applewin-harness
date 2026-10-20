@@ -32,7 +32,11 @@ def check_region(region):
     if region is None:
         return (0, 0, APPLE_W, APPLE_H)
     bad = ScreenError("region must be [x, y, w, h] inside 280x192 Apple pixels")
-    if len(region) != 4 or not all(isinstance(v, int) and not isinstance(v, bool) for v in region):
+    try:
+        valid = len(region) == 4 and all(isinstance(v, int) and not isinstance(v, bool) for v in region)
+    except TypeError:
+        valid = False
+    if not valid:
         raise bad
     x, y, w, h = region
     if x < 0 or y < 0 or w < 1 or h < 1 or x + w > APPLE_W or y + h > APPLE_H:

@@ -256,6 +256,7 @@ class Machine:
         self.applied = {}       # input id -> discarded, for each input whose input_applied has arrived
         self.frame_ready = []   # frame_ready params, collected only while wait_until_change is subscribed
         self.collect_frames = False
+        self.input_screen = None   # (frame RGB, emulated_cycles) just after the last input was sent
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
         self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
                                       stderr_line=self._forward_harness_line)
@@ -316,11 +317,24 @@ class Machine:
         else:
             time.sleep(ms / 1000.0)
 
-    def await_input(self, input_id, expected_ms, keys=1, describe=None):
+    def note_input_sent(self):
+        """Keeps the screen as it is just after an input was sent, for wait_until_change's since="last_input". In a
+        stepped session the program cannot have reacted yet (input takes effect at the next step); in realtime the
+        fetch takes a few ms, so a program fast enough to draw within them may already show its reaction. Best
+        effort: the input was sent, so a failed fetch only drops the reference. Call with self.lock held, right
+        after the input RPC."""
+        try:
+            self.input_screen = self.frame_rgb()
+        except ToolError as e:
+            self.input_screen = None
+            log("could not keep the screen after an input: {}".format(e))
+
+    def await_input(self, input_id, expected_ms, keys=1, describe=None, settle=True):
         """Lets time pass, a frame at a time, until input_applied arrives for input_id, and returns its params. The
         cap counts frames beyond expected_ms, the time the input itself takes (keys x delay, or the hold): 600 per key,
         since the harness may wait that long on each key before it drops the rest (D10). It is only a safety net.
-        describe(params), when given, adds lines to the error for a dropped input."""
+        describe(params), when given, adds lines to the error for a dropped input. settle false skips the frames
+        that let the program echo the last key (a strip taken from that moment instead)."""
         frames = 0
         allowed = math.ceil(expected_ms * FRAMES_PER_SECOND / 1000) + INPUT_FRAME_CAP * max(1, keys)
         while True:
@@ -332,7 +346,8 @@ class Machine:
                                "may be busy), and the rest of the keys were dropped. Call wait to let time pass, then "
                                "look.".format(INPUT_FRAME_CAP))
                     raise ToolError(message + ("\n" + describe(params) if describe else ""))
-                self.advance(SETTLE_FRAMES)   # let the program echo the last key
+                if settle:
+                    self.advance(SETTLE_FRAMES)   # let the program echo the last key
                 return params
             if frames >= allowed:
                 raise ToolError("the keyboard wasn't read within {} frames: the program may not be reading keys "
@@ -345,6 +360,7 @@ class Machine:
     def type_text(self, text, inter_key_delay_ms):
         with self.lock:
             reply = self.rpc(self.agent, "type_text", text=text, inter_key_delay_ms=inter_key_delay_ms)
+            self.note_input_sent()
             self.await_input(reply["input_id"], len(text) * inter_key_delay_ms, keys=len(text))
         return "typed {} characters".format(len(text))
 
@@ -354,12 +370,34 @@ class Machine:
             params["hold_ms"] = hold_ms
         with self.lock:
             reply = self.rpc(self.agent, "press_key", **params)
+            self.note_input_sent()
             self.await_input(reply["input_id"], hold_ms if hold_ms > 0 else DEFAULT_HOLD_MS)
         return "pressed {}".format(key)
 
-    def press_keys(self, keys, look=False):
+    def press_keys(self, keys, look=False, frames=1, every_ms=None, region=None, zoom=None):
+        """The key report; with look, [report, PNG] (region/zoom as for look); with frames > 1, [report and tile
+        times, contact sheet] of frames screenshots every_ms apart, the first as soon as the last key has been read
+        and released. Strip arguments are checked before any key is sent."""
+        _check_range("frames", frames, *STRIP_FRAMES_RANGE)
+        if every_ms is not None:
+            _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
+        strip = frames != 1
+        if strip and look:
+            raise ToolError("use look or frames, not both: a strip already shows the screen")
+        if (region is not None or zoom is not None) and not (look or strip):
+            raise ToolError("region and zoom need look or frames")
+        if strip:
+            box, zoom = self._strip_args(region, zoom, frames, every_ms)
+        elif look and (region is not None or zoom is not None):
+            try:   # as _look_locked checks them, but before any key is pressed
+                box, scale = check_region(region), 2 if zoom is None else zoom
+                check_zoom(scale)
+                check_size(box[2] * scale, box[3] * scale)
+            except ScreenError as e:
+                raise ToolError(str(e)) from None
         with self.lock:
             reply = self.rpc(self.agent, "press_keys", keys=keys)   # the harness validates every entry
+            self.note_input_sent()
             expected_ms = 0   # an upper bound: every delay and every hold, end to end
             for k in keys:
                 entry = k if isinstance(k, dict) else {}
@@ -368,11 +406,20 @@ class Machine:
                 else:
                     expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
             applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys),
-                                       describe=lambda params: key_report(keys, params.get("keys") or []))
-            report = key_report(keys, applied.get("keys") or [])
-            if not look:
+                                       describe=lambda params: key_report(keys, params.get("keys") or []),
+                                       settle=not strip)
+            timings = applied.get("keys") or []
+            report = key_report(keys, timings)
+            if strip:
+                png, cycles = self._strip_locked(box, zoom, frames, every_ms)
+            elif look:
+                png = self._look_locked(region, zoom)
+            else:
                 return report
-            png = self._look_locked()
+        if strip:
+            last = timings[-1]["applied_cycle"] if timings else cycles[0]   # the harness reports one per entry
+            times = ", ".join("{:.1f}".format(cycles_to_ms(c - last)) for c in cycles)
+            report += "\ntile times from the last key's press: {} ms".format(times)
         return [report, png]
 
     def set_joystick(self, x, y, button0, button1, duration_ms):
@@ -392,6 +439,7 @@ class Machine:
             params["duration_ms"] = duration_ms
         with self.lock:
             self.rpc(self.agent, "set_joystick", **params)
+            self.note_input_sent()
         return "joystick set; call wait to let time pass"
 
     def wait(self, ms):
@@ -408,22 +456,35 @@ class Machine:
             raise ToolError(str(e)) from None
         return rgb, frame["emulated_cycles"]
 
-    def wait_until_change(self, timeout_ms, region=None, look=True):
-        """Lets time pass until the pixels in region differ from those at the start, or timeout_ms of emulated time
-        have passed. Returns [text, PNG of the whole screen at the end] (just the text when look is false)."""
+    def wait_until_change(self, timeout_ms, region=None, look=True, since="now"):
+        """Lets time pass until the pixels in region differ from the reference, or timeout_ms of emulated time have
+        passed in this call. The reference is the screen at the start (since "now") or just after the last input was
+        sent (since "last_input"; a change already made counts at once). Returns [text, PNG of the whole screen at
+        the end] (just the text when look is false); the text's time counts from the reference."""
         _check_range("timeout_ms", timeout_ms, *CHANGE_RANGE)
+        if since not in ("now", "last_input"):
+            raise ToolError('since must be "now" or "last_input"')
         try:
             box = check_region(region)
         except ScreenError as e:
             raise ToolError(str(e)) from None
         with self.lock:
-            ref, start = self.frame_rgb()
-            cur, elapsed, changed = ref, 0.0, False
-            if self.stepped:
-                while not changed and elapsed < timeout_ms:
+            cur, start = self.frame_rgb()
+            if since == "last_input":
+                if self.input_screen is None:
+                    raise ToolError('since="last_input": no input has been sent yet')
+                ref, ref_cycles = self.input_screen
+                changed = region_differs(ref, cur, box)
+            else:
+                ref, ref_cycles, changed = cur, start, False
+            cycles, waited = start, 0.0   # waited: emulated time in this call, which timeout_ms bounds
+            if changed:
+                pass   # since="last_input" and the screen already differs: no waiting
+            elif self.stepped:
+                while not changed and waited < timeout_ms:
                     self.advance(1)
                     cur, cycles = self.frame_rgb()
-                    elapsed = cycles_to_ms(cycles - start)
+                    waited = cycles_to_ms(cycles - start)
                     changed = region_differs(ref, cur, box)
             else:
                 deadline = time.monotonic() + 2 * timeout_ms / 1000.0
@@ -431,7 +492,7 @@ class Machine:
                 self.collect_frames = True
                 try:
                     self.rpc(self.agent, "subscribe_frames", every_n_frames=1)
-                    while not changed and elapsed < timeout_ms:
+                    while not changed and waited < timeout_ms:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
@@ -440,7 +501,7 @@ class Machine:
                             continue
                         self.frame_ready = []
                         cur, cycles = self.frame_rgb()
-                        elapsed = cycles_to_ms(cycles - start)
+                        waited = cycles_to_ms(cycles - start)
                         changed = region_differs(ref, cur, box)
                 finally:
                     self.collect_frames = False
@@ -452,7 +513,10 @@ class Machine:
                         if not failing:
                             raise    # the wait itself succeeded: the failed unsubscribe is the error
                         log("unsubscribe after a failed wait_until_change also failed: {}".format(e))
-        text = "{} {} ms".format("changed after" if changed else "no change in", int(round(elapsed)))
+        text = "{} {} ms".format("changed after" if changed else "no change in",
+                                 int(round(cycles_to_ms(cycles - ref_cycles))))
+        if since == "last_input":
+            text += " (since the last input)"
         if not look:
             return text
         return [text, encode_png(560, 384, cur)]
@@ -482,6 +546,16 @@ class Machine:
         if frames == 1:
             with self.lock:
                 return self._look_locked(region, zoom)
+        box, zoom = self._strip_args(region, zoom, frames, every_ms)
+        with self.lock:
+            png, cycles = self._strip_locked(box, zoom, frames, every_ms)
+        times = ", ".join("{:.1f}".format(cycles_to_ms(c - cycles[0])) for c in cycles)
+        return ["tile times: {} ms".format(times), png]
+
+    @staticmethod
+    def _strip_args(region, zoom, frames, every_ms):
+        """(region box, zoom) for a strip of frames > 1 tiles, after checking every_ms is given and the whole sheet
+        fits, so a rejected strip lets no time pass. frames and every_ms ranges are checked by the caller."""
         if every_ms is None:
             raise ToolError("every_ms is required when frames is more than 1")
         try:
@@ -492,17 +566,20 @@ class Machine:
                        MAX_SHEET_W, MAX_SHEET_H)
         except ScreenError as e:
             raise ToolError(str(e)) from None
+        return box, zoom
+
+    def _strip_locked(self, box, zoom, frames, every_ms):
+        """(contact sheet PNG, each tile's emulated_cycles): frames tiles every_ms apart, the first now. Call with
+        self.lock held."""
         tiles, cycles = [], []
-        with self.lock:
-            for i in range(frames):
-                if i:
-                    self.advance_ms(every_ms)
-                rgb, emulated = self.frame_rgb()
-                tiles.append(crop_zoom(rgb, box, zoom))
-                cycles.append(emulated)
+        for i in range(frames):
+            if i:
+                self.advance_ms(every_ms)
+            rgb, emulated = self.frame_rgb()
+            tiles.append(crop_zoom(rgb, box, zoom))
+            cycles.append(emulated)
         width, height, pixels = contact_sheet(tiles, STRIP_PER_ROW, STRIP_GAP)
-        times = ", ".join("{:.1f}".format(cycles_to_ms(c - cycles[0])) for c in cycles)
-        return ["tile times: {} ms".format(times), encode_png(width, height, pixels)]
+        return encode_png(width, height, pixels), cycles
 
     def read_screen(self):
         with self.lock:
@@ -598,7 +675,8 @@ def build_server(args, machine):
         return await asyncio.to_thread(machine.press_key, key, hold_ms)
 
     @mcp.tool()
-    async def press_keys(keys: list[str | int | dict], look: bool = False):
+    async def press_keys(keys: list[str | int | dict], look: bool = False, frames: int = 1,
+                         every_ms: int | None = None, region: list[int] | None = None, zoom: int | None = None):
         """Press a timed sequence of keys in one call, timed in the machine's own time: use it for a game manoeuvre
         whose keys must land at exact moments (your thinking time between calls would otherwise sit between them).
         Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
@@ -619,9 +697,13 @@ def build_server(args, machine):
         program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
         (the unread one marked "never read") and those not pressed. With look true it also returns the screen after the
         last key (a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2), so you see the result of the manoeuvre
-        without a second call."""
-        result = await asyncio.to_thread(machine.press_keys, keys, look)
-        if look:
+        without a second call. To watch the manoeuvre play out, give frames (2-16) and every_ms (1-1000) instead of
+        look: a strip of screenshots as for look, the first taken as soon as the last key has been read and released,
+        with tile times in ms from the last key's press. region and zoom (as for look) apply to look or to the
+        strip; region is in Apple pixels, so halve coordinates read off a 560x384 screenshot. Strip arguments are
+        checked before any key is pressed."""
+        result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom)
+        if isinstance(result, list):
             return [result[0], Image(data=result[1], format="png")]
         return result
 
@@ -644,7 +726,8 @@ def build_server(args, machine):
     async def look(region: list[int] | None = None, zoom: int | None = None, frames: int = 1,
                    every_ms: int | None = None):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
-        (x 0-279, y 0-191). To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
+        (x 0-279, y 0-191), so halve coordinates read off a 560x384 screenshot.
+        To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
         the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
         is 7x8 Apple pixels. The image may not exceed 1120x768. At zoom 2 or more every dot of the 560-dot line is shown (Double Hi-Res,
         80-column text); zoom 1 shows every other one. To watch something change, give frames (2-16) and
@@ -658,18 +741,23 @@ def build_server(args, machine):
         return Image(data=result, format="png")
 
     @mcp.tool()
-    async def wait_until_change(timeout_ms: int, region: list[int] | None = None, look: bool = True):
+    async def wait_until_change(timeout_ms: int, region: list[int] | None = None, look: bool = True,
+                                since: str = "now"):
         """Let emulated time pass until the screen changes, for at most timeout_ms (1-60000), then return at once.
         Use it instead of guessing a wait: after typing a command or starting a program, it returns as soon as
         something is drawn. It compares the screen as it is now with each later frame, and stops at the first frame
-        in which any pixel differs. region [x, y, w, h] (Apple pixels, x 0-279, y 0-191) only selects which part
-        is watched; changes elsewhere are ignored. The result is "changed after N ms" or "no change in N ms" (N is
-        emulated time since the call); running out of time is not an error. In a stepped session it steps frame by
+        in which any pixel differs. With since "last_input" it compares with the screen as it was just after your
+        last input (press_key, press_keys, type_text or set_joystick) was sent instead, so a change that already
+        happened during that call (a prompt drawn while the key was being read) counts at once rather than being
+        missed. region [x, y, w, h] (Apple pixels, x 0-279, y 0-191: halve coordinates read off a 560x384
+        screenshot) only selects which part is watched; changes elsewhere are ignored. The result is "changed after
+        N ms" or "no change in N ms", N being emulated time since the call (with since "last_input": since that
+        input, and the text says so); running out of time is not an error. In a stepped session it steps frame by
         frame, so a long timeout takes real time to run. With look true (the default) it also
         returns the whole screen at that moment as a 560x384 PNG (never cropped to region). In a realtime session
         the game keeps running while you wait. Anything that flickers in the watched region (a blinking cursor, an
         animation) counts as a change at once, so choose a region that excludes it."""
-        result = await asyncio.to_thread(machine.wait_until_change, timeout_ms, region, look)
+        result = await asyncio.to_thread(machine.wait_until_change, timeout_ms, region, look, since)
         if isinstance(result, list):
             return [result[0], Image(data=result[1], format="png")]
         return result

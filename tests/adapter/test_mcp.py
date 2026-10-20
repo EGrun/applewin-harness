@@ -368,6 +368,43 @@ class EndToEndTest(AdapterTestCase):
                 self.assertGreaterEqual(times[1], 150.0)
         self.run_async(go)
 
+    def test_press_keys_strip_starts_at_the_last_key(self):
+        """press_keys with frames: the strip's first tile is taken as soon as the last key is read and released,
+        and tile times count from the last key's press."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                screen = text_of(await call(s, "read_screen"))
+                for bad in ({"look": True, "frames": 2, "every_ms": 10}, {"frames": 2},
+                            {"frames": 17, "every_ms": 10}, {"region": [0, 0, 10, 10]},
+                            {"look": True, "region": [270, 0, 20, 10]}, {"look": True, "zoom": 9}):
+                    with self.subTest(**bad):
+                        r = await call(s, "press_keys", keys=["Z"], **bad)
+                        self.assertTrue(r.is_error, bad)
+                self.assertEqual(text_of(await call(s, "read_screen")), screen)   # rejected before any key went in
+                r = await call(s, "press_keys", keys=["A"], frames=3, every_ms=100, zoom=1)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                lines = r.content[0].text.splitlines()
+                self.assertRegex(lines[0], r"^1\. A  applied 0\.0 ms  read \d+\.\d ms$")
+                m = re.fullmatch(r"tile times from the last key's press: ([\d.]+), ([\d.]+), ([\d.]+) ms", lines[-1])
+                self.assertTrue(m, lines)
+                t = [float(v) for v in m.groups()]
+                self.assertTrue(50 <= t[0] < 50 + 2 * 16.7, t)   # the default 50 ms hold, then the next frame
+                for a, b in zip(t, t[1:]):
+                    self.assertTrue(99 <= b - a <= 117, t)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (3 * 280 + 2 * 2, 192))
+        self.run_async(go)
+
+    def test_screen_tools_say_to_halve_screenshot_coordinates(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                tools = {t.name: t.description for t in (await s.list_tools()).tools}
+                for name in ("look", "press_keys", "wait_until_change"):
+                    with self.subTest(tool=name):
+                        self.assertIn("halve", tools[name])
+        self.run_async(go)
+
     def test_press_keys_look_returns_report_then_screen(self):
         async def go():
             async with mcp_session(self.errlog) as s:
@@ -581,6 +618,39 @@ class WaitUntilChangeTest(AdapterTestCase):
                 self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
         self.run_async(go)
 
+    def test_wait_until_change_since_last_input_sees_a_change_made_during_the_input(self):
+        """The change happens during press_key (its settle frames), before wait_until_change starts: the default
+        reference misses it, since="last_input" compares with the screen from just after the key was sent."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                await call(s, "type_text", text="POKE 768,76:POKE 769,0:POKE 770,3\n")
+                await call(s, "type_text", text="10 GET A$:HOME:PRINT A$:CALL 768\n")
+                await call(s, "type_text", text="RUN\n")
+                await call(s, "wait", ms=200)
+                pressed = await call(s, "press_key", key="Q")   # HOME, PRINT, then a JMP loop: a static screen
+                self.assertFalse(pressed.is_error, text_of(pressed))
+                await call(s, "wait", ms=300)
+                self.check_no_change(await call(s, "wait_until_change", timeout_ms=200), 200, 220)
+                r = await call(s, "wait_until_change", timeout_ms=200, since="last_input")
+                self.assertFalse(r.is_error, text_of(r))
+                m = re.fullmatch(r"changed after (\d+) ms \(since the last input\)", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                self.assertGreaterEqual(int(m.group(1)), 300)   # counted from the key, not from this call
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
+        self.run_async(go)
+
+    def test_wait_until_change_since_needs_an_input_and_a_known_value(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                r = await call(s, "wait_until_change", timeout_ms=10, since="last_input")
+                self.assertTrue(r.is_error)
+                self.assertIn("no input", text_of(r))
+                r = await call(s, "wait_until_change", timeout_ms=10, since="yesterday")
+                self.assertTrue(r.is_error)
+                self.assertIn("since", text_of(r))
+        self.run_async(go)
+
     def test_wait_until_change_ranges_and_region(self):
         async def go():
             async with mcp_session(self.errlog) as s:
@@ -641,6 +711,21 @@ class MachineUnitTest(unittest.TestCase):
         from mcp.server.mcpserver.exceptions import ToolError
         with self.assertRaisesRegex(ToolError, "unsubscribe failed"):
             self.stub_wait(False).wait_until_change(1, None, False)
+
+    def test_a_failed_screen_fetch_after_an_input_does_not_fail_the_input(self):
+        """The input was sent: the tool still succeeds, and since="last_input" then has no reference rather than an
+        older input's screen."""
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.machine()
+        m.input_screen = (b"old", 0)
+
+        def no_frame():
+            raise ToolError("get_frame failed")
+        m.frame_rgb = no_frame
+        m.rpc = lambda conn, method, **params: {}
+        m.agent = object()
+        self.assertEqual(m.set_joystick(10, None, None, None, 0), "joystick set; call wait to let time pass")
+        self.assertIsNone(m.input_screen)
 
 
 class DiskSwapTest(AdapterTestCase):

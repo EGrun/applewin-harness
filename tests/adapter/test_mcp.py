@@ -40,9 +40,12 @@ ADAPTER_DIR = os.path.join(REPO_ROOT, "adapter")
 CALL_TIMEOUT = 120.0
 TEST_TIMEOUT = 300.0
 
-ALL_TOOLS = ["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "press_keys", "read_screen",
-             "set_joystick", "set_speed", "type_text", "wait", "wait_until_change"]
+CHECKPOINT_TOOLS = ["checkpoint", "delete_checkpoint", "list_checkpoints", "restore_checkpoint"]   # stepped only
+ALL_TOOLS = sorted(["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "press_keys",
+                    "read_screen", "set_joystick", "set_speed", "type_text", "wait", "wait_until_change"]
+                   + CHECKPOINT_TOOLS)
 NO_TEXT_TOOLS = [t for t in ALL_TOOLS if t != "read_screen"]
+REALTIME_TOOLS = [t for t in ALL_TOOLS if t not in CHECKPOINT_TOOLS]
 
 
 def server_params(text_screen=True, extra_args=()):
@@ -119,8 +122,8 @@ async def mcp_session(errlog, text_screen=True, extra_args=()):
             yield session
 
 
-async def call(session, name, **arguments):
-    return await asyncio.wait_for(session.call_tool(name, arguments), CALL_TIMEOUT)
+async def call(session, tool, **arguments):   # not "name": checkpoint takes a name argument
+    return await asyncio.wait_for(session.call_tool(tool, arguments), CALL_TIMEOUT)
 
 
 FIXTURE_DIR = None   # a tempfile directory for the module, removed in tearDownModule
@@ -210,9 +213,9 @@ class AdapterTestCase(unittest.TestCase):
 
 
 class ToolListTest(AdapterTestCase):
-    def tool_names(self, text_screen):
+    def tool_names(self, text_screen, extra_args=()):
         async def go():
-            async with mcp_session(self.errlog, text_screen=text_screen) as s:
+            async with mcp_session(self.errlog, text_screen=text_screen, extra_args=extra_args) as s:
                 return sorted(t.name for t in (await asyncio.wait_for(s.list_tools(), CALL_TIMEOUT)).tools)
         return self.run_async(go)
 
@@ -232,11 +235,25 @@ class ToolListTest(AdapterTestCase):
     def test_read_screen_absent_without_text_screen(self):
         self.assertEqual(self.tool_names(False), NO_TEXT_TOOLS)
 
+    def test_checkpoint_tools_absent_in_realtime(self):
+        """Checkpoints are for stepped sessions only (user ruling 2026-10-20): a realtime session does not list them,
+        and calling one is an error."""
+        self.assertEqual(self.tool_names(True, ["--realtime"]), REALTIME_TOOLS)
+
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
+                for name in CHECKPOINT_TOOLS:
+                    with self.subTest(tool=name):
+                        args = {"checkpoint_id": "cp-1"} if name in ("restore_checkpoint", "delete_checkpoint") else {}
+                        result = await call(s, name, **args)
+                        self.assertTrue(result.is_error)
+        self.run_async(go)
+
     def test_no_operator_method_is_reachable(self):
         async def go():
             async with mcp_session(self.errlog) as s:
-                for name in ("step_frames", "checkpoint", "restore_checkpoint",
-                             "get_state_checksum", "create_session", "close_session", "pause", "resume"):
+                for name in ("step_frames", "get_state_checksum", "create_session", "close_session", "pause",
+                             "resume"):
                     with self.subTest(tool=name):
                         result = await call(s, name)
                         self.assertTrue(result.is_error)
@@ -659,6 +676,58 @@ class WaitUntilChangeTest(AdapterTestCase):
                     with self.subTest(**kwargs):
                         r = await call(s, "wait_until_change", **kwargs)
                         self.assertTrue(r.is_error, kwargs)
+        self.run_async(go)
+
+
+class CheckpointTest(AdapterTestCase):
+    """Stepped-session checkpoints through the adapter (user ruling 2026-10-20): the harness's checkpoint methods,
+    which wrap AppleWin's own save state together with the working disks."""
+
+    def test_save_restore_list_and_delete(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                saved = await call(s, "checkpoint", name="booted")
+                self.assertFalse(saved.is_error, text_of(saved))
+                self.assertRegex(text_of(saved), r"^saved cp-1 \(booted\) at \d+\.\d ms$")
+
+                await call(s, "type_text", text='PRINT "AFTER"\n')
+                self.assertIn("AFTER", text_of(await call(s, "read_screen")))
+                restored = await call(s, "restore_checkpoint", checkpoint_id="cp-1")
+                self.assertFalse(restored.is_error, text_of(restored))
+                self.assertRegex(text_of(restored), r"^restored cp-1 \(booted\) at \d+\.\d ms$")
+                await call(s, "wait", ms=100)
+                self.assertNotIn("AFTER", text_of(await call(s, "read_screen")))   # the machine went back
+
+                # Deterministic: the same input after the same checkpoint gives the same screen.
+                shots = []
+                for _ in range(2):
+                    await call(s, "restore_checkpoint", checkpoint_id="cp-1")
+                    await call(s, "press_keys", keys=["P", "R", "I", "N", "T"])
+                    await call(s, "wait", ms=250)
+                    shots.append(base64.b64decode((await call(s, "look")).content[0].data))
+                self.assertEqual(shots[0], shots[1])
+
+                listed = text_of(await call(s, "list_checkpoints"))
+                self.assertRegex(listed, r"^cp-1  booted  \d+\.\d ms$")
+                deleted = await call(s, "delete_checkpoint", checkpoint_id="cp-1")
+                self.assertFalse(deleted.is_error, text_of(deleted))
+                self.assertEqual(text_of(await call(s, "list_checkpoints")), "no checkpoints")
+                missing = await call(s, "restore_checkpoint", checkpoint_id="cp-1")
+                self.assertTrue(missing.is_error)
+        self.run_async(go)
+
+    def test_restore_forgets_the_discarded_timeline(self):
+        """After a restore, since="last_input" has no reference from the thrown-away timeline."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                await call(s, "checkpoint")
+                await call(s, "press_key", key="A")
+                await call(s, "restore_checkpoint", checkpoint_id="cp-1")
+                r = await call(s, "wait_until_change", timeout_ms=10, since="last_input")
+                self.assertTrue(r.is_error)
+                self.assertIn("no input", text_of(r))
         self.run_async(go)
 
 

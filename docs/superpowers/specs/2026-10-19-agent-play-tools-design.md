@@ -93,15 +93,15 @@ call: whether the MCP SDK lets a tool error carry an image; if not, the error is
 - `zoom` is the size of one Apple pixel in the output, 1–8; default 2 (today's scale). Nearest-neighbour only.
 - The output must stay at most 1,120×768 pixels (the whole screen at zoom 4); a larger request is a tool error saying
   the limit.
-- The adapter fetches `get_frame { format: "BGRA32" }` (560×384, top row first), samples one source pixel per Apple pixel
-  (the top-left of each 2×2 block), and encodes an RGB PNG itself. The cropped or zoomed image is the 280x192 Apple-pixel picture (the top-left pixel of each 2x2 block), so it loses the extra horizontal detail of 80-column text, double-hires and NTSC colour; a plain look shows the full 560x384 frame.
+- The adapter fetches `get_frame { format: "BGRA32" }` (560×384, top row first), samples the full-resolution frame (output pixel (ox, oy) is frame pixel (2x + ⌊2·ox/zoom⌋, 2y + ⌊2·oy/zoom⌋)
+  for a region at (x, y)), and encodes an RGB PNG itself. At zoom 2 or more every dot of the 560-dot line is shown (Double Hi-Res, 80-column text); zoom 1 shows every other one.
 - With no arguments the result is byte-for-byte today's `look` (the harness's own PNG). *(my call: keeps the existing
   M5 behaviour and its tests unchanged.)*
 
 ### 4. `look { frames?: int = 1, every_ms?: int, region?, zoom? }` (adapter)
 - `frames` 1–16; with `frames > 1`, `every_ms` is required, 1–1,000.
 - One image: the tiles left to right, wrapping after 4 per row, a 2-pixel grey gap between tiles. `region` and `zoom`
-  apply to each tile; the same 1,120×768 cap applies to the whole sheet.
+  apply to each tile; a strip sheet may be at most 1,280×1,024 (so four full-screen tiles at zoom 1, 1,126 px wide, fit), while a single-image `look` keeps 1,120×768.
 - The text result lists each tile's emulated time in ms, relative to the first tile.
 - **Stepped:** the first tile is now; then the adapter steps `every_ms` (rounded up to whole frames) and captures, so
   tile times are exact.
@@ -110,8 +110,8 @@ call: whether the MCP SDK lets a tool error carry an image; if not, the error is
   clock's.
 
 ### 5. `wait_until_change { region?: [x, y, w, h], timeout_ms: int, look?: bool = true }` (adapter)
-- Takes the current frame as the reference, then checks every presented frame until any pixel in `region` (Apple
-  pixels, default the whole screen) differs from the reference, or `timeout_ms` (1–60,000) passes.
+- Takes the current frame as the reference, then checks frames as they are presented (in realtime a change lasting a single frame can be missed) until any pixel in `region` (Apple
+  pixels, default the whole screen; compared as frame pixels, the region scaled ×2) differs from the reference, or `timeout_ms` (1–60,000) passes.
 - Returns text: `changed after N ms` or `no change in N ms` (a timeout is not an error), plus the screen as a PNG when
   `look` is true (the default). `region` crops nothing in the returned image: it only selects what is watched.
   *(my call: the agent needs to see the whole scene to decide what to do next.)*

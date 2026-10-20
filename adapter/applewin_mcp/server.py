@@ -2,7 +2,7 @@
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
-and as agent (to type, look, listen), and serves twelve tools over MCP stdio.
+and as agent (to type, look, listen), and serves thirteen tools over MCP stdio.
 
 stdout carries MCP frames only: the harness child's stdout is a pipe that harness_client drains, and all logging goes
 to stderr. The adapter writes the line "harness pid <N>" to stderr once the harness is running.
@@ -25,7 +25,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
-from .screen import ScreenError, apple_pixels, check_region, check_size, crop_zoom, encode_png
+from .screen import (MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
+                     contact_sheet, crop_zoom, encode_png, frame_pixels, region_differs, sheet_size)
 
 FRAMES_PER_SECOND = 60
 BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC: emulated cycles to emulated ms (D10)
@@ -35,6 +36,11 @@ SETTLE_FRAMES = 3          # frames after the last key so the program can echo i
 CALL_TIMEOUT = 600.0
 WAIT_RANGE = (1, 60000)
 LISTEN_RANGE = (0, 60000)
+CHANGE_RANGE = (1, 60000)
+STRIP_FRAMES_RANGE = (1, 16)
+STRIP_EVERY_MS_RANGE = (1, 1000)
+STRIP_PER_ROW = 4
+STRIP_GAP = 2
 
 
 _logger = logging.getLogger("applewin_mcp")
@@ -238,6 +244,8 @@ class Machine:
         self.lock = threading.Lock()
         self.events = []        # sound events not yet reported by listen (buffered from launch)
         self.applied = {}       # input id -> discarded, for each input whose input_applied has arrived
+        self.frame_ready = []   # frame_ready params, collected only while wait_until_change is subscribed
+        self.collect_frames = False
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
         self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
                                       stderr_line=self._forward_harness_line)
@@ -282,6 +290,8 @@ class Machine:
                 self.applied[params.get("input_id")] = params
             elif method in ("sound_started", "sound_stopped"):
                 self.events.append((method, params))
+            elif method == "frame_ready" and self.collect_frames:
+                self.frame_ready.append(params)
 
     def advance(self, frames):
         """Lets `frames` video frames of emulated time pass (stepped: step_frames; realtime: sleeps)."""
@@ -377,13 +387,62 @@ class Machine:
         return "waited {} ms".format(ms)
 
     def frame_rgb(self):
-        """(280x192 RGB Apple pixels, emulated_cycles) from one get_frame. Call with self.lock held."""
+        """(560x384 RGB frame, emulated_cycles) from one get_frame. Call with self.lock held."""
         frame = self.rpc(self.agent, "get_frame", format="BGRA32", borders=False)
         try:
-            rgb = apple_pixels(base64.b64decode(frame["data"]), frame["width"], frame["height"])
+            rgb = frame_pixels(base64.b64decode(frame["data"]), frame["width"], frame["height"])
         except ScreenError as e:
             raise ToolError(str(e)) from None
         return rgb, frame["emulated_cycles"]
+
+    def wait_until_change(self, timeout_ms, region=None, look=True):
+        """Lets time pass until the pixels in region differ from those at the start, or timeout_ms of emulated time
+        have passed. Returns [text, PNG of the whole screen at the end] (just the text when look is false)."""
+        _check_range("timeout_ms", timeout_ms, *CHANGE_RANGE)
+        try:
+            box = check_region(region)
+        except ScreenError as e:
+            raise ToolError(str(e)) from None
+        with self.lock:
+            ref, start = self.frame_rgb()
+            cur, elapsed, changed = ref, 0.0, False
+            if self.stepped:
+                while not changed and elapsed < timeout_ms:
+                    self.advance(1)
+                    cur, cycles = self.frame_rgb()
+                    elapsed = cycles_to_ms(cycles - start)
+                    changed = region_differs(ref, cur, box)
+            else:
+                deadline = time.monotonic() + 2 * timeout_ms / 1000.0
+                self.frame_ready = []
+                self.collect_frames = True
+                try:
+                    self.rpc(self.agent, "subscribe_frames", every_n_frames=1)
+                    while not changed and elapsed < timeout_ms:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self.pump(min(remaining, 0.1))
+                        if not self.frame_ready:
+                            continue
+                        self.frame_ready = []
+                        cur, cycles = self.frame_rgb()
+                        elapsed = cycles_to_ms(cycles - start)
+                        changed = region_differs(ref, cur, box)
+                finally:
+                    self.collect_frames = False
+                    self.frame_ready = []
+                    failing = sys.exc_info()[0] is not None   # an exception is already propagating
+                    try:
+                        self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
+                    except ToolError as e:
+                        if not failing:
+                            raise    # the wait itself succeeded: the failed unsubscribe is the error
+                        log("unsubscribe after a failed wait_until_change also failed: {}".format(e))
+        text = "{} {} ms".format("changed after" if changed else "no change in", int(round(elapsed)))
+        if not look:
+            return text
+        return [text, encode_png(560, 384, cur)]
 
     def _look_locked(self, region=None, zoom=None):
         """PNG bytes of the screen. Call with self.lock held."""
@@ -393,16 +452,44 @@ class Machine:
         try:
             box = check_region(region)
             zoom = 2 if zoom is None else zoom
+            check_zoom(zoom)
+            check_size(box[2] * zoom, box[3] * zoom)   # before the frame is fetched or cropped
             rgb, _ = self.frame_rgb()
             width, height, pixels = crop_zoom(rgb, box, zoom)
-            check_size(width, height)
             return encode_png(width, height, pixels)
         except ScreenError as e:
             raise ToolError(str(e)) from None
 
-    def look(self, region=None, zoom=None):
+    def look(self, region=None, zoom=None, frames=1, every_ms=None):
+        """The screen as PNG bytes; with frames > 1, [tile times text, PNG of a contact sheet of the tiles taken
+        every_ms apart]. Everything is validated before the first tile, so a rejected call lets no time pass."""
+        _check_range("frames", frames, *STRIP_FRAMES_RANGE)
+        if every_ms is not None:
+            _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
+        if frames == 1:
+            with self.lock:
+                return self._look_locked(region, zoom)
+        if every_ms is None:
+            raise ToolError("every_ms is required when frames is more than 1")
+        try:
+            box = check_region(region)
+            zoom = 2 if zoom is None else zoom
+            check_zoom(zoom)
+            check_size(*sheet_size(box[2] * zoom, box[3] * zoom, frames, STRIP_PER_ROW, STRIP_GAP),
+                       MAX_SHEET_W, MAX_SHEET_H)
+        except ScreenError as e:
+            raise ToolError(str(e)) from None
+        tiles, cycles = [], []
         with self.lock:
-            return self._look_locked(region, zoom)
+            for i in range(frames):
+                if i:
+                    self.advance_ms(every_ms)
+                rgb, emulated = self.frame_rgb()
+                tiles.append(crop_zoom(rgb, box, zoom))
+                cycles.append(emulated)
+        width, height, pixels = contact_sheet(tiles, STRIP_PER_ROW, STRIP_GAP)
+        times = ", ".join("{:.1f}".format(cycles_to_ms(c - cycles[0])) for c in cycles)
+        return ["tile times: {} ms".format(times), encode_png(width, height, pixels)]
 
     def read_screen(self):
         with self.lock:
@@ -533,15 +620,38 @@ def build_server(args, machine):
         return await asyncio.to_thread(machine.wait, ms)
 
     @mcp.tool()
-    async def look(region: list[int] | None = None, zoom: int | None = None) -> Image:
+    async def look(region: list[int] | None = None, zoom: int | None = None, frames: int = 1,
+                   every_ms: int | None = None):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
         (x 0-279, y 0-191). To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
         the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
-        is 7x8 Apple pixels. The image may not exceed 1120x768. The cropped or zoomed image is the 280x192 Apple-pixel picture (the top-left pixel
-        of each 2x2 block), so it loses the extra horizontal detail of 80-column text, double-hires and NTSC
-        colour; a plain look shows the full 560x384 frame."""
-        png = await asyncio.to_thread(machine.look, region, zoom)
-        return Image(data=png, format="png")
+        is 7x8 Apple pixels. The image may not exceed 1120x768. At zoom 2 or more every dot of the 560-dot line is shown (Double Hi-Res,
+        80-column text); zoom 1 shows every other one. To watch something change, give frames (2-16) and
+        every_ms (1-1000, required with frames): it takes frames screenshots every_ms of emulated time apart and
+        returns one contact sheet (4 tiles per row, 2 pixels of grey between them, region/zoom applying to each
+        tile, the whole sheet within 1280x1024), preceded by the tiles' times in ms from the first. This lets
+        that much time pass. Use a small region and zoom for long strips."""
+        result = await asyncio.to_thread(machine.look, region, zoom, frames, every_ms)
+        if isinstance(result, list):
+            return [result[0], Image(data=result[1], format="png")]
+        return Image(data=result, format="png")
+
+    @mcp.tool()
+    async def wait_until_change(timeout_ms: int, region: list[int] | None = None, look: bool = True):
+        """Let emulated time pass until the screen changes, for at most timeout_ms (1-60000), then return at once.
+        Use it instead of guessing a wait: after typing a command or starting a program, it returns as soon as
+        something is drawn. It compares the screen as it is now with each later frame, and stops at the first frame
+        in which any pixel differs. region [x, y, w, h] (Apple pixels, x 0-279, y 0-191) only selects which part
+        is watched; changes elsewhere are ignored. The result is "changed after N ms" or "no change in N ms" (N is
+        emulated time since the call); running out of time is not an error. In a stepped session it steps frame by
+        frame, so a long timeout takes real time to run. With look true (the default) it also
+        returns the whole screen at that moment as a 560x384 PNG (never cropped to region). In a realtime session
+        the game keeps running while you wait. Anything that flickers in the watched region (a blinking cursor, an
+        animation) counts as a change at once, so choose a region that excludes it."""
+        result = await asyncio.to_thread(machine.wait_until_change, timeout_ms, region, look)
+        if isinstance(result, list):
+            return [result[0], Image(data=result[1], format="png")]
+        return result
 
     if args.text_screen:
         @mcp.tool()

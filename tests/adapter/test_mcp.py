@@ -20,8 +20,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "adapter"))
 
@@ -39,7 +41,7 @@ CALL_TIMEOUT = 120.0
 TEST_TIMEOUT = 300.0
 
 ALL_TOOLS = ["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "press_keys", "read_screen",
-             "set_joystick", "set_speed", "type_text", "wait"]
+             "set_joystick", "set_speed", "type_text", "wait", "wait_until_change"]
 NO_TEXT_TOOLS = [t for t in ALL_TOOLS if t != "read_screen"]
 
 
@@ -66,6 +68,47 @@ def text_of(result):
 def png_size(data):
     assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
     return struct.unpack(">II", data[16:24])
+
+
+def decode_png_rgb(data):
+    """(width, height, rgb) of an 8-bit RGB (colour type 2) PNG; fails clearly on anything else."""
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    pos, idat, header = 8, b"", None
+    while pos < len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        tag, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + length]
+        if tag == b"IHDR":
+            header = struct.unpack(">IIBBBBB", body)
+        elif tag == b"IDAT":
+            idat += body
+        pos += 12 + length
+    width, height, depth, ctype, _, _, interlace = header
+    assert (depth, ctype, interlace) == (8, 2, 0), "PNG is not 8-bit RGB, non-interlaced: {}".format(header)
+    raw = zlib.decompress(idat)
+    stride = width * 3
+    out, prev = [], bytearray(stride)
+    for y in range(height):
+        ft = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - 3] if i >= 3 else 0
+            b = prev[i]
+            c = prev[i - 3] if i >= 3 else 0
+            if ft == 1:
+                line[i] = (line[i] + a) & 255
+            elif ft == 2:
+                line[i] = (line[i] + b) & 255
+            elif ft == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif ft == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+            else:
+                assert ft == 0, "bad PNG filter type {}".format(ft)
+        out.append(bytes(line))
+        prev = line
+    return width, height, b"".join(out)
 
 
 @contextlib.asynccontextmanager
@@ -251,6 +294,80 @@ class EndToEndTest(AdapterTestCase):
                 self.assertIn("280x192", text_of(bad))
         self.run_async(go)
 
+    def test_look_zoom_2_matches_plain_look_in_80_columns(self):
+        """Zoom 2 over the whole screen is the full 560x384 frame, dot for dot (80-column text uses every dot)."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                for text in ("PR#3\n", "HOME:PRINT \"MIXED Il1|\"\n"):
+                    typed = await call(s, "type_text", text=text)
+                    self.assertFalse(typed.is_error, text_of(typed))
+                await call(s, "wait", ms=500)
+
+                async def image(**args):
+                    r = await call(s, "look", **args)
+                    self.assertFalse(r.is_error, text_of(r))
+                    return decode_png_rgb(base64.b64decode([c for c in r.content if c.type == "image"][0].data))
+                plain, zoomed = await image(), await image(zoom=2)
+                self.assertEqual(plain[:2], (560, 384))
+                self.assertEqual(zoomed[:2], (560, 384))
+                self.assertTrue(plain[2] == zoomed[2], "adapter zoom=2 differs from the harness PNG")
+        self.run_async(go)
+
+    def test_strip_parameter_errors(self):
+        """Everything is validated before the first tile, so a rejected call lets no time pass."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                for text in ("10 GOTO 10\n", "RUN\n"):
+                    await call(s, "type_text", text=text)
+
+                async def png(**args):
+                    r = await call(s, "look", **args)
+                    self.assertFalse(r.is_error, text_of(r))
+                    return base64.b64decode([c for c in r.content if c.type == "image"][0].data)
+                before = await png(zoom=1)
+                for args in ({"frames": 3}, {"frames": 17, "every_ms": 10}, {"frames": 0, "every_ms": 10},
+                             {"frames": 2, "every_ms": 1001}, {"frames": 8, "every_ms": 10, "zoom": 8},
+                             {"frames": 1, "every_ms": 5000}):
+                    with self.subTest(args=args):
+                        r = await call(s, "look", **args)
+                        self.assertTrue(r.is_error, args)
+                self.assertEqual(await png(zoom=1), before)
+        self.run_async(go)
+
+    def test_strip_tile_times_are_exact_in_stepped_mode(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                r = await call(s, "look", frames=4, every_ms=100, zoom=1)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                m = re.fullmatch(r"tile times: ([\d., ]+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                times = [float(v) for v in m.group(1).split(", ")]
+                self.assertEqual(len(times), 4)
+                self.assertEqual(times[0], 0.0)
+                for i, t in enumerate(times):
+                    self.assertAlmostEqual(t, 100.0 * i, delta=16.7)
+                self.assertTrue(all(a < b for a, b in zip(times, times[1:])), times)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (4 * 280 + 3 * 2, 192))
+        self.run_async(go)
+
+    def test_strip_realtime_smoke(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
+                await call(s, "wait", ms=12000)
+                r = await call(s, "look", frames=2, every_ms=200, zoom=1)
+                self.assertFalse(r.is_error, text_of(r))
+                m = re.fullmatch(r"tile times: ([\d., ]+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                times = [float(v) for v in m.group(1).split(", ")]
+                self.assertEqual(len(times), 2)
+                self.assertLess(times[0], times[1])
+                self.assertGreaterEqual(times[1], 150.0)
+        self.run_async(go)
+
     def test_press_keys_look_returns_report_then_screen(self):
         async def go():
             async with mcp_session(self.errlog) as s:
@@ -335,6 +452,179 @@ class EndToEndTest(AdapterTestCase):
                         result = await call(s, name, ms=ms)
                         self.assertTrue(result.is_error, "{}(ms={}) must be rejected".format(name, ms))
         self.run_async(go)
+
+class WaitUntilChangeTest(AdapterTestCase):
+    JMP_LOOP = "POKE 768,76:POKE 769,0:POKE 770,3:CALL 768\n"
+
+    async def start_loop(self, s):
+        await call(s, "wait", ms=12000)   # boot DOS 3.3
+        await call(s, "type_text", text=self.JMP_LOOP)
+        await call(s, "wait", ms=500)
+
+    def check_no_change(self, r, low, high):
+        self.assertFalse(r.is_error, text_of(r))
+        m = re.fullmatch(r"no change in (\d+) ms", r.content[0].text)
+        self.assertTrue(m, r.content[0].text)
+        self.assertTrue(low <= int(m.group(1)) <= high, r.content[0].text)
+
+    def test_wait_until_change_sees_printed_text(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                await call(s, "type_text", text='10 FOR I=1 TO 4000:NEXT:PRINT "X"\n')
+                await call(s, "type_text", text="RUN\n")
+                await call(s, "wait", ms=100)   # the echo of RUN is on the screen before the reference is taken
+                before = text_of(await call(s, "read_screen")).splitlines()
+                self.assertNotIn("X", [l.strip() for l in before])
+                r = await call(s, "wait_until_change", timeout_ms=5000)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                m = re.fullmatch(r"changed after (\d+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                self.assertGreater(int(m.group(1)), 50)   # the program's own PRINT, well after the reference
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
+                self.assertIn("X", [l.strip() for l in text_of(await call(s, "read_screen")).splitlines()])
+        self.run_async(go)
+
+    def test_wait_until_change_text_only_without_look(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "wait_until_change", timeout_ms=100, look=False)
+                self.assertEqual([c.type for c in r.content], ["text"])
+                self.check_no_change(r, 100, 120)
+        self.run_async(go)
+
+    def test_wait_until_change_times_out_without_error(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "wait_until_change", timeout_ms=300)
+                self.check_no_change(r, 300, 319)
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+        self.run_async(go)
+
+    def test_wait_until_change_tiny_timeout(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                self.check_no_change(await call(s, "wait_until_change", timeout_ms=1), 0, 17)
+        self.run_async(go)
+
+    def test_wait_until_change_region_only_watches(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "wait_until_change", timeout_ms=200, region=[0, 0, 280, 8])
+                self.check_no_change(r, 200, 220)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
+        self.run_async(go)
+
+    def test_wait_until_change_unsubscribes(self):
+        """After a realtime wait the harness must have stopped sending frame_ready: observed on the agent connection
+        of an in-process Machine (the MCP client cannot see notifications)."""
+        from applewin_mcp import server
+        args = server.parse_args(["--exe", os.path.abspath(exe_path()), "--headless", "--disk", DOS_IMAGE,
+                                  "--realtime"])
+        machine = server.Machine(args)
+        self.addCleanup(machine.shutdown)
+        machine.wait(12000)   # boot DOS 3.3
+        machine.type_text("POKE 768,76:POKE 769,0:POKE 770,3:CALL 768\n", 0)
+        machine.wait(500)
+        for _ in range(2):
+            text = machine.wait_until_change(200, None, False)
+            self.assertRegex(text, r"no change in \d+ ms")
+        while True:   # replies and notifications are in order: what is queued now predates the unsubscribe
+            try:
+                machine.agent.next_notification(timeout=0)
+            except TimeoutError:
+                break
+        deadline = time.monotonic() + 0.7
+        late = []
+        while time.monotonic() < deadline:
+            try:
+                note = machine.agent.next_notification(timeout=0.1)
+            except TimeoutError:
+                continue
+            if note.get("method") == "frame_ready":
+                late.append(note)
+        self.assertEqual(late, [], "frame_ready still arriving after wait_until_change")
+
+    def test_wait_until_change_sees_printed_text_realtime(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                await call(s, "type_text", text='10 FOR I=1 TO 300:NEXT:PRINT "X"\n')
+                await call(s, "type_text", text="RUN\n")
+                r = await call(s, "wait_until_change", timeout_ms=5000)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                m = re.fullmatch(r"changed after (\d+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                self.assertGreater(int(m.group(1)), 0)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
+        self.run_async(go)
+
+    def test_wait_until_change_ranges_and_region(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                for kwargs in ({"timeout_ms": 0}, {"timeout_ms": 60001},
+                               {"timeout_ms": 100, "region": [0, 0, 281, 8]}):
+                    with self.subTest(**kwargs):
+                        r = await call(s, "wait_until_change", **kwargs)
+                        self.assertTrue(r.is_error, kwargs)
+        self.run_async(go)
+
+
+class MachineUnitTest(unittest.TestCase):
+    """Machine methods against a stub (no harness)."""
+
+    def machine(self):
+        from applewin_mcp import server
+        m = object.__new__(server.Machine)
+        m.lock = threading.Lock()
+        m.stepped = False
+        m.frame_ready = []
+        m.collect_frames = False
+        return m
+
+    def test_whole_screen_zoom_8_is_rejected_before_a_frame_is_fetched(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.machine()
+
+        def no_frame():
+            raise AssertionError("frame_rgb must not be called")
+        m.frame_rgb = no_frame
+        with self.assertRaisesRegex(ToolError, "1120x768"):
+            m._look_locked(None, 8)
+        with self.assertRaisesRegex(ToolError, "1120x768"):
+            m._look_locked([0, 0, 200, 100], 8)
+
+    def stub_wait(self, pump_raises):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.machine()
+        m.frame_rgb = lambda: (b"", 0)
+
+        def rpc(conn, method, **params):
+            if method == "subscribe_frames" and params["every_n_frames"] == 0:
+                raise ToolError("unsubscribe failed")
+
+        def pump(timeout=0.0):
+            if pump_raises:
+                raise ToolError("original failure")
+            time.sleep(0.01)
+        m.rpc, m.pump, m.agent = rpc, pump, object()
+        return m
+
+    def test_a_failing_unsubscribe_does_not_mask_the_original_error(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        with self.assertRaisesRegex(ToolError, "original failure"):
+            self.stub_wait(True).wait_until_change(100, None, False)
+
+    def test_a_failing_unsubscribe_is_an_error_when_the_wait_succeeded(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        with self.assertRaisesRegex(ToolError, "unsubscribe failed"):
+            self.stub_wait(False).wait_until_change(1, None, False)
 
 
 class DiskSwapTest(AdapterTestCase):

@@ -251,6 +251,60 @@ class EndToEndTest(AdapterTestCase):
                 self.assertIn("280x192", text_of(bad))
         self.run_async(go)
 
+    def test_strip_parameter_errors(self):
+        """Everything is validated before the first tile, so a rejected call lets no time pass."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                for text in ("10 GOTO 10\n", "RUN\n"):
+                    await call(s, "type_text", text=text)
+
+                async def png(**args):
+                    r = await call(s, "look", **args)
+                    self.assertFalse(r.is_error, text_of(r))
+                    return base64.b64decode([c for c in r.content if c.type == "image"][0].data)
+                before = await png(zoom=1)
+                for args in ({"frames": 3}, {"frames": 17, "every_ms": 10}, {"frames": 0, "every_ms": 10},
+                             {"frames": 2, "every_ms": 1001}, {"frames": 8, "every_ms": 10, "zoom": 8},
+                             {"frames": 1, "every_ms": 5000}):
+                    with self.subTest(args=args):
+                        r = await call(s, "look", **args)
+                        self.assertTrue(r.is_error, args)
+                self.assertEqual(await png(zoom=1), before)
+        self.run_async(go)
+
+    def test_strip_tile_times_are_exact_in_stepped_mode(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                r = await call(s, "look", frames=4, every_ms=100, zoom=1)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                m = re.fullmatch(r"tile times: ([\d., ]+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                times = [float(v) for v in m.group(1).split(", ")]
+                self.assertEqual(len(times), 4)
+                self.assertEqual(times[0], 0.0)
+                for i, t in enumerate(times):
+                    self.assertAlmostEqual(t, 100.0 * i, delta=16.7)
+                self.assertTrue(all(a < b for a, b in zip(times, times[1:])), times)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (4 * 280 + 3 * 2, 192))
+        self.run_async(go)
+
+    def test_strip_realtime_smoke(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
+                await call(s, "wait", ms=12000)
+                r = await call(s, "look", frames=2, every_ms=200, zoom=1)
+                self.assertFalse(r.is_error, text_of(r))
+                m = re.fullmatch(r"tile times: ([\d., ]+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                times = [float(v) for v in m.group(1).split(", ")]
+                self.assertEqual(len(times), 2)
+                self.assertLess(times[0], times[1])
+                self.assertGreaterEqual(times[1], 150.0)
+        self.run_async(go)
+
     def test_press_keys_look_returns_report_then_screen(self):
         async def go():
             async with mcp_session(self.errlog) as s:

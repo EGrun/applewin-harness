@@ -94,6 +94,27 @@ class ScreenTests(unittest.TestCase):
         cur[3 * (12 * 280 + 20)] = 1
         self.assertFalse(screen.region_differs(ref, bytes(cur), region))
 
+    def test_contact_sheet_layout(self):
+        tiles = [(2, 1, bytes([i, i, i, i, i, i])) for i in range(1, 6)]
+        w, h, rgb = screen.contact_sheet(tiles, per_row=4, gap=2)
+        self.assertEqual((w, h), (14, 4))
+        grey = bytes((128, 128, 128))
+
+        def px(x, y):
+            return rgb[(y * w + x) * 3:][:3]
+        self.assertEqual(px(0, 0), bytes((1, 1, 1)))
+        self.assertEqual(px(4, 0), bytes((2, 2, 2)))   # tile 2 starts at x = 2 + 2
+        self.assertEqual(px(2, 0), grey)                       # the gap between tile 1 and 2
+        self.assertEqual(px(0, 1), grey)                       # the gap between rows
+        self.assertEqual(px(0, 3), bytes((5, 5, 5)))           # tile 5: row 2, column 1
+        self.assertEqual(px(1, 3), bytes((5, 5, 5)))
+        for x in range(2, 14):                                 # the three empty cells and gaps in row 2
+            self.assertEqual(px(x, 3), grey, x)
+
+    def test_sheet_size(self):
+        self.assertEqual(screen.sheet_size(2, 1, 5, per_row=4, gap=2), (14, 4))
+        self.assertEqual(screen.sheet_size(280, 192, 4, per_row=4, gap=2), (1126, 192))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import zlib
 APPLE_W, APPLE_H = 280, 192
 FRAME_W, FRAME_H = 560, 384
 MAX_OUT_W, MAX_OUT_H = 1120, 768
+MAX_SHEET_W, MAX_SHEET_H = 1280, 1024   # a frame strip's contact sheet (four full-screen tiles at zoom 1 are 1126 wide)
 
 
 class ScreenError(ValueError):
@@ -44,10 +45,14 @@ def check_region(region):
     return (x, y, w, h)
 
 
-def crop_zoom(apple_rgb, region, zoom):
-    """Crop to region, then scale by an integer factor with nearest neighbour. Returns (width, height, rgb)."""
+def check_zoom(zoom):
     if not isinstance(zoom, int) or isinstance(zoom, bool) or not 1 <= zoom <= 8:
         raise ScreenError("zoom must be 1 to 8")
+
+
+def crop_zoom(apple_rgb, region, zoom):
+    """Crop to region, then scale by an integer factor with nearest neighbour. Returns (width, height, rgb)."""
+    check_zoom(zoom)
     x, y, w, h = region
     out = bytearray()
     for row in range(y, y + h):
@@ -57,9 +62,33 @@ def crop_zoom(apple_rgb, region, zoom):
     return w * zoom, h * zoom, bytes(out)
 
 
-def check_size(width, height):
-    if width > MAX_OUT_W or height > MAX_OUT_H:
-        raise ScreenError(f"the image would be {width}x{height}; the limit is {MAX_OUT_W}x{MAX_OUT_H}")
+def check_size(width, height, max_w=MAX_OUT_W, max_h=MAX_OUT_H):
+    if width > max_w or height > max_h:
+        raise ScreenError(f"the image would be {width}x{height}; the limit is {max_w}x{max_h}")
+
+
+def sheet_size(tile_w, tile_h, count, per_row=4, gap=2):
+    """(width, height) of the contact sheet for count tiles of tile_w x tile_h."""
+    cols = min(count, per_row)
+    rows = -(-count // per_row)
+    return cols * tile_w + (cols - 1) * gap, rows * tile_h + (rows - 1) * gap
+
+
+def contact_sheet(tiles, per_row=4, gap=2, gap_rgb=(128, 128, 128)):
+    """Lays equal-sized (w, h, rgb) tiles out left to right, top to bottom, per_row to a row, with gap pixels of
+    gap_rgb between them (and in the unused cells of the last row). Returns (width, height, rgb)."""
+    tile_w, tile_h, _ = tiles[0]
+    if any((w, h) != (tile_w, tile_h) for w, h, _ in tiles):
+        raise ScreenError("contact sheet tiles must all be the same size")
+    width, height = sheet_size(tile_w, tile_h, len(tiles), per_row, gap)
+    grey = bytes(gap_rgb)
+    canvas = [bytearray(grey * width) for _ in range(height)]
+    for n, (_, _, rgb) in enumerate(tiles):
+        x0 = (n % per_row) * (tile_w + gap)
+        y0 = (n // per_row) * (tile_h + gap)
+        for row in range(tile_h):
+            canvas[y0 + row][x0 * 3:(x0 + tile_w) * 3] = rgb[row * tile_w * 3:(row + 1) * tile_w * 3]
+    return width, height, b"".join(canvas)
 
 
 def _chunk(tag, data):

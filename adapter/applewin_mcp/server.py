@@ -25,7 +25,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
-from .screen import ScreenError, apple_pixels, check_region, check_size, crop_zoom, encode_png
+from .screen import (MAX_SHEET_H, MAX_SHEET_W, ScreenError, apple_pixels, check_region, check_size, check_zoom,
+                     contact_sheet, crop_zoom, encode_png, sheet_size)
 
 FRAMES_PER_SECOND = 60
 BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC: emulated cycles to emulated ms (D10)
@@ -35,6 +36,10 @@ SETTLE_FRAMES = 3          # frames after the last key so the program can echo i
 CALL_TIMEOUT = 600.0
 WAIT_RANGE = (1, 60000)
 LISTEN_RANGE = (0, 60000)
+STRIP_FRAMES_RANGE = (1, 16)
+STRIP_EVERY_MS_RANGE = (1, 1000)
+STRIP_PER_ROW = 4
+STRIP_GAP = 2
 
 
 _logger = logging.getLogger("applewin_mcp")
@@ -400,9 +405,39 @@ class Machine:
         except ScreenError as e:
             raise ToolError(str(e)) from None
 
-    def look(self, region=None, zoom=None):
+    def look(self, region=None, zoom=None, frames=1, every_ms=None):
+        """The screen as PNG bytes; with frames > 1, [tile times text, PNG of a contact sheet of the tiles taken
+        every_ms apart]. Everything is validated before the first tile, so a rejected call lets no time pass."""
+        _check_range("frames", frames, *STRIP_FRAMES_RANGE)
+        if every_ms is not None:
+            _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
+        if frames == 1:
+            with self.lock:
+                return self._look_locked(region, zoom)
+        if every_ms is None:
+            raise ToolError("every_ms is required when frames is more than 1")
+        try:
+            box = check_region(region)
+            zoom = 2 if zoom is None else zoom
+            check_zoom(zoom)
+            check_size(*sheet_size(box[2] * zoom, box[3] * zoom, frames, STRIP_PER_ROW, STRIP_GAP),
+                       MAX_SHEET_W, MAX_SHEET_H)
+        except ScreenError as e:
+            raise ToolError(str(e)) from None
+        tiles, cycles = [], []
         with self.lock:
-            return self._look_locked(region, zoom)
+            for i in range(frames):
+                if i:
+                    self.advance_ms(every_ms)
+                rgb, emulated = self.frame_rgb()
+                try:
+                    tiles.append(crop_zoom(rgb, box, zoom))
+                except ScreenError as e:
+                    raise ToolError(str(e)) from None
+                cycles.append(emulated)
+        width, height, pixels = contact_sheet(tiles, STRIP_PER_ROW, STRIP_GAP)
+        times = ", ".join("{:.1f}".format(cycles_to_ms(c - cycles[0])) for c in cycles)
+        return ["tile times: {} ms".format(times), encode_png(width, height, pixels)]
 
     def read_screen(self):
         with self.lock:
@@ -533,15 +568,22 @@ def build_server(args, machine):
         return await asyncio.to_thread(machine.wait, ms)
 
     @mcp.tool()
-    async def look(region: list[int] | None = None, zoom: int | None = None) -> Image:
+    async def look(region: list[int] | None = None, zoom: int | None = None, frames: int = 1,
+                   every_ms: int | None = None):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
         (x 0-279, y 0-191). To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
         the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
         is 7x8 Apple pixels. The image may not exceed 1120x768. The cropped or zoomed image is the 280x192 Apple-pixel picture (the top-left pixel
         of each 2x2 block), so it loses the extra horizontal detail of 80-column text, double-hires and NTSC
-        colour; a plain look shows the full 560x384 frame."""
-        png = await asyncio.to_thread(machine.look, region, zoom)
-        return Image(data=png, format="png")
+        colour; a plain look shows the full 560x384 frame. To watch something change, give frames (2-16) and
+        every_ms (1-1000, required with frames): it takes frames screenshots every_ms of emulated time apart and
+        returns one contact sheet (4 tiles per row, 2 pixels of grey between them, region/zoom applying to each
+        tile, the whole sheet within 1280x1024), preceded by the tiles' times in ms from the first. This lets
+        that much time pass. Use a small region and zoom for long strips."""
+        result = await asyncio.to_thread(machine.look, region, zoom, frames, every_ms)
+        if isinstance(result, list):
+            return [result[0], Image(data=result[1], format="png")]
+        return Image(data=result, format="png")
 
     if args.text_screen:
         @mcp.tool()

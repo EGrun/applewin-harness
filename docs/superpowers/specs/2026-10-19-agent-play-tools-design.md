@@ -147,6 +147,18 @@ call: whether the MCP SDK lets a tool error carry an image; if not, the error is
 - The program's read of every key is still recorded and reported, and the sequence still completes when the last key
   has been read (600-frame timeout as now).
 
+### 8. Follow-ups from play testing (2026-10-20, adapter only)
+- **`wait_until_change { since: "last_input" }`:** each input tool keeps the screen fetched right after its input RPC
+  returns (before the program can have reacted on screen); with `since: "last_input"` that is the reference, so a
+  change made during the previous call (a prompt drawn within `press_key`'s settle frames, a disk-boosted boot) counts
+  at once instead of the wait running out. `timeout_ms` still bounds this call's own waiting; the reported time counts
+  from the input. Default `"now"` (unchanged). Costs one full-frame fetch per input call, after the input is sent.
+- **Strips on `press_keys { frames, every_ms, region?, zoom? }`:** same rules as `look` strips; the first tile is taken
+  as soon as `input_applied` arrives (the settle frames are skipped), tile times count from the last entry's
+  `applied_cycle`, and the strip arguments are checked before any key is sent. Not together with `look`.
+- **Coordinates:** the screen tools' descriptions say outright that region coordinates are half of screenshot
+  coordinates.
+
 ## Testing
 
 - Adapter, goals 1–5: unit tests for the PNG encoder (decode with `zlib` and compare pixels), region and zoom maths, the

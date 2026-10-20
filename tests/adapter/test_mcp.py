@@ -176,6 +176,16 @@ class ToolListTest(AdapterTestCase):
     def test_exactly_the_agent_tools_with_text_screen(self):
         self.assertEqual(self.tool_names(True), ALL_TOOLS)
 
+    def test_look_and_press_keys_describe_the_screen_scale(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                tools = {t.name: t for t in (await asyncio.wait_for(s.list_tools(), CALL_TIMEOUT)).tools}
+                for name in ("look", "press_keys"):
+                    with self.subTest(tool=name):
+                        self.assertIn("560x384", tools[name].description)
+                        self.assertIn("280x192", tools[name].description)
+        self.run_async(go)
+
     def test_read_screen_absent_without_text_screen(self):
         self.assertEqual(self.tool_names(False), NO_TEXT_TOOLS)
 
@@ -220,6 +230,36 @@ class EndToEndTest(AdapterTestCase):
                 await call(s, "wait", ms=500)
                 rows = [r.strip() for r in text_of(await call(s, "read_screen")).splitlines()[1:] if r.strip()]
                 self.assertTrue(rows[-1].startswith("]"), rows[-3:])   # back at the prompt (the cursor may follow)
+        self.run_async(go)
+
+    def test_look_region_and_zoom(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+
+                async def size(**args):
+                    r = await call(s, "look", **args)
+                    self.assertFalse(r.is_error, text_of(r))
+                    images = [c for c in r.content if c.type == "image"]
+                    self.assertEqual(len(images), 1)
+                    return png_size(base64.b64decode(images[0].data))
+                self.assertEqual(await size(region=[0, 0, 40, 8], zoom=4), (160, 32))
+                self.assertEqual(await size(zoom=1), (280, 192))
+                self.assertEqual(await size(), (560, 384))
+                bad = await call(s, "look", region=[270, 0, 20, 10])
+                self.assertTrue(bad.is_error)
+                self.assertIn("280x192", text_of(bad))
+        self.run_async(go)
+
+    def test_press_keys_look_returns_report_then_screen(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                r = await call(s, "press_keys", keys=["P"], look=True)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                self.assertTrue(r.content[0].text.startswith("1. P  applied 0.0 ms"), r.content[0].text)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
         self.run_async(go)
 
     def test_press_keys_sends_a_timed_sequence_and_reports_each_key(self):

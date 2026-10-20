@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+﻿# SPDX-License-Identifier: MIT
 """MCP server for AppleWinHarness (spec: docs/specs/m5.md).
 
 The adapter launches the harness (--serve), connects as operator (to create the session, step frames and close it)
@@ -25,6 +25,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
+from .screen import ScreenError, apple_pixels, check_region, check_size, crop_zoom, encode_png
 
 FRAMES_PER_SECOND = 60
 BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC: emulated cycles to emulated ms (D10)
@@ -336,7 +337,7 @@ class Machine:
             self.await_input(reply["input_id"], hold_ms if hold_ms > 0 else DEFAULT_HOLD_MS)
         return "pressed {}".format(key)
 
-    def press_keys(self, keys):
+    def press_keys(self, keys, look=False):
         with self.lock:
             reply = self.rpc(self.agent, "press_keys", keys=keys)   # the harness validates every entry
             expected_ms = 0   # an upper bound: every delay and every hold, end to end
@@ -345,7 +346,11 @@ class Machine:
                 expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
             applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys),
                                        describe=lambda params: key_report(keys, params.get("keys") or []))
-        return key_report(keys, applied.get("keys") or [])
+            report = key_report(keys, applied.get("keys") or [])
+            if not look:
+                return report
+            png = self._look_locked()
+        return [report, png]
 
     def set_joystick(self, x, y, button0, button1, duration_ms):
         params = {}
@@ -371,10 +376,35 @@ class Machine:
             self.advance_ms(ms)
         return "waited {} ms".format(ms)
 
-    def look(self):
-        with self.lock:
+    def frame_rgb(self):
+        """(280x192 RGB Apple pixels, emulated_cycles) from one get_frame. Call with self.lock held."""
+        frame = self.rpc(self.agent, "get_frame", format="BGRA32", borders=False)
+        try:
+            rgb = apple_pixels(base64.b64decode(frame["data"]), frame["width"], frame["height"])
+        except ScreenError as e:
+            raise ToolError(str(e)) from None
+        return rgb, frame["emulated_cycles"]
+
+    def _look_locked(self, region=None, zoom=None):
+        """PNG bytes of the screen. Call with self.lock held."""
+        if region is None and zoom is None:
             frame = self.rpc(self.agent, "get_frame", format="PNG", borders=False)
-        return base64.b64decode(frame["data"])
+            return base64.b64decode(frame["data"])
+        try:
+            box = check_region(region)
+            zoom = 2 if zoom is None else zoom
+            rgb, _ = self.frame_rgb()
+            width, height, pixels = crop_zoom(rgb, box, zoom)
+            check_size(width, height)
+            return encode_png(width, height, pixels)
+        except ScreenError as e:
+            raise ToolError(str(e)) from None
+        except (TypeError, ValueError):
+            raise ToolError("region must be [x, y, w, h] inside 280x192 Apple pixels") from None
+
+    def look(self, region=None, zoom=None):
+        with self.lock:
+            return self._look_locked(region, zoom)
 
     def read_screen(self):
         with self.lock:
@@ -470,7 +500,7 @@ def build_server(args, machine):
         return await asyncio.to_thread(machine.press_key, key, hold_ms)
 
     @mcp.tool()
-    async def press_keys(keys: list[str | int | dict]) -> str:
+    async def press_keys(keys: list[str | int | dict], look: bool = False):
         """Press a timed sequence of keys in one call, timed in the machine's own time: use it for a game manoeuvre
         whose keys must land at exact moments (your thinking time between calls would otherwise sit between them).
         Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
@@ -481,8 +511,13 @@ def build_server(args, machine):
         At most 256 keys. Returns, per key, when it was pressed (applied) and when the program read it, in ms from the
         first press: a program acts on a key when it reads it. Returns once the last key is read and released. If the
         program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
-        (the unread one marked "never read") and those not pressed."""
-        return await asyncio.to_thread(machine.press_keys, keys)
+        (the unread one marked "never read") and those not pressed. With look true it also returns the screen after the
+        last key (a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2), so you see the result of the manoeuvre
+        without a second call."""
+        result = await asyncio.to_thread(machine.press_keys, keys, look)
+        if look:
+            return [result[0], Image(data=result[1], format="png")]
+        return result
 
     @mcp.tool()
     async def set_joystick(x: int | None = None, y: int | None = None, button0: bool | None = None,
@@ -500,9 +535,13 @@ def build_server(args, machine):
         return await asyncio.to_thread(machine.wait, ms)
 
     @mcp.tool()
-    async def look() -> Image:
-        """Look at the screen: a 560x384 PNG."""
-        return Image(data=await asyncio.to_thread(machine.look), format="png")
+    async def look(region: list[int] | None = None, zoom: int | None = None) -> Image:
+        """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
+        (x 0-279, y 0-191). To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
+        the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
+        is 7x8 Apple pixels. The image may not exceed 1120x768."""
+        png = await asyncio.to_thread(machine.look, region, zoom)
+        return Image(data=png, format="png")
 
     if args.text_screen:
         @mcp.tool()

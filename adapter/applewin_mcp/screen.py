@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Screen helpers: Apple pixels out of a harness frame, region crop and zoom, PNG encoding (stdlib only)."""
+"""Screen helpers: RGB out of a harness frame, region crop and zoom, PNG encoding (stdlib only)."""
 
 import struct
 import zlib
@@ -14,18 +14,15 @@ class ScreenError(ValueError):
     """The message is the user-facing tool error text."""
 
 
-def apple_pixels(bgra, width, height):
-    """280x192 RGB from a 560x384 BGRA frame (each Apple pixel is drawn 2x2; sample the top-left of each block)."""
+def frame_pixels(bgra, width, height):
+    """560x384 RGB from a 560x384 BGRA frame: every pixel is kept (Double Hi-Res, 80-column text and NTSC colour
+    use all 560 dots of a line)."""
     if (width, height) != (FRAME_W, FRAME_H) or len(bgra) != FRAME_W * FRAME_H * 4:
         raise ScreenError("unsupported video mode for region/zoom/strips")
-    out = bytearray(APPLE_W * APPLE_H * 3)
-    stride = FRAME_W * 4
-    for y in range(APPLE_H):
-        row = bgra[2 * y * stride:][:stride]
-        o = y * APPLE_W * 3
-        out[o + 0:o + APPLE_W * 3:3] = row[2::8]
-        out[o + 1:o + APPLE_W * 3:3] = row[1::8]
-        out[o + 2:o + APPLE_W * 3:3] = row[0::8]
+    out = bytearray(FRAME_W * FRAME_H * 3)
+    out[0::3] = bgra[2::4]
+    out[1::3] = bgra[1::4]
+    out[2::3] = bgra[0::4]
     return bytes(out)
 
 
@@ -50,16 +47,19 @@ def check_zoom(zoom):
         raise ScreenError("zoom must be 1 to 8")
 
 
-def crop_zoom(apple_rgb, region, zoom):
-    """Crop to region, then scale by an integer factor with nearest neighbour. Returns (width, height, rgb)."""
+def crop_zoom(frame_rgb, region, zoom):
+    """Crop a region (in Apple pixels, each 2x2 frame pixels) from a 560x384 RGB frame and scale it to
+    (w*zoom, h*zoom) with nearest neighbour: output pixel (ox, oy) is frame pixel
+    (2*x + (2*ox)//zoom, 2*y + (2*oy)//zoom), so zoom 2 or more shows every dot. Returns (width, height, rgb)."""
     check_zoom(zoom)
     x, y, w, h = region
+    out_w, out_h = w * zoom, h * zoom
+    cols = [(2 * x + (2 * ox) // zoom) * 3 for ox in range(out_w)]
     out = bytearray()
-    for row in range(y, y + h):
-        src = apple_rgb[(row * APPLE_W + x) * 3:][:w * 3]
-        line = b"".join(src[i:i + 3] * zoom for i in range(0, w * 3, 3))
-        out += line * zoom
-    return w * zoom, h * zoom, bytes(out)
+    for oy in range(out_h):
+        base = (2 * y + (2 * oy) // zoom) * FRAME_W * 3
+        out += b"".join([frame_rgb[base + c:base + c + 3] for c in cols])
+    return out_w, out_h, bytes(out)
 
 
 def check_size(width, height, max_w=MAX_OUT_W, max_h=MAX_OUT_H):
@@ -106,10 +106,10 @@ def encode_png(width, height, rgb):
 
 
 def region_differs(ref_rgb, cur_rgb, region):
-    """True when any pixel inside region differs between two 280x192 RGB buffers."""
+    """True when any frame pixel inside region (Apple pixels, scaled x2) differs between two 560x384 RGB buffers."""
     x, y, w, h = region
-    for row in range(y, y + h):
-        o = (row * APPLE_W + x) * 3
-        if ref_rgb[o:o + w * 3] != cur_rgb[o:o + w * 3]:
+    for row in range(2 * y, 2 * (y + h)):
+        o = (row * FRAME_W + 2 * x) * 3
+        if ref_rgb[o:o + 2 * w * 3] != cur_rgb[o:o + 2 * w * 3]:
             return True
     return False

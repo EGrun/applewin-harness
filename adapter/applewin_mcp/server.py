@@ -25,8 +25,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
-from .screen import (MAX_SHEET_H, MAX_SHEET_W, ScreenError, apple_pixels, check_region, check_size, check_zoom,
-                     contact_sheet, crop_zoom, encode_png, sheet_size)
+from .screen import (MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
+                     contact_sheet, crop_zoom, encode_png, frame_pixels, sheet_size)
 
 FRAMES_PER_SECOND = 60
 BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC: emulated cycles to emulated ms (D10)
@@ -382,10 +382,10 @@ class Machine:
         return "waited {} ms".format(ms)
 
     def frame_rgb(self):
-        """(280x192 RGB Apple pixels, emulated_cycles) from one get_frame. Call with self.lock held."""
+        """(560x384 RGB frame, emulated_cycles) from one get_frame. Call with self.lock held."""
         frame = self.rpc(self.agent, "get_frame", format="BGRA32", borders=False)
         try:
-            rgb = apple_pixels(base64.b64decode(frame["data"]), frame["width"], frame["height"])
+            rgb = frame_pixels(base64.b64decode(frame["data"]), frame["width"], frame["height"])
         except ScreenError as e:
             raise ToolError(str(e)) from None
         return rgb, frame["emulated_cycles"]
@@ -573,9 +573,8 @@ def build_server(args, machine):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
         (x 0-279, y 0-191). To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
         the result is that part of the screen, each Apple pixel drawn zoom x zoom. A 40-column text character cell
-        is 7x8 Apple pixels. The image may not exceed 1120x768. The cropped or zoomed image is the 280x192 Apple-pixel picture (the top-left pixel
-        of each 2x2 block), so it loses the extra horizontal detail of 80-column text, double-hires and NTSC
-        colour; a plain look shows the full 560x384 frame. To watch something change, give frames (2-16) and
+        is 7x8 Apple pixels. The image may not exceed 1120x768. At zoom 2 or more every dot of the 560-dot line is shown (Double Hi-Res,
+        80-column text); zoom 1 shows every other one. To watch something change, give frames (2-16) and
         every_ms (1-1000, required with frames): it takes frames screenshots every_ms of emulated time apart and
         returns one contact sheet (4 tiles per row, 2 pixels of grey between them, region/zoom applying to each
         tile, the whole sheet within 1280x1024), preceded by the tiles' times in ms from the first. This lets

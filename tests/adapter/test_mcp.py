@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "adapter"))
 
@@ -66,6 +67,47 @@ def text_of(result):
 def png_size(data):
     assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
     return struct.unpack(">II", data[16:24])
+
+
+def decode_png_rgb(data):
+    """(width, height, rgb) of an 8-bit RGB (colour type 2) PNG; fails clearly on anything else."""
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    pos, idat, header = 8, b"", None
+    while pos < len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        tag, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + length]
+        if tag == b"IHDR":
+            header = struct.unpack(">IIBBBBB", body)
+        elif tag == b"IDAT":
+            idat += body
+        pos += 12 + length
+    width, height, depth, ctype, _, _, interlace = header
+    assert (depth, ctype, interlace) == (8, 2, 0), "PNG is not 8-bit RGB, non-interlaced: {}".format(header)
+    raw = zlib.decompress(idat)
+    stride = width * 3
+    out, prev = [], bytearray(stride)
+    for y in range(height):
+        ft = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - 3] if i >= 3 else 0
+            b = prev[i]
+            c = prev[i - 3] if i >= 3 else 0
+            if ft == 1:
+                line[i] = (line[i] + a) & 255
+            elif ft == 2:
+                line[i] = (line[i] + b) & 255
+            elif ft == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif ft == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+            else:
+                assert ft == 0, "bad PNG filter type {}".format(ft)
+        out.append(bytes(line))
+        prev = line
+    return width, height, b"".join(out)
 
 
 @contextlib.asynccontextmanager
@@ -249,6 +291,26 @@ class EndToEndTest(AdapterTestCase):
                 bad = await call(s, "look", region=[270, 0, 20, 10])
                 self.assertTrue(bad.is_error)
                 self.assertIn("280x192", text_of(bad))
+        self.run_async(go)
+
+    def test_look_zoom_2_matches_plain_look_in_80_columns(self):
+        """Zoom 2 over the whole screen is the full 560x384 frame, dot for dot (80-column text uses every dot)."""
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                for text in ("PR#3\n", "HOME:PRINT \"MIXED Il1|\"\n"):
+                    typed = await call(s, "type_text", text=text)
+                    self.assertFalse(typed.is_error, text_of(typed))
+                await call(s, "wait", ms=500)
+
+                async def image(**args):
+                    r = await call(s, "look", **args)
+                    self.assertFalse(r.is_error, text_of(r))
+                    return decode_png_rgb(base64.b64decode([c for c in r.content if c.type == "image"][0].data))
+                plain, zoomed = await image(), await image(zoom=2)
+                self.assertEqual(plain[:2], (560, 384))
+                self.assertEqual(zoomed[:2], (560, 384))
+                self.assertTrue(plain[2] == zoomed[2], "adapter zoom=2 differs from the harness PNG")
         self.run_async(go)
 
     def test_strip_parameter_errors(self):

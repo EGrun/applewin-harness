@@ -407,9 +407,13 @@ void Session::SendInputApplied()
             }
             if (!a.keys.empty()) {   // press_keys (D10, "Key sequences"); a timed-out one: the keys it pressed
                 json keys = json::array();
-                for (const KeyTiming& k : a.keys)
-                    keys.push_back(json{{"applied_cycle", k.appliedCycle},
-                                        {"read_cycle", k.readCycle ? json(k.readCycle) : json(nullptr)}});
+                for (const KeyTiming& k : a.keys) {
+                    if (k.joystick)   // no read_cycle: a never-read key reports read_cycle null
+                        keys.push_back(json{{"applied_cycle", k.appliedCycle}, {"joystick", true}});
+                    else
+                        keys.push_back(json{{"applied_cycle", k.appliedCycle},
+                                            {"read_cycle", k.readCycle ? json(k.readCycle) : json(nullptr)}});
+                }
                 params["keys"] = std::move(keys);
             }
             conn->Send(MakeNotification("input_applied", params));
@@ -740,6 +744,25 @@ json Session::SubscribeFrames(const ConnectionPtr& connection, const json& param
     return json::object();
 }
 
+// The x, y and buttons fields of set_joystick, or of a press_keys joystick entry's "joystick" object.
+static JoystickChange ParseJoystickChange(const json& params)
+{
+    JoystickChange change;
+    if (Field(params, "x")) change.x = uint8_t(GetUint(params, "x", 0, 255, std::nullopt));
+    if (Field(params, "y")) change.y = uint8_t(GetUint(params, "y", 0, 255, std::nullopt));
+    if (const json* buttons = Field(params, "buttons")) {
+        if (!buttons->is_object()) InvalidParams("buttons must be an object");
+        for (const auto& [name, value] : buttons->items()) {
+            if (name == "2") throw RpcError{kNotSupported, "button 2 is not supported"};
+            if (name != "0" && name != "1") InvalidParams("unknown button: " + name);
+            if (value.is_null()) continue;
+            if (!value.is_boolean()) InvalidParams("button " + name + " must be a boolean");
+            (name == "0" ? change.button0 : change.button1) = value.get<bool>();
+        }
+    }
+    return change;
+}
+
 // All or nothing: throws -32010 unless `events` more input events fit in the queue.
 void Session::RequireInputRoom(uint64_t events)
 {
@@ -788,16 +811,33 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
     if (!list->is_array()) InvalidParams("keys must be an array");
     if (list->empty() || list->size() > kMaxSequenceKeys) InvalidParams("keys must have 1 to 256 entries");
     std::vector<SequenceKey> keys;
+    uint64_t events = 0;   // pending-event slots: a key 1, a joystick entry 1 or, with a duration, 2
     for (const json& entry : *list) {
         const json item = entry.is_object() ? entry : json{{"key", entry}};
         SequenceKey k;
-        k.key = ParseKey(item);
-        if (std::holds_alternative<ResetKey>(k.key)) InvalidParams("RESET is not allowed in press_keys; use press_key");
+        if (const json* joy = Field(item, "joystick")) {   // joystick entry (spec section 6)
+            if (Field(item, "key")) InvalidParams("an entry is a key or a joystick change, not both");
+            if (Field(item, "wait_for_read")) InvalidParams("wait_for_read is not allowed on a joystick entry");
+            if (!joy->is_object()) InvalidParams("joystick must be an object");
+            if (const json* inner = Field(*joy, "joystick")) {   // joystick 0 only, as set_joystick
+                if (inner->is_number_integer() && inner->get<int64_t>() == 1)
+                    throw RpcError{kNotSupported, "joystick 1 is not supported"};
+                InvalidParams("joystick is not a field of a joystick entry");
+            }
+            k.joystick = ParseJoystickChange(*joy);
+            k.durationMs = uint32_t(GetUint(item, "duration_ms", 0, kMaxDurationMs, 0));
+            events += k.durationMs > 0 ? 2 : 1;
+        } else {
+            k.key = ParseKey(item);
+            if (std::holds_alternative<ResetKey>(k.key)) InvalidParams("RESET is not allowed in press_keys; use press_key");
+            k.holdMs = uint32_t(GetUint(item, "hold_ms", 0, kMaxHoldMs, kDefaultHoldMs));
+            k.waitForRead = GetBool(item, "wait_for_read", true);
+            ++events;
+        }
         k.delayMs = uint32_t(GetUint(item, "delay_ms", 0, kMaxKeyDelayMs, 0));
-        k.holdMs = uint32_t(GetUint(item, "hold_ms", 0, kMaxHoldMs, kDefaultHoldMs));
         keys.push_back(k);
     }
-    RequireInputRoom(keys.size());
+    RequireInputRoom(events);
     const uint64_t id = emulator_.QueueKeys(std::move(keys));
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
@@ -809,19 +849,7 @@ json Session::SetJoystick(const ConnectionPtr& connection, const json& params)
     RequireUsable();
     const uint64_t joystick = GetUint(params, "joystick", 0, 1, 0);
     if (joystick == 1) throw RpcError{kNotSupported, "joystick 1 is not supported"};
-    JoystickChange change;
-    if (Field(params, "x")) change.x = uint8_t(GetUint(params, "x", 0, 255, std::nullopt));
-    if (Field(params, "y")) change.y = uint8_t(GetUint(params, "y", 0, 255, std::nullopt));
-    if (const json* buttons = Field(params, "buttons")) {
-        if (!buttons->is_object()) InvalidParams("buttons must be an object");
-        for (const auto& [name, value] : buttons->items()) {
-            if (name == "2") throw RpcError{kNotSupported, "button 2 is not supported"};
-            if (name != "0" && name != "1") InvalidParams("unknown button: " + name);
-            if (value.is_null()) continue;
-            if (!value.is_boolean()) InvalidParams("button " + name + " must be a boolean");
-            (name == "0" ? change.button0 : change.button1) = value.get<bool>();
-        }
-    }
+    const JoystickChange change = ParseJoystickChange(params);
     const uint64_t duration = GetUint(params, "duration_ms", 0, kMaxDurationMs, 0);
     RequireInputRoom(duration > 0 ? 2 : 1);
     const uint64_t id = emulator_.QueueJoystick(change, uint32_t(duration));

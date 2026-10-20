@@ -523,6 +523,130 @@ TEST_CASE("press_keys: invalid sequences throw std::invalid_argument and queue n
     CHECK(e.PendingInputEvents() == 0);
 }
 
+namespace {
+// A press_keys joystick entry.
+SequenceKey JoyEntry(JoystickChange change, uint32_t delayMs, uint32_t durationMs)
+{
+    SequenceKey k;
+    k.joystick = change;
+    k.delayMs = delayMs;
+    k.durationMs = durationMs;
+    return k;
+}
+}  // namespace
+
+TEST_CASE("press_keys: a joystick entry applies after its delay and restores after its duration")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+
+    const uint64_t queuedAt = e.EmulatedCycles();
+    const uint64_t id = e.QueueKeys({JoyEntry(X(10), 20, 50)});
+    CHECK(e.PendingInputEvents() == 2);
+    REQUIRE(e.RunFrames(1));   // ~17 ms
+    CHECK(e.ScheduledCycle(id) == std::nullopt);
+    REQUIRE(e.RunFrames(2));
+    const auto first = e.ScheduledCycle(id);
+    REQUIRE(first.has_value());
+    CHECK(*first >= queuedAt + MsToCycles(20));
+    CHECK(!FindApplied(e.TakeAppliedInputs(), id).has_value());   // the restore is pending
+    CHECK(e.PendingInputEvents() == 1);
+    REQUIRE(e.RunFrames(4));
+    const auto a = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(a.has_value());
+    CHECK(!a->discarded);
+    REQUIRE(a->keys.size() == 1);
+    CHECK(a->keys[0].joystick);
+    CHECK(a->keys[0].readCycle == 0);
+    CHECK(a->lastCycle - a->firstCycle >= MsToCycles(50));
+    CHECK(e.PendingInputEvents() == 0);
+}
+
+TEST_CASE("press_keys: a key after a joystick entry waits for the last key's read")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    (void)e.TakeAppliedInputs();
+
+    SequenceKey a, b;
+    a.key = KeySpec(uint8_t('A'));
+    a.holdMs = 0;
+    b.key = KeySpec(uint8_t('B'));
+    b.holdMs = 0;
+    const uint64_t id = e.QueueKeys({a, JoyEntry(X(0), 0, 0), b});
+    REQUIRE(e.RunFrames(30));
+
+    const auto rows = Rows(e);
+    INFO("text page 1 (trimmed):" << Screen(rows));
+    CHECK(LastNonEmptyRow(rows) == "]AB");
+    const auto r = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(r.has_value());
+    CHECK(!r->discarded);
+    REQUIRE(r->keys.size() == 3);
+    CHECK(!r->keys[0].joystick);
+    CHECK(r->keys[1].joystick);
+    CHECK(!r->keys[2].joystick);
+    CHECK(r->keys[2].appliedCycle >= r->keys[0].readCycle);
+    CHECK(r->keys[1].appliedCycle <= r->keys[2].appliedCycle);
+    CHECK(r->keys[0].readCycle != 0);
+    CHECK(r->keys[2].readCycle != 0);
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("press_keys: wait_for_read false overwrites an unread key")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+    KeybClearStrobe();
+
+    SequenceKey a, b;
+    a.key = KeySpec(uint8_t('A'));
+    a.holdMs = 0;
+    b.key = KeySpec(uint8_t('B'));
+    b.holdMs = 0;
+    b.waitForRead = false;
+    const uint64_t id = e.QueueKeys({a, b});
+    REQUIRE(e.RunFrames(1));
+    CHECK(int(KeybReadData()) == int(0x80 | 'B'));
+    REQUIRE(e.RunFrames(601));
+    const auto r = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(r.has_value());
+    CHECK(r->discarded);   // "B" was never read
+    REQUIRE(r->keys.size() == 2);
+    CHECK(r->keys[0].readCycle == 0);
+    CHECK(r->keys[1].readCycle == 0);
+    CHECK(e.PendingInputEvents() == 0);
+    KeybClearStrobe();
+}
+
+TEST_CASE("press_keys: joystick entries only")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));
+    (void)e.TakeAppliedInputs();
+
+    const uint64_t id = e.QueueKeys({JoyEntry(X(0), 0, 100)});
+    REQUIRE(e.RunFrames(3));   // ~50 ms
+    CHECK(!FindApplied(e.TakeAppliedInputs(), id).has_value());
+    REQUIRE(e.RunFrames(5));
+    const auto r = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(r.has_value());
+    CHECK(!r->discarded);
+    REQUIRE(r->keys.size() == 1);
+    CHECK(r->keys[0].joystick);
+    CHECK(r->lastCycle - r->firstCycle >= MsToCycles(100));
+}
+
 TEST_CASE("input: RESET returns to the BASIC prompt without waiting for the strobe")
 {
     auto& e = StartedEmulator();

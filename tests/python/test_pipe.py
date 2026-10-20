@@ -735,6 +735,34 @@ class AgentMethodsTest(PipeTestCase):
         self.assertIsInstance(params["keys"][0]["applied_cycle"], int)
         self.assertIsNone(params["keys"][0]["read_cycle"])
 
+    def test_press_keys_joystick_entry_reports_a_joystick_item(self):
+        h = self.launch()
+        op = self.stepped_session(h)
+        op.call("step_frames", frames=10)
+        agent = h.connect("agent")
+        sent = agent.call("press_keys", keys=[{"joystick": {"x": 10, "buttons": {"0": True}}, "duration_ms": 30}])
+        self.assertIn("input_id", sent)
+        op.call("step_frames", frames=10)
+        params = agent.next_notification(timeout=5.0)["params"]
+        self.assertEqual(params["input_id"], sent["input_id"])
+        self.assertEqual(len(params["keys"]), 1)
+        item = params["keys"][0]
+        self.assertEqual(set(item), {"applied_cycle", "joystick"})
+        self.assertIsInstance(item["applied_cycle"], int)
+        self.assertIs(item["joystick"], True)
+
+    def test_press_keys_joystick_and_wait_for_read_validation(self):
+        h = self.launch()
+        self.stepped_session(h)
+        agent = h.connect("agent")
+        for entry in ({"joystick": {"x": 256}}, {"key": "A", "joystick": {"x": 1}},
+                      {"joystick": {"x": 1}, "wait_for_read": False}, {"key": "A", "wait_for_read": 1},
+                      {"joystick": {"x": 1}, "duration_ms": 60001}, {"joystick": 5}):
+            with self.subTest(entry=entry):
+                self.assertRpcError(-32602, agent, "press_keys", keys=[entry])
+        self.assertRpcError(-32006, agent, "press_keys", keys=[{"joystick": {"buttons": {"2": True}}}])
+        self.assertIn("input_id", agent.call("press_keys", keys=[{"key": "A", "wait_for_read": False}]))
+
     def test_press_keys_parameters_are_validated(self):
         h = self.launch()
         self.stepped_session(h)

@@ -140,6 +140,9 @@ struct JoyState {
 struct SeqStep {
     KeySpec key{uint8_t(0)};
     uint64_t delayCycles = 0, holdCycles = 0;
+    bool waitForRead = true;                 // press_keys key: waits for the read of the most recent key before it
+    std::optional<JoystickChange> joystick;  // press_keys joystick entry (key, hold and waitForRead unused)
+    uint64_t durationCycles = 0;             // joystick entry: restore the previous state after this long
 };
 
 struct QueuedOp {
@@ -151,7 +154,8 @@ struct QueuedOp {
     uint64_t earliest = 0;      // the next key is not due before this cycle
     std::optional<uint64_t> waitingSince;   // type_text: waiting on the program (strobe set) since this cycle
     bool timed = false;         // press_keys: completes once the last key is read, with timings
-    std::vector<KeyTiming> timings;   // timed: one per applied key; readCycle 0 until read (a read follows its apply)
+    std::vector<KeyTiming> timings;   // timed: one per applied entry; readCycle 0 until read (a read follows its apply)
+    int lastKey = -1;           // timed: index in timings of the most recent key applied (-1: none yet)
     // Key
     KeySpec key{uint8_t(0)};
     uint64_t holdCycles = 0;
@@ -362,7 +366,7 @@ void FinishTimedSequence(QueuedOp& op, uint64_t now)
 {
     uint64_t lastRelease = 0;
     for (const TimedOp& t : g_input.timed)
-        if (t.kind == TimedOp::Kind::KeyUp && t.id == op.id)
+        if ((t.kind == TimedOp::Kind::KeyUp || t.kind == TimedOp::Kind::JoyRestore) && t.id == op.id)
             lastRelease = (std::max)(lastRelease, t.due);
     if (lastRelease <= now) {
         g_input.applied.push_back(InputApplied{op.id, op.first, now, false, std::move(op.timings)});
@@ -419,22 +423,23 @@ void ProcessDueInput()
                 continue;
             }
             if (op.timed) {
-                // press_keys (D10): a key is read at the program's first keyboard read after it was pressed, and the
-                // next key waits for that. The first key waits for nothing.
-                if (op.next > 0 && op.timings.back().readCycle == 0) {
-                    KeyTiming& last = op.timings.back();
-                    if (g_keyboardRead) {
-                        last.readCycle = now;
-                    } else if (now - last.appliedCycle >= timeout) {
-                        // unread 600 frames after its press: the rest is dropped, reported with the keys pressed
+                // press_keys (D10): a key is read at the program's first keyboard read after it was pressed. The most
+                // recent key is the only one that can still be read (a later key overwrote the earlier ones), and a
+                // key with waitForRead waits for it; so does the end of the sequence. The first key waits for nothing.
+                if (op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0 && g_keyboardRead)
+                    op.timings[op.lastKey].readCycle = now;
+                const bool atEnd = op.next >= op.steps.size();
+                const bool dependsOnRead = atEnd || (!op.steps[op.next].joystick && op.steps[op.next].waitForRead);
+                if (dependsOnRead && op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0) {
+                    if (now - op.timings[op.lastKey].appliedCycle >= timeout) {
+                        // unread 600 frames after its press: the rest is dropped, reported with the entries applied
                         ReportDiscarded(op.id, std::move(op.timings));
                         g_input.fifo.pop_front();
                         continue;
-                    } else {
-                        break;
                     }
+                    break;
                 }
-                if (op.next >= op.steps.size()) {   // the last key has been read
+                if (atEnd) {   // the last key has been read (if there is one)
                     FinishTimedSequence(op, now);
                     g_input.fifo.pop_front();
                     continue;
@@ -457,15 +462,40 @@ void ProcessDueInput()
                 op.waitingSince.reset();
             }
             const SeqStep& s = op.steps[op.next];
-            PressKey(s.key, s.holdCycles, op.id, now, false);
+            if (s.joystick) {   // press_keys joystick entry: as a queued set_joystick, restore included
+                const JoyState previous = g_input.joy;
+                JoyState js = previous;
+                if (s.joystick->x) js.x = *s.joystick->x;
+                if (s.joystick->y) js.y = *s.joystick->y;
+                if (s.joystick->button0) js.b0 = *s.joystick->button0;
+                if (s.joystick->button1) js.b1 = *s.joystick->button1;
+                ApplyJoy(js);
+                if (s.durationCycles > 0) {
+                    TimedOp t;
+                    t.kind = TimedOp::Kind::JoyRestore;
+                    t.id = op.id;
+                    t.due = now + s.durationCycles;
+                    t.first = now;
+                    t.restore = previous;
+                    t.completes = false;   // the sequence completes on its own (FinishTimedSequence)
+                    g_input.timed.push_back(t);
+                }
+            } else {
+                PressKey(s.key, s.holdCycles, op.id, now, false);
+            }
             if (!op.started) {
                 op.started = true;
                 op.first = now;
                 NoteFirst(op.id, now);
             }
             if (op.timed) {
-                op.timings.push_back(KeyTiming{now, 0});
-                g_keyboardRead = false;
+                KeyTiming timing{now, 0};
+                timing.joystick = bool(s.joystick);
+                op.timings.push_back(timing);
+                if (!s.joystick) {
+                    op.lastKey = int(op.timings.size()) - 1;
+                    g_keyboardRead = false;
+                }
             }
             ++op.next;
             if (op.next < op.steps.size()) {
@@ -1195,11 +1225,14 @@ uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys)
     op.kind = QueuedOp::Kind::Sequence;
     op.timed = true;
     for (const SequenceKey& k : keys) {
-        if (std::holds_alternative<ResetKey>(k.key))
-            throw std::invalid_argument("QueueKeys: RESET is not allowed in a sequence");
-        if (const uint8_t* c = std::get_if<uint8_t>(&k.key); c && *c > 127)
-            throw std::invalid_argument("QueueKeys: ASCII code above 127");
-        op.steps.push_back(SeqStep{k.key, MsToBaseCycles(k.delayMs), MsToBaseCycles(k.holdMs)});
+        if (!k.joystick) {
+            if (std::holds_alternative<ResetKey>(k.key))
+                throw std::invalid_argument("QueueKeys: RESET is not allowed in a sequence");
+            if (const uint8_t* c = std::get_if<uint8_t>(&k.key); c && *c > 127)
+                throw std::invalid_argument("QueueKeys: ASCII code above 127");
+        }
+        op.steps.push_back(SeqStep{k.key, MsToBaseCycles(k.delayMs), MsToBaseCycles(k.holdMs), k.waitForRead,
+                                   k.joystick, MsToBaseCycles(k.durationMs)});
     }
     op.id = g_input.nextId++;
     op.earliest = EmulatedNow() + op.steps.front().delayCycles;
@@ -1240,7 +1273,13 @@ uint64_t Emulator::PendingInputEvents() const
     for (const QueuedOp& op : g_input.fifo) {
         switch (op.kind) {
         // an empty text, and a timed sequence waiting for its last read, still occupy a slot
-        case QueuedOp::Kind::Sequence: n += std::max<size_t>(1, op.steps.size() - op.next); break;
+        case QueuedOp::Kind::Sequence: {
+            uint64_t steps = 0;   // a key is 1 event, a joystick entry 1 or, with a duration, 2
+            for (size_t i = op.next; i < op.steps.size(); ++i)
+                steps += op.steps[i].joystick && op.steps[i].durationCycles > 0 ? 2 : 1;
+            n += (std::max<uint64_t>)(1, steps);
+            break;
+        }
         case QueuedOp::Kind::Key: n += 1; break;
         case QueuedOp::Kind::Joy: n += op.durationCycles > 0 ? 2 : 1; break;
         }

@@ -111,6 +111,34 @@
 - [ ] **Step 4: Run** — expected: PASS.
 - [ ] **Step 5: Commit** `feat(adapter): frame strips on look`.
 
+### Task 3b: Full-resolution sampling (Double Hi-Res)
+
+Added 2026-10-19 at the user's request ("we need to support double high-resolution"). Region/zoom, strips and change detection sample the full 560×384 frame instead of 280×192 Apple pixels, so Double Hi-Res, Double Lo-Res, 80-column text and NTSC colour keep every dot. Tool parameters and output sizes do not change.
+
+**Files:**
+- Modify: `adapter/applewin_mcp/screen.py`, `adapter/applewin_mcp/server.py` (`Machine.frame_rgb` and its callers, `look` and `press_keys` descriptions), `adapter/README.md`, `docs/specs/m5.md`, `docs/superpowers/specs/2026-10-19-agent-play-tools-design.md` (§3: replace the top-left 2×2 sampling rule and the 280×192 caveat added in Stage 1; §4 strip cap 1,280×1,024 per the Task 3 ruling; §5: change detection on frame pixels)
+- Test: `tests/adapter/test_screen.py`, `tests/adapter/test_mcp.py`
+
+**Interfaces:**
+- Produces (replacing Task 1's `apple_pixels` and Task 2's `frame_rgb` contract):
+  - `frame_pixels(bgra: bytes, width: int, height: int) -> bytes` — 560×384 RGB (BGRA → RGB, every pixel); same `ScreenError("unsupported video mode for region/zoom/strips")` rule as `apple_pixels` had. `apple_pixels` is removed.
+  - `crop_zoom(frame_rgb: bytes, region: tuple[int,int,int,int], zoom: int) -> tuple[int, int, bytes]` — output `(w*zoom, h*zoom)` as before; output pixel `(ox, oy)` takes frame pixel `(2*x + (2*ox)//zoom, 2*y + (2*oy)//zoom)`. Zoom 2 over the whole screen equals the frame; zoom ≥ 2 shows every frame column; zoom 1 shows every other one.
+  - `region_differs(ref_rgb: bytes, cur_rgb: bytes, region) -> bool` — on 560×384 frame buffers, comparing every frame pixel inside the region scaled ×2.
+  - `Machine.frame_rgb() -> tuple[bytes, int]` — `(frame_pixels(...), emulated_cycles)`.
+- Unchanged: `check_region`, `check_size`, `encode_png`, `contact_sheet`, `MAX_OUT_*`, `MAX_SHEET_*`, all tool parameters.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `test_frame_pixels_keeps_every_pixel` (unit, replaces `test_apple_pixels_samples_top_left_of_each_block`): a 560×384 BGRA buffer with pixel (x, y) = (B=x%256, G=y%256, R=7) → `frame_pixels` pixel (x, y) is `(7, y%256, x%256)` for `(x, y)` in `[(0,0), (559,383), (1,1), (301,7)]`; the wrong-size rejection test is kept, renamed for `frame_pixels`.
+  - `test_crop_zoom_keeps_every_dot_at_zoom_2_and_up` (unit): a frame whose odd columns are white and even columns black → `crop_zoom(f, (0, 0, 4, 1), 2)` is 8×2 with columns alternating black/white; at zoom 3 (12×3) both colours appear in every pair of output columns' source span and no source column in `0..7` is skipped (collect the set of source columns hit = `{0..7}`); at zoom 1 (4×1) only even (black) columns appear.
+  - `test_crop_zoom_zoom_2_whole_screen_is_the_frame` (unit): random 560×384 frame → `crop_zoom(f, (0,0,280,192), 2)` returns `(560, 384, f)`.
+  - `test_region_differs_sees_a_single_odd_column` (unit): change only frame pixel (2*10+1, 2*5+1) → `region_differs(..., (10, 5, 1, 1))` is True and `(11, 5, 1, 1)` is False.
+  - Update Task 1's `test_crop_zoom_nearest_neighbour` for the new source mapping (the red source pixel is frame pixel (20, 40)).
+  - `test_look_zoom_2_matches_plain_look_in_80_columns` (adapter, stepped): boot; `type_text("PR#3\n")`, `type_text("HOME:PRINT \"MIXED Il1|\"\n")`, `wait ms=500`; decode both `look()` (the harness PNG) and `look(zoom=2)` to RGB with a small test-local PNG decoder (zlib + PNG filter types 0–4) and assert the pixel data is identical.
+- [ ] **Step 2: Run** `python -m unittest tests.adapter.test_screen -v` and the new adapter test — expected: FAIL (`frame_pixels` missing; zoom-2 look differs from plain look).
+- [ ] **Step 3: Implement** the interfaces above; Task 3's strip path and the Stage 1 look path keep working through `frame_rgb` and `crop_zoom`. Tool descriptions: replace the Stage 1 caveat with "at zoom 2 or more every dot of the 560-dot line is shown (Double Hi-Res, 80-column text); zoom 1 shows every other one". Keep "560x384" and "280x192" in the `look` description.
+- [ ] **Step 4: Run** the full adapter suite — expected: PASS.
+- [ ] **Step 5: Commit** `feat(adapter): full-resolution sampling for Double Hi-Res`.
+
 ### Task 4: `wait_until_change`
 
 **Files:**
@@ -118,7 +146,7 @@
 - Test: `tests/adapter/test_mcp.py` (`ALL_TOOLS` gains `"wait_until_change"`)
 
 **Interfaces:**
-- Consumes: Task 1 `region_differs`, `check_region`; Task 2 `Machine.frame_rgb`.
+- Consumes: Task 3b's `region_differs` (frame pixels, region scaled ×2) and `Machine.frame_rgb` (560×384 RGB); Task 1 `check_region`.
 - Produces: tool `wait_until_change(timeout_ms: int, region: list[int] | None = None, look: bool = True)` → `["changed after N ms" | "no change in N ms", Image]` (just the text when `look` is false); `Machine.pump` keeps the latest `frame_ready` params in `self.frame_ready` (a list it appends to only while a wait is subscribed).
 
 - [ ] **Step 1: Write the failing tests** (stepped unless noted):

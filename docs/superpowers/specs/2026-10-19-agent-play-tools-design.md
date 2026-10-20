@@ -101,7 +101,7 @@ call: whether the MCP SDK lets a tool error carry an image; if not, the error is
 ### 4. `look { frames?: int = 1, every_ms?: int, region?, zoom? }` (adapter)
 - `frames` 1–16; with `frames > 1`, `every_ms` is required, 1–1,000.
 - One image: the tiles left to right, wrapping after 4 per row, a 2-pixel grey gap between tiles. `region` and `zoom`
-  apply to each tile; the same 1,120×768 cap applies to the whole sheet.
+  apply to each tile; a strip sheet may be at most 1,280×1,024 (so four full-screen tiles at zoom 1, 1,126 px wide, fit), while a single-image `look` keeps 1,120×768.
 - The text result lists each tile's emulated time in ms, relative to the first tile.
 - **Stepped:** the first tile is now; then the adapter steps `every_ms` (rounded up to whole frames) and captures, so
   tile times are exact.

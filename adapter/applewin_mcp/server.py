@@ -163,13 +163,20 @@ def cycles_to_ms(cycles):
     return cycles * 1000.0 / BASE_CLOCK_HZ
 
 
+def _entry_name(entry):
+    """How key_report names a press_keys entry: "joystick", its key, or the bare key itself."""
+    if not isinstance(entry, dict):
+        return entry
+    return "joystick" if "joystick" in entry else entry.get("key")
+
+
 def key_report(keys, timings):
     """press_keys' result, one line per key, in ms from the first press: when it was pressed and read, "never read",
     or "not pressed" (a timed-out sequence lists only the keys it pressed)."""
     start = timings[0]["applied_cycle"] if timings else 0
     lines = []
     for i, k in enumerate(keys, 1):
-        name = ("joystick" if "joystick" in k else k.get("key")) if isinstance(k, dict) else k
+        name = _entry_name(k)
         if i > len(timings):
             lines.append("{}. {}  not pressed".format(i, name))
             continue
@@ -177,7 +184,7 @@ def key_report(keys, timings):
         if "read_cycle" not in t:   # a joystick entry: nothing to read
             lines.append("{}. {}  applied {:.1f} ms".format(i, name, cycles_to_ms(t["applied_cycle"] - start)))
             continue
-        read ="never read" if t["read_cycle"] is None else "read {:.1f} ms".format(cycles_to_ms(t["read_cycle"] - start))
+        read = "never read" if t["read_cycle"] is None else "read {:.1f} ms".format(cycles_to_ms(t["read_cycle"] - start))
         lines.append("{}. {}  applied {:.1f} ms  {}".format(i, name, cycles_to_ms(t["applied_cycle"] - start), read))
     return "\n".join(lines)
 
@@ -603,7 +610,9 @@ def build_server(args, machine):
         program has not read yet, as press_key does (a replaced key is reported "never read"). An entry may instead
         be a joystick move {"joystick": {"x": 0-255, "y": 0-255, "buttons": {"0": true, "1": false}}, "delay_ms": ...,
         "duration_ms": 0-60000}: every field is optional, fields left out keep their value, and with duration_ms the
-        joystick then returns to its previous state. A joystick entry never waits for a keyboard read; it is timed
+        joystick then returns to its previous state (overlapping durations restore in due order, each to the state
+        before its own entry, so a later restore can re-apply an earlier move; avoid overlapping duration_ms or end
+        with an explicit centring entry). A joystick entry never waits for a keyboard read; it is timed
         from the previous entry like delay_ms above, so it can land between or alongside keys. At most 256 entries.
         Returns, per entry, when it was pressed (applied) and, for a key, when the program read it, in ms from the
         first press: a program acts on a key when it reads it. Returns once the last key is read and released. If the

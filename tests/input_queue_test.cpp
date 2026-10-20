@@ -627,6 +627,104 @@ TEST_CASE("press_keys: wait_for_read false overwrites an unread key")
     KeybClearStrobe();
 }
 
+TEST_CASE("press_keys: a key superseded by a wait_for_read false key stays unread without failing the sequence")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    (void)e.TakeAppliedInputs();
+
+    // BASIC reads the keyboard only while a step runs, and the entries are applied at one step boundary: with delay 0
+    // and no wait, "B" replaces "A" before BASIC can have read it. "B" is the key that is read.
+    SequenceKey a, b;
+    a.key = KeySpec(uint8_t('A'));
+    a.holdMs = 0;
+    b.key = KeySpec(uint8_t('B'));
+    b.holdMs = 0;
+    b.waitForRead = false;
+    const uint64_t id = e.QueueKeys({a, b});
+    REQUIRE(e.RunFrames(30));   // far below the 600-frame timeout
+
+    const auto r = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(r.has_value());
+    CHECK(!r->discarded);
+    REQUIRE(r->keys.size() == 2);
+    CHECK(r->keys[0].appliedCycle == r->keys[1].appliedCycle);   // same step boundary: "A" was never readable
+    CHECK(r->keys[0].readCycle == 0);
+    CHECK(r->keys[1].readCycle != 0);
+    CHECK(LastNonEmptyRow(Rows(e)) == "]B");
+    CHECK(e.PendingInputEvents() == 0);
+}
+
+TEST_CASE("press_keys: only a key a waiting entry depends on, or the last key, can time the sequence out")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));   // nothing reads the keyboard
+    (void)e.TakeAppliedInputs();
+    KeybClearStrobe();
+
+    // "A" sits unread for ~600.5 frames (10 s) before "M" replaces it, and "M" for as long before "B" does: neither
+    // may time the sequence out. "C" waits for "B", which nothing reads: only that one does, 600 frames after it.
+    SequenceKey a, m, b, c;
+    a.key = KeySpec(uint8_t('A'));
+    a.holdMs = 0;
+    m.key = KeySpec(uint8_t('M'));
+    m.holdMs = 0;
+    m.delayMs = 10000;
+    m.waitForRead = false;
+    b.key = KeySpec(uint8_t('B'));
+    b.holdMs = 0;
+    b.delayMs = 10000;
+    b.waitForRead = false;
+    c.key = KeySpec(uint8_t('C'));
+    c.holdMs = 0;
+    const uint64_t id = e.QueueKeys({a, m, b, c});
+    REQUIRE(e.RunFrames(1000));   // "A" has been unread for 1000 frames, "M" for ~400
+    CHECK(e.TakeAppliedInputs().empty());
+    REQUIRE(e.RunFrames(250));    // 1250: "B" was applied at ~1201
+    CHECK(e.TakeAppliedInputs().empty());
+    REQUIRE(e.RunFrames(560));    // 1810: "B" has been unread for 600 frames
+    const auto r = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(r.has_value());
+    CHECK(r->discarded);
+    REQUIRE(r->keys.size() == 3);   // "C" was never pressed
+    CHECK(r->keys[0].readCycle == 0);
+    CHECK(r->keys[1].readCycle == 0);
+    CHECK(r->keys[2].readCycle == 0);
+    CHECK(e.PendingInputEvents() == 0);
+    KeybClearStrobe();
+}
+
+TEST_CASE("press_keys: overlapping joystick durations restore in due order, each to the state before its own entry")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    (void)e.TakeAppliedInputs();
+
+    // x=0 at 0 ms (restore to centre at 500), button 0 down at 200 ms (restore at 800 to the state at 200: x=0, up).
+    const uint64_t id = e.QueueKeys({JoyEntry(X(0), 0, 500), JoyEntry(Button0(true), 200, 600)});
+    REQUIRE(e.RunFrames(60));   // ~1 s: both restores are done
+    const auto r = FindApplied(e.TakeAppliedInputs(), id);
+    REQUIRE(r.has_value());
+    CHECK(!r->discarded);
+
+    // The later restore re-applied the earlier move: x stays 0 although the first entry had ended.
+    auto check = [&](const std::string& expr, const std::string& expected) {
+        e.QueueText("PRINT " + expr + "", 0);
+        REQUIRE(e.RunFrames(60));
+        const auto rows = Rows(e);
+        INFO("text page 1 (trimmed):" << Screen(rows));
+        CHECK(RowAfterLast(rows, "]PRINT " + expr) == expected);
+    };
+    check("PDL(0)", "0");
+    check("PEEK(-16287)>127", "0");
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
 TEST_CASE("press_keys: joystick entries only")
 {
     auto& e = StartedEmulator();

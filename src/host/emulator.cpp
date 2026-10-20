@@ -172,7 +172,7 @@ struct TimedOp {
     uint64_t id = 0, due = 0, first = 0;
     WPARAM vk = 0;
     JoyState restore;
-    bool completes = true;          // KeyUp: false for a sequence key (the sequence completes on its own)
+    bool completes = true;          // false for a sequence's KeyUp and JoyRestore ops (the sequence completes on its own)
     std::vector<KeyTiming> keys;    // Done: a timed sequence's completion, once its last hold is released
 };
 
@@ -294,8 +294,9 @@ void ClearInput()
 }
 
 // Drops every queued input and releases held keys, reporting each dropped id once as discarded (ruling D1): the inputs
-// still queued and those whose release, restore or completion is still pending. LoadSnapshot. A sequence key's release
-// is not one: its sequence is still queued, has a pending Done, or was already reported (the 600-frame timeout).
+// still queued and those whose release, restore or completion is still pending. LoadSnapshot. A sequence's releases and
+// restores are not one: its sequence is still queued, has a pending Done, or was already reported (the 600-frame
+// timeout).
 void DiscardInput()
 {
     std::vector<uint64_t> ids;
@@ -309,6 +310,16 @@ void DiscardInput()
     for (const uint64_t id : ids)
         ReportDiscarded(id);
     ClearInput();
+}
+
+// The state after a JoystickChange: the fields it sets replace those of s, the rest keep their values.
+JoyState WithChange(JoyState s, const JoystickChange& c)
+{
+    if (c.x) s.x = *c.x;
+    if (c.y) s.y = *c.y;
+    if (c.button0) s.b0 = *c.button0;
+    if (c.button1) s.b1 = *c.button1;
+    return s;
 }
 
 // Joystick 0 once every pending restore has taken effect (in due order): the position a checkpoint keeps.
@@ -464,12 +475,7 @@ void ProcessDueInput()
             const SeqStep& s = op.steps[op.next];
             if (s.joystick) {   // press_keys joystick entry: as a queued set_joystick, restore included
                 const JoyState previous = g_input.joy;
-                JoyState js = previous;
-                if (s.joystick->x) js.x = *s.joystick->x;
-                if (s.joystick->y) js.y = *s.joystick->y;
-                if (s.joystick->button0) js.b0 = *s.joystick->button0;
-                if (s.joystick->button1) js.b1 = *s.joystick->button1;
-                ApplyJoy(js);
+                ApplyJoy(WithChange(previous, *s.joystick));
                 if (s.durationCycles > 0) {
                     TimedOp t;
                     t.kind = TimedOp::Kind::JoyRestore;
@@ -522,12 +528,7 @@ void ProcessDueInput()
             g_input.fifo.pop_front();
         } else {   // Joy
             const JoyState previous = g_input.joy;
-            JoyState s = previous;
-            if (op.change.x) s.x = *op.change.x;
-            if (op.change.y) s.y = *op.change.y;
-            if (op.change.button0) s.b0 = *op.change.button0;
-            if (op.change.button1) s.b1 = *op.change.button1;
-            ApplyJoy(s);
+            ApplyJoy(WithChange(previous, op.change));
             NoteFirst(op.id, now);
             if (op.durationCycles > 0) {
                 TimedOp t;

@@ -40,7 +40,7 @@ CALL_TIMEOUT = 120.0
 TEST_TIMEOUT = 300.0
 
 ALL_TOOLS = ["eject_disk", "export_disk", "insert_disk", "listen", "look", "press_key", "press_keys", "read_screen",
-             "set_joystick", "set_speed", "type_text", "wait"]
+             "set_joystick", "set_speed", "type_text", "wait", "wait_until_change"]
 NO_TEXT_TOOLS = [t for t in ALL_TOOLS if t != "read_screen"]
 
 
@@ -450,6 +450,94 @@ class EndToEndTest(AdapterTestCase):
                     with self.subTest(name=name, ms=ms, kind="out of range"):
                         result = await call(s, name, ms=ms)
                         self.assertTrue(result.is_error, "{}(ms={}) must be rejected".format(name, ms))
+        self.run_async(go)
+
+class WaitUntilChangeTest(AdapterTestCase):
+    JMP_LOOP = "POKE 768,76:POKE 769,0:POKE 770,3:CALL 768\n"
+
+    async def start_loop(self, s):
+        await call(s, "wait", ms=12000)   # boot DOS 3.3
+        await call(s, "type_text", text=self.JMP_LOOP)
+        await call(s, "wait", ms=500)
+
+    def check_no_change(self, r, low, high):
+        self.assertFalse(r.is_error, text_of(r))
+        m = re.fullmatch(r"no change in (\d+) ms", r.content[0].text)
+        self.assertTrue(m, r.content[0].text)
+        self.assertTrue(low <= int(m.group(1)) <= high, r.content[0].text)
+
+    def test_wait_until_change_sees_printed_text(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)   # boot DOS 3.3
+                await call(s, "type_text", text='10 FOR I=1 TO 500:NEXT:PRINT "X"\n')
+                await call(s, "type_text", text="RUN\n")
+                r = await call(s, "wait_until_change", timeout_ms=5000)
+                self.assertFalse(r.is_error, text_of(r))
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+                m = re.fullmatch(r"changed after (\d+) ms", r.content[0].text)
+                self.assertTrue(m, r.content[0].text)
+                self.assertGreater(int(m.group(1)), 0)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
+                self.assertIn("X", [l.strip() for l in text_of(await call(s, "read_screen")).splitlines()])
+        self.run_async(go)
+
+    def test_wait_until_change_text_only_without_look(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "wait_until_change", timeout_ms=100, look=False)
+                self.assertEqual([c.type for c in r.content], ["text"])
+                self.check_no_change(r, 100, 120)
+        self.run_async(go)
+
+    def test_wait_until_change_times_out_without_error(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "wait_until_change", timeout_ms=300)
+                self.check_no_change(r, 300, 319)
+                self.assertEqual([c.type for c in r.content], ["text", "image"])
+        self.run_async(go)
+
+    def test_wait_until_change_tiny_timeout(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                self.check_no_change(await call(s, "wait_until_change", timeout_ms=1), 0, 17)
+        self.run_async(go)
+
+    def test_wait_until_change_region_only_watches(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_loop(s)
+                r = await call(s, "wait_until_change", timeout_ms=200, region=[0, 0, 280, 8])
+                self.check_no_change(r, 200, 220)
+                self.assertEqual(png_size(base64.b64decode(r.content[1].data)), (560, 384))
+        self.run_async(go)
+
+    def test_wait_until_change_unsubscribes(self):
+        async def go():
+            async with mcp_session(self.errlog, extra_args=["--realtime"]) as s:
+                await self.start_loop(s)
+                for _ in range(2):
+                    r = await call(s, "wait_until_change", timeout_ms=200)
+                    self.assertFalse(r.is_error, text_of(r))
+                    self.assertRegex(r.content[0].text, r"no change in \d+ ms")
+                started = time.monotonic()
+                heard = await call(s, "listen")
+                self.assertFalse(heard.is_error, text_of(heard))
+                self.assertLess(time.monotonic() - started, 2.0)
+        self.run_async(go)
+
+    def test_wait_until_change_ranges_and_region(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                for kwargs in ({"timeout_ms": 0}, {"timeout_ms": 60001},
+                               {"timeout_ms": 100, "region": [0, 0, 281, 8]}):
+                    with self.subTest(**kwargs):
+                        r = await call(s, "wait_until_change", **kwargs)
+                        self.assertTrue(r.is_error, kwargs)
         self.run_async(go)
 
 

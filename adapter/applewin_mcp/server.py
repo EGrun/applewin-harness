@@ -184,7 +184,9 @@ def key_report(keys, timings):
         if "read_cycle" not in t:   # a joystick entry: nothing to read
             lines.append("{}. {}  applied {:.1f} ms".format(i, name, cycles_to_ms(t["applied_cycle"] - start)))
             continue
-        read = "never read" if t["read_cycle"] is None else "read {:.1f} ms".format(cycles_to_ms(t["read_cycle"] - start))
+        # The program acts on a key when it reads it: the latency (read - applied) is how late its clock starts.
+        read = "never read" if t["read_cycle"] is None else "read {:.1f} ms (latency {:.1f} ms)".format(
+            cycles_to_ms(t["read_cycle"] - start), cycles_to_ms(t["read_cycle"] - t["applied_cycle"]))
         lines.append("{}. {}  applied {:.1f} ms  {}".format(i, name, cycles_to_ms(t["applied_cycle"] - start), read))
     return "\n".join(lines)
 
@@ -374,10 +376,11 @@ class Machine:
             self.await_input(reply["input_id"], hold_ms if hold_ms > 0 else DEFAULT_HOLD_MS)
         return "pressed {}".format(key)
 
-    def press_keys(self, keys, look=False, frames=1, every_ms=None, region=None, zoom=None):
+    def press_keys(self, keys, look=False, frames=1, every_ms=None, region=None, zoom=None, delay_from="applied"):
         """The key report; with look, [report, PNG] (region/zoom as for look); with frames > 1, [report and tile
         times, contact sheet] of frames screenshots every_ms apart, the first as soon as the last key has been read
-        and released. Strip arguments are checked before any key is sent."""
+        and released. Strip arguments are checked before any key is sent. delay_from "read" counts each delay from the
+        program's read of the key before it instead of from that key's apply (D10, "Read-anchored delays")."""
         _check_range("frames", frames, *STRIP_FRAMES_RANGE)
         if every_ms is not None:
             _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
@@ -395,8 +398,11 @@ class Machine:
                 check_size(box[2] * scale, box[3] * scale)
             except ScreenError as e:
                 raise ToolError(str(e)) from None
+        rpc_params = {"keys": keys}
+        if delay_from != "applied":   # the harness's default; anything else is passed on and validated there
+            rpc_params["delay_from"] = delay_from
         with self.lock:
-            reply = self.rpc(self.agent, "press_keys", keys=keys)   # the harness validates every entry
+            reply = self.rpc(self.agent, "press_keys", **rpc_params)   # the harness validates every entry
             self.note_input_sent()
             expected_ms = 0   # an upper bound: every delay and every hold, end to end
             for k in keys:
@@ -733,7 +739,8 @@ def build_server(args, machine):
 
     @mcp.tool()
     async def press_keys(keys: list[str | int | dict], look: bool = False, frames: int = 1,
-                         every_ms: int | None = None, region: list[int] | None = None, zoom: int | None = None):
+                         every_ms: int | None = None, region: list[int] | None = None, zoom: int | None = None,
+                         delay_from: str = "applied"):
         """Press a timed sequence of keys in one call, timed in the machine's own time: use it for a game manoeuvre
         whose keys must land at exact moments (your thinking time between calls would otherwise sit between them).
         Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
@@ -747,10 +754,20 @@ def build_server(args, machine):
         "duration_ms": 0-60000}: every field is optional, fields left out keep their value, and with duration_ms the
         joystick then returns to its previous state (overlapping durations restore in due order, each to the state
         before its own entry, so a later restore can re-apply an earlier move; avoid overlapping duration_ms or end
-        with an explicit centring entry). A joystick entry never waits for a keyboard read; it is timed
-        from the previous entry like delay_ms above, so it can land between or alongside keys. At most 256 entries.
-        Returns, per entry, when it was pressed (applied) and, for a key, when the program read it, in ms from the
-        first press: a program acts on a key when it reads it. Returns once the last key is read and released. If the
+        with an explicit centring entry). By default a joystick entry never waits for a keyboard read; it is timed
+        from the previous entry like delay_ms above, so it can land between or alongside keys (with delay_from "read"
+        it counts from the read of the key before it, like a key). At most 256 entries.
+        Timing relative to the program: it acts on a key when it READS it, which for a program that polls the keyboard
+        slowly (a title screen, a game loop) is up to a whole loop period after the key went in, depending on where in
+        its loop the key arrived; the report shows this as the key's latency. delay_ms counts from the previous entry's
+        apply by default, so the gap the program sees between two keys can vary by that much from run to run (and
+        between stepped and realtime sessions). Give delay_from "read" (for the whole call, or {"key": ..., "delay_from":
+        "read"|"applied"} for one entry) to count delay_ms from the program's read of the key before instead: the keys
+        then keep the same timing relative to the program in every run. Use it for timings tuned against a game's own
+        clock, and after a key that starts or restarts that clock (a start key, an unpause). The default stays
+        "applied". Entries are applied on their exact cycle, and a key that waits for a read goes in at least 1 ms after
+        it (a read-anchored delay under about 2 ms can land up to 1 ms late, at the end of the step holding the read). Returns, per entry, when it was pressed (applied) and, for a key, when the program read it and the latency
+        (read minus applied), in ms from the first press. Returns once the last key is read and released. If the
         program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
         (the unread one marked "never read") and those not pressed. With look true it also returns the screen after the
         last key (a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2), so you see the result of the manoeuvre
@@ -759,7 +776,7 @@ def build_server(args, machine):
         with tile times in ms from the last key's press. region and zoom (as for look) apply to look or to the
         strip; region is in Apple pixels, so halve coordinates read off a 560x384 screenshot. Strip arguments are
         checked before any key is pressed."""
-        result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom)
+        result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom, delay_from)
         if isinstance(result, list):
             return [result[0], Image(data=result[1], format="png")]
         return result

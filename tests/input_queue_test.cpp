@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -382,13 +383,15 @@ TEST_CASE("press_keys: each key waits for the previous read and its delay, and r
     CHECK(!a->discarded);
     REQUIRE(a->keys.size() == 3);
     for (const KeyTiming& k : a->keys)
-        CHECK(k.appliedCycle < k.readCycle);
+        CHECK(k.appliedCycle <= k.readCycle);   // the read's own cycle: BASIC polls in a tight loop
     CHECK(a->firstCycle == a->keys[0].appliedCycle);
     CHECK(a->keys[1].appliedCycle >= a->keys[0].appliedCycle + MsToCycles(30));
-    CHECK(a->keys[1].appliedCycle >= a->keys[0].readCycle);
-    CHECK(a->keys[1].appliedCycle < a->keys[0].appliedCycle + MsToCycles(30) + MsToCycles(2));   // a step or two
-    CHECK(a->keys[2].appliedCycle >= a->keys[1].readCycle);
-    CHECK(a->keys[2].appliedCycle < a->keys[1].readCycle + MsToCycles(2));   // delay 0: at the next step
+    CHECK(a->keys[1].appliedCycle >= a->keys[0].readCycle + MsToCycles(1));
+    CHECK(a->keys[1].appliedCycle < a->keys[0].appliedCycle + MsToCycles(30) + 8);   // on its due cycle
+    // "C" waits for BASIC's read of "B", and then 1 ms more: BASIC checks $C000 and fetches the key a few
+    // instructions later, so a key put in right after the check would replace the one it is about to fetch.
+    CHECK(a->keys[2].appliedCycle >= a->keys[1].readCycle + MsToCycles(1));
+    CHECK(a->keys[2].appliedCycle < a->keys[1].readCycle + MsToCycles(1) + 8);
     CHECK(a->lastCycle == a->keys[2].readCycle);
 }
 
@@ -743,6 +746,163 @@ TEST_CASE("press_keys: joystick entries only")
     REQUIRE(r->keys.size() == 1);
     CHECK(r->keys[0].joystick);
     CHECK(r->lastCycle - r->firstCycle >= MsToCycles(100));
+}
+
+namespace {
+// A 6502 loop like a slowly polling title screen: it reads $C000 once every 92,240 cycles (about 90.4 ms) and never
+// clears the strobe. LDA $C000; LDX #72; L: LDY #255; M: DEY; BNE M; DEX; BNE L; JMP $0300 (D10, "Read-anchored
+// delays").
+constexpr uint64_t kPollPeriod = 92240;
+
+void StartPollLoop(Emulator& e)
+{
+    const uint8_t code[] = {173, 0, 192, 162, 72, 160, 255, 136, 208, 253, 202, 208, 248, 76, 0, 3};
+    std::string pokes;
+    for (size_t i = 0; i < sizeof(code); ++i)
+        pokes += (i ? ":POKE " : "POKE ") + std::to_string(768 + i) + "," + std::to_string(code[i]);
+    e.QueueText(pokes + "\r", 0);
+    REQUIRE(e.RunFrames(120));
+    e.QueueText("CALL 768\r", 0);
+    REQUIRE(e.RunFrames(60));
+    (void)e.TakeAppliedInputs();
+}
+
+SequenceKey Key(char c, uint32_t delayMs, bool delayFromRead = false)
+{
+    SequenceKey k;
+    k.key = KeySpec(uint8_t(c));
+    k.delayMs = delayMs;
+    k.holdMs = 0;
+    k.delayFromRead = delayFromRead;
+    return k;
+}
+
+// Queues the sequence and runs until it completes.
+InputApplied RunSequence(Emulator& e, std::vector<SequenceKey> keys)
+{
+    const uint64_t id = e.QueueKeys(std::move(keys));
+    for (int i = 0; i < 120; ++i) {
+        REQUIRE(e.RunFrames(5));
+        if (const auto a = FindApplied(e.TakeAppliedInputs(), id))
+            return *a;
+    }
+    FAIL("the sequence did not complete");
+    return {};
+}
+}  // namespace
+
+TEST_CASE("press_keys: a key's read cycle is the cycle of the program's read")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    // Each key waits for the read of the one before, so B, C and D are read at consecutive polls: exactly one loop
+    // apart. A read rounded to a step boundary (1,020 cycles) could not be.
+    const InputApplied a = RunSequence(e, {Key('A', 0), Key('B', 0), Key('C', 0), Key('D', 0)});
+    REQUIRE(a.keys.size() == 4);
+    CHECK(a.keys[2].readCycle - a.keys[1].readCycle == kPollPeriod);
+    CHECK(a.keys[3].readCycle - a.keys[2].readCycle == kPollPeriod);
+}
+
+TEST_CASE("press_keys: an entry goes in on its due cycle, not at the next step boundary")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));
+    (void)e.TakeAppliedInputs();
+
+    const InputApplied a = RunSequence(e, {JoyEntry(X(10), 0, 0), JoyEntry(X(20), 37, 0)});
+    REQUIRE(a.keys.size() == 2);
+    const uint64_t gap = a.keys[1].appliedCycle - a.keys[0].appliedCycle;
+    CHECK(gap >= MsToCycles(37));
+    CHECK(gap < MsToCycles(37) + 8);   // within one instruction
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("press_keys: read-anchored delays keep their timing relative to the program at every phase")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    std::set<uint64_t> fromApplied, fromRead;
+    for (uint32_t offset = 0; offset < 90; offset += 10) {
+        INFO("phase offset " << offset << " ms");
+        REQUIRE(e.RunCycles(MsToCycles(offset)));
+        const InputApplied a = RunSequence(e, {Key('A', 0), Key('B', 200)});
+        fromApplied.insert(a.keys[1].readCycle - a.keys[0].readCycle);
+        const InputApplied r = RunSequence(e, {Key('A', 0), Key('B', 200, true)});
+        fromRead.insert(r.keys[1].readCycle - r.keys[0].readCycle);
+        const uint64_t afterRead = r.keys[1].appliedCycle - r.keys[0].readCycle;
+        CHECK(afterRead >= MsToCycles(200));
+        CHECK(afterRead < MsToCycles(200) + 8);
+    }
+    CHECK(fromApplied.size() > 1);   // counted from the apply, the gap the program sees depends on the phase
+    REQUIRE(fromRead.size() == 1);   // counted from the read, it never does
+    CHECK(*fromRead.begin() == 3 * kPollPeriod);   // 200 ms after a poll: the third poll after it
+}
+
+TEST_CASE("press_keys: delay_from read with no key before the entry counts as applied")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    const uint64_t queuedAt = e.EmulatedCycles();
+    const InputApplied first = RunSequence(e, {Key('A', 50, true)});
+    CHECK(first.keys[0].appliedCycle - queuedAt >= MsToCycles(50));   // the first entry: from the call
+    CHECK(first.keys[0].appliedCycle - queuedAt < MsToCycles(50) + 8);
+
+    const InputApplied a = RunSequence(e, {JoyEntry(X(10), 0, 0), Key('A', 30, true)});
+    const uint64_t gap = a.keys[1].appliedCycle - a.keys[0].appliedCycle;   // no key before it: from the joystick
+    CHECK(gap >= MsToCycles(30));
+    CHECK(gap < MsToCycles(30) + 8);
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("press_keys: a read-anchored joystick entry counts from the read, without the key guard")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    SequenceKey joy = JoyEntry(X(10), 100, 0);
+    joy.delayFromRead = true;
+    const InputApplied a = RunSequence(e, {Key('A', 0), joy});
+    REQUIRE(a.keys.size() == 2);
+    const uint64_t afterRead = a.keys[1].appliedCycle - a.keys[0].readCycle;
+    CHECK(afterRead >= MsToCycles(100));
+    CHECK(afterRead < MsToCycles(100) + 8);
+
+    SequenceKey now = JoyEntry(X(20), 0, 0);   // delay 0: at the read (the end of its step), no 1 ms guard
+    now.delayFromRead = true;
+    const InputApplied b = RunSequence(e, {Key('B', 0), now});
+    CHECK(b.keys[1].appliedCycle - b.keys[0].readCycle < MsToCycles(1));
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("press_keys: a sequence ending in a joystick entry completes no earlier than that entry")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    const InputApplied a = RunSequence(e, {Key('A', 0), JoyEntry(X(10), 500, 0)});
+    REQUIRE(a.keys.size() == 2);
+    CHECK(a.lastCycle >= a.keys[1].appliedCycle);
+    CHECK(a.lastCycle >= a.keys[0].readCycle);
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
 }
 
 TEST_CASE("input: RESET returns to the BASIC prompt without waiting for the strobe")

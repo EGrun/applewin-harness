@@ -810,10 +810,20 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
     if (!list) InvalidParams("keys is required");
     if (!list->is_array()) InvalidParams("keys must be an array");
     if (list->empty() || list->size() > kMaxSequenceKeys) InvalidParams("keys must have 1 to 256 entries");
+    // delay_from (D10, "Read-anchored delays"): "applied" (default) or "read", for the sequence and per entry.
+    const auto delayFrom = [](const json& params, const char* where, std::optional<bool> fallback) -> std::optional<bool> {
+        const json* f = Field(params, "delay_from");
+        if (!f) return fallback;
+        if (f->is_string() && f->get<std::string>() == "applied") return false;
+        if (f->is_string() && f->get<std::string>() == "read") return true;
+        InvalidParams(std::string(where) + "delay_from must be \"applied\" or \"read\"");
+    };
+    const bool sequenceFromRead = *delayFrom(params, "", false);
     std::vector<SequenceKey> keys;
     uint64_t events = 0;   // pending-event slots: a key 1, a joystick entry 1 or, with a duration, 2
     for (const json& entry : *list) {
         const json item = entry.is_object() ? entry : json{{"key", entry}};
+        const std::optional<bool> entryFromRead = delayFrom(item, "an entry's ", std::nullopt);
         SequenceKey k;
         if (const json* joy = Field(item, "joystick")) {   // joystick entry (spec section 6)
             if (Field(item, "key")) InvalidParams("an entry is a key or a joystick change, not both");
@@ -832,8 +842,13 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
             if (std::holds_alternative<ResetKey>(k.key)) InvalidParams("RESET is not allowed in press_keys; use press_key");
             k.holdMs = uint32_t(GetUint(item, "hold_ms", 0, kMaxHoldMs, kDefaultHoldMs));
             k.waitForRead = GetBool(item, "wait_for_read", true);
+            if (entryFromRead.value_or(false) && !k.waitForRead)
+                InvalidParams("delay_from \"read\" waits for the read: it cannot be combined with wait_for_read false");
             ++events;
         }
+        // An entry's own delay_from wins; under a sequence-level "read" a key that does not wait for the read counts
+        // from the apply, and a joystick entry counts from the read of the key before it (without the 1 ms guard).
+        k.delayFromRead = entryFromRead.value_or(sequenceFromRead && (k.joystick || k.waitForRead));
         k.delayMs = uint32_t(GetUint(item, "delay_ms", 0, kMaxKeyDelayMs, 0));
         keys.push_back(k);
     }

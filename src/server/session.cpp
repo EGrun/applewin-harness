@@ -846,8 +846,9 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
                 InvalidParams("delay_from \"read\" waits for the read: it cannot be combined with wait_for_read false");
             ++events;
         }
-        // An entry's own delay_from wins; a key that does not wait for the read counts from the apply.
-        k.delayFromRead = entryFromRead.value_or(sequenceFromRead && k.waitForRead);
+        // An entry's own delay_from wins; under a sequence-level "read" a key that does not wait for the read counts
+        // from the apply, and a joystick entry counts from the read of the key before it (without the 1 ms guard).
+        k.delayFromRead = entryFromRead.value_or(sequenceFromRead && (k.joystick || k.waitForRead));
         k.delayMs = uint32_t(GetUint(item, "delay_ms", 0, kMaxKeyDelayMs, 0));
         keys.push_back(k);
     }

@@ -754,8 +754,9 @@ def build_server(args, machine):
         "duration_ms": 0-60000}: every field is optional, fields left out keep their value, and with duration_ms the
         joystick then returns to its previous state (overlapping durations restore in due order, each to the state
         before its own entry, so a later restore can re-apply an earlier move; avoid overlapping duration_ms or end
-        with an explicit centring entry). A joystick entry never waits for a keyboard read; it is timed
-        from the previous entry like delay_ms above, so it can land between or alongside keys. At most 256 entries.
+        with an explicit centring entry). By default a joystick entry never waits for a keyboard read; it is timed
+        from the previous entry like delay_ms above, so it can land between or alongside keys (with delay_from "read"
+        it counts from the read of the key before it, like a key). At most 256 entries.
         Timing relative to the program: it acts on a key when it READS it, which for a program that polls the keyboard
         slowly (a title screen, a game loop) is up to a whole loop period after the key went in, depending on where in
         its loop the key arrived; the report shows this as the key's latency. delay_ms counts from the previous entry's
@@ -765,7 +766,7 @@ def build_server(args, machine):
         then keep the same timing relative to the program in every run. Use it for timings tuned against a game's own
         clock, and after a key that starts or restarts that clock (a start key, an unpause). The default stays
         "applied". Entries are applied on their exact cycle, and a key that waits for a read goes in at least 1 ms after
-        it. Returns, per entry, when it was pressed (applied) and, for a key, when the program read it and the latency
+        it (a read-anchored delay under about 2 ms can land up to 1 ms late, at the end of the step holding the read). Returns, per entry, when it was pressed (applied) and, for a key, when the program read it and the latency
         (read minus applied), in ms from the first press. Returns once the last key is read and released. If the
         program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
         (the unread one marked "never read") and those not pressed. With look true it also returns the screen after the

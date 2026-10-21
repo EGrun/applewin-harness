@@ -867,6 +867,44 @@ TEST_CASE("press_keys: delay_from read with no key before the entry counts as ap
     CHECK(e.RunFrames(1));
 }
 
+TEST_CASE("press_keys: a read-anchored joystick entry counts from the read, without the key guard")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    SequenceKey joy = JoyEntry(X(10), 100, 0);
+    joy.delayFromRead = true;
+    const InputApplied a = RunSequence(e, {Key('A', 0), joy});
+    REQUIRE(a.keys.size() == 2);
+    const uint64_t afterRead = a.keys[1].appliedCycle - a.keys[0].readCycle;
+    CHECK(afterRead >= MsToCycles(100));
+    CHECK(afterRead < MsToCycles(100) + 8);
+
+    SequenceKey now = JoyEntry(X(20), 0, 0);   // delay 0: at the read (the end of its step), no 1 ms guard
+    now.delayFromRead = true;
+    const InputApplied b = RunSequence(e, {Key('B', 0), now});
+    CHECK(b.keys[1].appliedCycle - b.keys[0].readCycle < MsToCycles(1));
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
+TEST_CASE("press_keys: a sequence ending in a joystick entry completes no earlier than that entry")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartPollLoop(e);
+
+    const InputApplied a = RunSequence(e, {Key('A', 0), JoyEntry(X(10), 500, 0)});
+    REQUIRE(a.keys.size() == 2);
+    CHECK(a.lastCycle >= a.keys[1].appliedCycle);
+    CHECK(a.lastCycle >= a.keys[0].readCycle);
+    e.QueueJoystick(Centred(), 0);
+    CHECK(e.RunFrames(1));
+}
+
 TEST_CASE("input: RESET returns to the BASIC prompt without waiting for the strobe")
 {
     auto& e = StartedEmulator();

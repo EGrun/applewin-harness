@@ -389,8 +389,9 @@ void FinishTimedSequence(QueuedOp& op, uint64_t now)
     for (const TimedOp& t : g_input.timed)
         if ((t.kind == TimedOp::Kind::KeyUp || t.kind == TimedOp::Kind::JoyRestore) && t.id == op.id)
             lastRelease = (std::max)(lastRelease, t.due);
-    if (lastRelease <= now) {   // done at the last key's read (its own cycle), or now for joystick entries only
-        const uint64_t last = op.lastKey >= 0 ? (std::max)(op.timings[op.lastKey].readCycle, lastRelease) : now;
+    if (lastRelease <= now) {   // done at the later of the last key's read (its own cycle) and the last entry's apply
+        const uint64_t last = op.lastKey >= 0
+            ? (std::max)({op.timings[op.lastKey].readCycle, lastRelease, op.timings.back().appliedCycle}) : now;
         g_input.applied.push_back(InputApplied{op.id, op.first, last, false, std::move(op.timings)});
         return;
     }
@@ -418,10 +419,11 @@ uint64_t SequenceDue(const QueuedOp& op)
     if (!waitsForRead || op.timings[op.lastKey].readCycle == 0)
         return op.earliest;
     const uint64_t read = op.timings[op.lastKey].readCycle;
-    return (std::max)(s.fromRead ? read + s.delayCycles : op.earliest, read + kReadGuardCycles);
+    const uint64_t floor = read + (s.joystick ? 0 : kReadGuardCycles);   // a joystick move leaves the latch alone
+    return (std::max)(s.fromRead ? read + s.delayCycles : op.earliest, floor);
 }
 
-// Applies every event that is due at the current step boundary.
+// Applies every event that is due now: at a step boundary, or where a step was split at a press_keys due cycle.
 void ProcessDueInput()
 {
     const uint64_t now = EmulatedNow();
@@ -780,28 +782,9 @@ void CanonicalClock()
     SetCurrentCLK6502();
 }
 
-// The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
-// holds the window-closed rule for all three.
-// Stepped: stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only
-// (ruling C7). Each step applies speed 10 (ApplyClock) and the run holds enhanced disk access on (SteppedEnhance);
-// steps of 1 ms at the base clock, video on, never full speed, no pacing.
-// Realtime (D9, D11, D14): each step first applies the session's speed (ApplyClock), then decides full speed with
-// ContinueExecution's rule (FullSpeedReasonBits).
-// - Normal: a BurstBudget burst at g_fCurrentCLK6502 (rebuilt whenever that clock changes) corrected by AudioOutput's
-//   feedback, then AudioOutput::Pump, then wait for the 1 ms tick.
-// - Full speed: unpaced bursts of the same size (g_fCurrentCLK6502 x 1 ms, so input, capture and the window keep
-//   working) with CpuExecute(cycles, false) and no feedback. AppleWin's entry (VideoRedrawScreenDuringFullSpeed(0,
-//   true), Mockingboard MuteControl(true), g_nCpuCyclesFeedback = 0); a redraw from the end-of-frame check at most every
-//   ~16 ms of wall time (ExecuteStep); on exit VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame) and
-//   MuteControl(false). Leaving full speed restarts the pacing, so the unpaced time is not "made up". The end of the
-//   run (return or throw) exits full speed too, so g_bFullSpeed is only ever set inside a realtime run.
-// Playback (AudioOutput, windowed): on only while a realtime run steps at the base clock (speed 10) and not at full
-// speed. The capture timeline is in emulated time, so at any other rate it cannot play in step with the wall clock,
-// and the feedback (up to +/-200 samples' worth of cycles per 1 ms step) would pull the emulation back to the base
-// clock. Otherwise the buffer is stopped (silence; it resyncs when playback resumes). Capture is never affected.
 // The next cycle at which press_keys input is known to be due: a sequence's next entry (once any read it waits for is
 // recorded), or a sequence's hold release, joystick restore or completion. press_key, set_joystick and type_text keep
-// taking effect at the start of the next step (D10).
+// taking effect at the start of the next step (D10), unless a press_keys split falls inside that step.
 std::optional<uint64_t> NextSequenceDue()
 {
     std::optional<uint64_t> best;
@@ -841,6 +824,26 @@ void ExecuteWithExactInput(uint64_t cycles, bool fullSpeed)
     } while (cycles > 0);
 }
 
+// The one step primitive behind RunFrames, RunRealtime and TypeText: executes at most 1 ms of emulated time. It also
+// holds the window-closed rule for all three.
+// Stepped: stepped runs always use authentic speed and enhanced disk access; speed settings affect realtime runs only
+// (ruling C7). Each step applies speed 10 (ApplyClock) and the run holds enhanced disk access on (SteppedEnhance);
+// steps of 1 ms at the base clock, video on, never full speed, no pacing.
+// Realtime (D9, D11, D14): each step first applies the session's speed (ApplyClock), then decides full speed with
+// ContinueExecution's rule (FullSpeedReasonBits).
+// - Normal: a BurstBudget burst at g_fCurrentCLK6502 (rebuilt whenever that clock changes) corrected by AudioOutput's
+//   feedback, then AudioOutput::Pump, then wait for the 1 ms tick.
+// - Full speed: unpaced bursts of the same size (g_fCurrentCLK6502 x 1 ms, so input, capture and the window keep
+//   working) with CpuExecute(cycles, false) and no feedback. AppleWin's entry (VideoRedrawScreenDuringFullSpeed(0,
+//   true), Mockingboard MuteControl(true), g_nCpuCyclesFeedback = 0); a redraw from the end-of-frame check at most every
+//   ~16 ms of wall time (ExecuteStep); on exit VideoRedrawScreenAfterFullSpeed(g_dwCyclesThisFrame) and
+//   MuteControl(false). Leaving full speed restarts the pacing, so the unpaced time is not "made up". The end of the
+//   run (return or throw) exits full speed too, so g_bFullSpeed is only ever set inside a realtime run.
+// Playback (AudioOutput, windowed): on only while a realtime run steps at the base clock (speed 10) and not at full
+// speed. The capture timeline is in emulated time, so at any other rate it cannot play in step with the wall clock,
+// and the feedback (up to +/-200 samples' worth of cycles per 1 ms step) would pull the emulation back to the base
+// clock. Otherwise the buffer is stopped (silence; it resyncs when playback resumes). Capture is never affected.
+// Within a step, ExecuteWithExactInput ends the CPU batch at each press_keys due cycle (D10, "Read-anchored delays").
 class Stepper {
 public:
     explicit Stepper(Pacing pacing)

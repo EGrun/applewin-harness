@@ -2,22 +2,25 @@
 
 A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-**Status:** M0, M1 and M2 (window, sound, keyboard, disks) are done. M3 is done: the `--serve` pipe server, agent audio (`get_audio`, `subscribe_audio`) and speed controls (`set_speed`, `get_speed`). M4 is done: checkpoints (`checkpoint`, `restore_checkpoint`), `get_state_checksum`, `step_cycles` and disk export (`list_disks`, `export_disk`). M5 is implemented and awaiting human acceptance: an MCP agent adapter (`adapter/`) and `get_text_screen`. M6 is implemented: input and request limits, structured logging (`--log-format json`), `disk_written` notifications, ASCII short paths for non-ASCII work directories, MIT/GPL licensing, and the portable release zip. See [project.md](project.md).
+**Status:** version 0.1.0, Windows 10/11 x64 only. The harness (windowed and headless, stepped and realtime, JSON-RPC over a named pipe, checkpoints, disk export) and the MCP adapter for LLM agents are implemented and tested; see [CHANGELOG.md](CHANGELOG.md). The milestone history is in [project.md](project.md).
 
 ## Documents
 - [project.md](project.md) — goal, architecture, milestones, risks
 - [docs/api_spec.md](docs/api_spec.md) — the JSON-RPC API
 - [docs/decisions.md](docs/decisions.md) — design decisions and their status
 - [adapter/README.md](adapter/README.md) — the MCP server for LLM agents
+- [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md)
+- [NOTICE.txt](NOTICE.txt), [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) — licensing
 
 ## Prerequisites
 - Windows 10/11 x64
 - Visual Studio 2022 with the "Desktop development with C++" workload (v143 toolset)
+
 ## Getting the source
 [AppleWin](https://github.com/AppleWin/AppleWin) is included as a pinned git submodule at `external/AppleWin` (decision D7). Clone with:
 
 ```
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules https://github.com/EGrun/applewin-harness.git
 ```
 
 If you already cloned without it, run:
@@ -52,7 +55,7 @@ The release zip `applewin-harness-<version>-win64.zip` holds the harness exe and
 }
 ```
 
-Replace `<PYTHON>`, `<BUNDLE>` and `<DISK>` with absolute paths (backslashes doubled in JSON). [adapter/examples/basic_count.md](adapter/examples/basic_count.md) has the Claude Desktop form and an example task. `AppleWinHarness.exe --version` prints the version. The zip is built by `tools\make_release.ps1` after a Release build; CI builds it, runs the adapter end-to-end test from the extracted zip, and uploads it as an artifact.
+Replace `<PYTHON>`, `<BUNDLE>` and `<DISK>` with absolute paths (backslashes doubled in JSON). [adapter/examples/basic_count.md](adapter/examples/basic_count.md) has the Claude Desktop form and an example task. `AppleWinHarness.exe --version` prints the version. The zip is built by `tools\make_release.ps1` after a Release build, and `tools\make_source_archive.ps1` builds the matching source archive (this repository plus AppleWin); CI builds it, runs the adapter end-to-end test from the extracted zip, and uploads it as an artifact.
 
 ## Build
 Open `AppleWinHarness.sln` in Visual Studio, or build from a Developer Command Prompt:
@@ -167,8 +170,10 @@ Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs
 ## License
 The license is split (decision D6):
 
-- **MIT:** everything this project wrote (`src/`, `tests/`, `adapter/`, `tools/`, `docs/`). See [LICENSE](LICENSE). Each source file has an `SPDX-License-Identifier: MIT` header.
-- **GPL-2.0-or-later:** the binaries `AppleWinHarness.exe` and `HarnessTests.exe`, because they link AppleWin, which is GPL-2.0-or-later. See [LICENSE-GPL-2.0.txt](LICENSE-GPL-2.0.txt). [NOTICE.txt](NOTICE.txt) gives the source offer, and says the exe contains AppleWin's Apple II ROM images on the same terms as AppleWin's own releases.
+- **MIT:** what this project wrote (`src/`, `tests/`, `adapter/`, `tools/`, `docs/`). See [LICENSE](LICENSE). Each source file has an `SPDX-License-Identifier` header. Three files contain short pieces copied from AppleWin and say so in their header (`GPL-2.0-or-later`, or `MIT AND GPL-2.0-or-later`): `src/host/applewin_host.cpp`, `src/host/virtual_sound.cpp` and `src/host/emulator.cpp`.
+- **GPL-2.0-or-later:** the binaries `AppleWinHarness.exe` and `HarnessTests.exe`, because they link AppleWin, which is GPL-2.0-or-later. See [LICENSE-GPL-2.0.txt](LICENSE-GPL-2.0.txt). [NOTICE.txt](NOTICE.txt) gives the source offer.
 - **Third-party components** (AppleWin, zlib, minizip, libyaml, nlohmann/json, and the `mcp` package the adapter installs) keep their own licenses. See [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
 
-**No disk images are included** in this repository or in the release bundle. The tests use images from the AppleWin submodule. You can get the DOS 3.3 System Master from the AppleWin repository's [`bin/` directory](https://github.com/AppleWin/AppleWin/tree/master/bin).
+**ROMs and disk images are not under these licenses.** `AppleWinHarness.exe` contains the Apple II ROM images that AppleWin carries (copyright Apple Inc. and others, no license that we know of; see "ROM images" in [NOTICE.txt](NOTICE.txt)). No disk images are among this repository's own files or the release zip, but the `external/AppleWin` submodule includes the ones AppleWin keeps in its `bin/` directory (such as the DOS 3.3 System Master, Apple Inc.'s copyright), and the tests use them. You can also get the DOS 3.3 System Master from the AppleWin repository's [`bin/` directory](https://github.com/AppleWin/AppleWin/tree/master/bin).
+
+Apple, Apple II and Apple //e are trademarks of Apple Inc. This project is not affiliated with or endorsed by Apple Inc. or the AppleWin project.

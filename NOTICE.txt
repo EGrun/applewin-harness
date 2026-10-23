@@ -24,15 +24,34 @@ Check out the release commit with its submodules
 (git clone --recurse-submodules, then git checkout the commit above) to get
 exactly the source that was built. No AppleWin source is modified.
 
+Each release also attaches applewin-harness-<version>-source.zip, a complete
+copy of that source including the AppleWin submodule (GitHub's automatic
+source archives leave submodules out). Separately, for at least three years
+after you received these binaries, we will give any third party, for a charge
+no more than the cost of physically performing the distribution, a complete
+machine-readable copy of the corresponding source (GPL version 2, section
+3(b)). Ask by opening an issue at https://github.com/EGrun/applewin-harness.
+
 ROM images
 ----------
 AppleWinHarness.exe contains Apple II ROM images (the Apple II, II+ and IIe
-system, video and peripheral card ROMs) compiled in from AppleWin's resources
-(external/AppleWin/resource). They are included on the same terms as AppleWin's
-own releases.
+system, video and peripheral card ROMs, and other firmware) compiled in from
+AppleWin's resources (external/AppleWin/resource). These images are not
+covered by the GPL or the MIT license: they are the copyright of Apple Inc.
+and other third parties, and we know of no license that covers them. They are
+redistributed here only in the way AppleWin has long redistributed them.
+Whether that is permitted for you is your own responsibility; to avoid
+carrying them, build from source and do not distribute the exe.
 
 Disk images
 -----------
-No disk images are included in this repository or in the release bundle. A
-DOS 3.3 System Master disk image can be found in the AppleWin repository's
-bin/ directory (https://github.com/AppleWin/AppleWin/tree/master/bin).
+No disk images are included in this repository's own files or in the release
+bundle. A DOS 3.3 System Master disk image (the copyright of Apple Inc., not
+covered by these licenses) can be found in the AppleWin repository's bin/
+directory (https://github.com/AppleWin/AppleWin/tree/master/bin). Checking out
+the external/AppleWin submodule also fetches the images AppleWin keeps there.
+
+Trademarks
+----------
+Apple, Apple II and Apple //e are trademarks of Apple Inc. This project is not
+affiliated with or endorsed by Apple Inc. or the AppleWin project.

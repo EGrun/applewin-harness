@@ -18,3 +18,7 @@ __pycache__/
 
 # Release bundles
 dist/
+
+# Local AI-assistant state (skills, worktrees, scratch)
+.claude/
+.superpowers/

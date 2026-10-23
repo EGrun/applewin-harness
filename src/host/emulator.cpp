@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+// ResetToLogoMode and UseClockMultiplier copy short pieces of AppleWin (Windows/AppleWin.cpp, Core.cpp); those pieces
+// are under AppleWin's license (Copyright (C) the AppleWin authors, see NOTICE.txt). The rest of the file is MIT.
 #include "host/emulator.h"
 #include "host/log.h"
 #include "host/applewin_host.h"

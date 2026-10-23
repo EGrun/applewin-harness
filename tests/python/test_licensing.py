@@ -16,7 +16,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from applewin_mcp.harness_client import REPO_ROOT
 
-SPDX = "SPDX-License-Identifier: MIT"
+# Files that contain code copied from AppleWin (GPL-2.0-or-later) and so are not plain MIT. Add a file here, and give it
+# the matching header, when code is copied from external/AppleWin into it.
+APPLEWIN_DERIVED = {
+    "src/host/applewin_host.cpp": "GPL-2.0-or-later",
+    "src/host/virtual_sound.cpp": "MIT AND GPL-2.0-or-later",
+    "src/host/emulator.cpp": "MIT AND GPL-2.0-or-later",
+}
 OWNED_ROOTS = ("src", "tests", "adapter", "tools")
 OWNED_SUFFIXES = (".cpp", ".h", ".py", ".ps1")
 EXCLUDED_DIRS = {"third_party", "external", "fixtures", "bin", "obj", "x64", "__pycache__", "build", ".vs"}
@@ -25,7 +31,7 @@ THIRD_PARTY = ("AppleWin", "zlib", "minizip", "libyaml", "nlohmann", "mcp")
 FORBIDDEN_IN_BUNDLE = (".dsk", ".do", ".po", ".nib", ".woz", ".pdb", ".lib", ".obj", ".idb", ".ilk")
 BUNDLE_FILES = {
     "AppleWinHarness.exe", "adapter/requirements.txt", "adapter/README.md", "adapter/VERSION", "adapter/examples/basic_count.md",
-    "docs/api_spec.md", "README.md", "LICENSE", "LICENSE-GPL-2.0.txt", "NOTICE.txt", "THIRD-PARTY-NOTICES.txt",
+    "docs/api_spec.md", "docs/QUICKSTART.md", "README.md", "LICENSE", "LICENSE-GPL-2.0.txt", "NOTICE.txt", "THIRD-PARTY-NOTICES.txt",
 }
 BUNDLE_ADAPTER_FILES = {"adapter/applewin_mcp/" + n for n in
                         ("__init__.py", "__main__.py", "harness_client.py", "server.py")}
@@ -59,6 +65,16 @@ def read_text(path):
         return f.read()
 
 
+def spdx_identifier(rel):
+    """The SPDX-License-Identifier expression in a file's first 5 lines, or None."""
+    with open(os.path.join(REPO_ROOT, rel), encoding="utf-8", errors="replace") as f:
+        for _ in range(5):
+            m = re.search(r"SPDX-License-Identifier: ([A-Za-z0-9.+ -]+?)\"?\s*$", f.readline())
+            if m:
+                return m.group(1)
+    return None
+
+
 class SourceHeaderTest(unittest.TestCase):
     def test_owned_files_are_found_in_every_root(self):
         files = owned_files()
@@ -68,11 +84,18 @@ class SourceHeaderTest(unittest.TestCase):
     def test_every_owned_source_file_has_an_spdx_header(self):
         missing = []
         for rel in owned_files():
-            with open(os.path.join(REPO_ROOT, rel), encoding="utf-8", errors="replace") as f:
-                head = [f.readline() for _ in range(5)]
-            if not any(SPDX in line for line in head):
+            if not spdx_identifier(rel):
                 missing.append(rel)
-        self.assertEqual(missing, [], "{} files lack '{}' in their first 5 lines".format(len(missing), SPDX))
+        self.assertEqual(missing, [], "{} files lack an SPDX-License-Identifier in their first 5 lines".format(len(missing)))
+
+    def test_files_with_code_copied_from_applewin_carry_the_gpl_identifier(self):
+        for rel, want in APPLEWIN_DERIVED.items():
+            with self.subTest(file=rel):
+                self.assertEqual(spdx_identifier(rel), want)
+
+    def test_only_the_applewin_derived_files_are_not_plain_mit(self):
+        others = {rel: spdx_identifier(rel) for rel in owned_files() if rel not in APPLEWIN_DERIVED}
+        self.assertEqual({rel: ident for rel, ident in others.items() if ident != "MIT"}, {})
 
 
 class LicenseFilesTest(unittest.TestCase):

@@ -96,6 +96,22 @@ jobs:
           path: ${{ env.BUNDLE_ZIP }}
           if-no-files-found: error
 
+      - name: Build the source archive (the GPL corresponding source, with the AppleWin submodule)
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: |
+          ./tools/make_source_archive.ps1
+          $version = (Get-Content VERSION -Raw).Trim()
+          "SOURCE_ZIP=$env:GITHUB_WORKSPACE\dist\applewin-harness-$version-source.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload the source archive
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: applewin-harness-source
+          path: ${{ env.SOURCE_ZIP }}
+          if-no-files-found: error
+
       - name: Upload harness temp files on failure
         if: failure()
         uses: actions/upload-artifact@v7.0.2

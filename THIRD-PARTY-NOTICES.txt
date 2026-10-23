@@ -11,11 +11,16 @@ Version:  commit 6c579da5bd9460ebf7c6051a6d635efbd1375c85 (v1.32.1.0-2)
 License:  GPL-2.0-or-later
 Source:   https://github.com/AppleWin/AppleWin (submodule external/AppleWin)
 
-AppleWin, including its Apple II ROM images, resources, SNESMAX joystick
-support and other source linked into the exe, is distributed under the GNU
-General Public License, version 2 or (at your option) any later version. The
-full text is in LICENSE-GPL-2.0.txt, copied unchanged from AppleWin's LICENSE
-file. It is not repeated here.
+AppleWin's source, including its SNESMAX joystick support and the other code
+linked into the exe, is distributed under the GNU General Public License,
+version 2 or (at your option) any later version. The full text is in
+LICENSE-GPL-2.0.txt, copied unchanged from AppleWin's LICENSE file. It is not
+repeated here.
+
+The Apple II ROM images and other firmware that AppleWin carries in its
+resource directory, and that are compiled into the exe, are NOT covered by
+that license. They are the copyright of Apple Inc. and other third parties;
+see "ROM images" in NOTICE.txt.
 
 ============================================================================
 2. zlib

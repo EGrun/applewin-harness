@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-or-later
+// This file contains code copied from AppleWin (Windows/AppleWin.cpp), so it is under AppleWin's license, not MIT:
+// Copyright (C) 1994-1996, Michael O'Brien; 1999-2001, Oliver Schmidt; 2002-2005, Tom Charlesworth;
+// 2006-2014, Tom Charlesworth, Michael Pohoreski. See LICENSE and NOTICE.txt.
+//
 // Provides what external/AppleWin/source/Windows/AppleWin.cpp provides to the rest of AppleWin. The harness does not
 // compile that file (it is AppleWin's WinMain, message loop and window startup).
 //

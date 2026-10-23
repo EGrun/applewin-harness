@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+// The DXSoundBuffer replacement below follows AppleWin's Windows/DXSoundBuffer.cpp, so that part is under AppleWin's
+// license (Copyright (C) the AppleWin authors, see NOTICE.txt); the virtual buffers above it are MIT.
 // Virtual sound buffers (D14), and the replacement for AppleWin's Windows/DXSoundBuffer.cpp translation unit.
 #include "host/virtual_sound.h"
 #include "core/audio_capture.h"

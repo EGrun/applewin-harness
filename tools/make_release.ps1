@@ -83,6 +83,7 @@ try {
     Copy-Item (Join-Path $repo 'adapter\README.md') (Join-Path $root 'adapter')
     Copy-Item (Join-Path $repo 'VERSION') (Join-Path $root 'adapter\VERSION')   # applewin_mcp.__version__ reads ..\VERSION
     Copy-Item (Join-Path $repo 'docs\api_spec.md') (Join-Path $root 'docs')
+    Copy-Item (Join-Path $repo 'docs\QUICKSTART.md') (Join-Path $root 'docs')
     foreach ($f in 'README.md', 'LICENSE', 'LICENSE-GPL-2.0.txt', 'THIRD-PARTY-NOTICES.txt') { Copy-Item (Join-Path $repo $f) $root }
 
     # NOTICE.txt: record the release commit (the repository's copy keeps the placeholder).

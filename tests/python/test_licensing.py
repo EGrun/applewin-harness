@@ -31,7 +31,7 @@ THIRD_PARTY = ("AppleWin", "zlib", "minizip", "libyaml", "nlohmann", "mcp")
 FORBIDDEN_IN_BUNDLE = (".dsk", ".do", ".po", ".nib", ".woz", ".pdb", ".lib", ".obj", ".idb", ".ilk")
 BUNDLE_FILES = {
     "AppleWinHarness.exe", "adapter/requirements.txt", "adapter/README.md", "adapter/VERSION", "adapter/examples/basic_count.md",
-    "docs/api_spec.md", "README.md", "LICENSE", "LICENSE-GPL-2.0.txt", "NOTICE.txt", "THIRD-PARTY-NOTICES.txt",
+    "docs/api_spec.md", "docs/QUICKSTART.md", "README.md", "LICENSE", "LICENSE-GPL-2.0.txt", "NOTICE.txt", "THIRD-PARTY-NOTICES.txt",
 }
 BUNDLE_ADAPTER_FILES = {"adapter/applewin_mcp/" + n for n in
                         ("__init__.py", "__main__.py", "harness_client.py", "server.py")}

@@ -1,16 +1,56 @@
 # AppleWin Harness
 
-A harness that lets an AI agent use an emulated Apple II through AppleWin. The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
+[![CI](https://github.com/EGrun/applewin-harness/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/EGrun/applewin-harness/actions/workflows/ci.yml)
+[![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-informational.svg)](CHANGELOG.md)
+[![License: MIT / GPL-2.0-or-later](https://img.shields.io/badge/license-MIT%20%2F%20GPL--2.0--or--later-blue.svg)](#license)
+[![Platform: Windows 10/11 x64](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg)](#prerequisites)
+[![Python 3.12+](https://img.shields.io/badge/python-%E2%89%A53.12-3776AB.svg?logo=python&logoColor=white)](adapter/requirements.txt)
+[![MCP server](https://img.shields.io/badge/MCP-stdio%20server-8A2BE2.svg)](adapter/README.md)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#limits)
 
-**Status:** version 0.1.0, Windows 10/11 x64 only. The harness (windowed and headless, stepped and realtime, JSON-RPC over a named pipe, checkpoints, disk export) and the MCP adapter for LLM agents are implemented and tested; see [CHANGELOG.md](CHANGELOG.md). The milestone history is in [project.md](project.md).
+A harness that lets an AI agent use an emulated Apple II through [AppleWin](https://github.com/AppleWin/AppleWin). The agent can only do what a person could: type on the keyboard, move the joystick, look at the screen, and listen. Experiments are safe (disks run on working copies) and reproducible (pause, step, checkpoint).
 
-## Documents
-- [project.md](project.md) — goal, architecture, milestones, risks
-- [docs/api_spec.md](docs/api_spec.md) — the JSON-RPC API
-- [docs/decisions.md](docs/decisions.md) — design decisions and their status
-- [adapter/README.md](adapter/README.md) — the MCP server for LLM agents
-- [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md)
-- [NOTICE.txt](NOTICE.txt), [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) — licensing
+It has two parts: `AppleWinHarness.exe`, which hosts the AppleWin core and serves it over a local JSON-RPC pipe, and `applewin_mcp`, an MCP server through which an LLM agent (Claude Code, Claude Desktop or any MCP client) uses the machine.
+
+**Status:** alpha, version 0.1.0, Windows only. The harness and the MCP adapter are implemented and tested in CI; the API may still change before 1.0. See [CHANGELOG.md](CHANGELOG.md) and [Limits](#limits).
+
+**New here? Start with the [quick start](docs/QUICKSTART.md).**
+
+## Fair play
+The agent gets a player's view and a player's controls, nothing more (decision D4):
+
+- **It can** type and press keys (including timed sequences), move the joystick and press its buttons, look at the screen (whole, a region, zoomed, or as a strip of frames over time), wait for the screen to change, listen to the speaker and Mockingboard, and swap or save floppy disks.
+- **It cannot** read or write the Apple's memory or CPU registers, pause the machine in a realtime session, or reach the operator methods (sessions, stepping, state checksums). The MCP adapter only has the agent role.
+- **Opt-ins:** `read_screen` (the text on the text screen, for convenience) only exists with `--text-screen`. Checkpoints (save and restore, like an emulator's save states) only exist in stepped sessions, never with `--realtime`.
+
+## How it fits together
+```mermaid
+flowchart LR
+    agent["LLM agent<br/>(MCP client)"] -- "MCP over stdio" --> mcp["applewin_mcp<br/>(Python adapter)"]
+    mcp -- "JSON-RPC 2.0 over a named pipe<br/>agent role" --> exe
+    operator["Tests, scripts<br/>(operator role)"] -- "JSON-RPC 2.0" --> exe
+    subgraph exe ["AppleWinHarness.exe"]
+        direction TB
+        session["Session: input queue, frames, audio capture,<br/>checkpoints, working disk copies"]
+        core["AppleWin core<br/>(enhanced Apple //e, Disk II, speaker, Mockingboard)"]
+        session --> core
+    end
+    exe --> window["View-only window<br/>and sound (optional)"]
+```
+
+## Documentation
+| Document | What it covers |
+|---|---|
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Install, connect an MCP client, run a first task, troubleshooting |
+| [adapter/README.md](adapter/README.md) | The MCP server: every tool, launch flags, behaviour notes |
+| [adapter/examples/basic_count.md](adapter/examples/basic_count.md) | An example task with its success check and client configs |
+| [docs/api_spec.md](docs/api_spec.md) | The JSON-RPC API on the named pipe |
+| [docs/decisions.md](docs/decisions.md) | Design decisions (D1 to D14) and their status |
+| [project.md](project.md) | Goal, architecture, milestone history, risks |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing and licensing of contributions |
+| [SECURITY.md](SECURITY.md) | Reporting vulnerabilities, and the threat model |
+| [CHANGELOG.md](CHANGELOG.md) | Versions |
+| [NOTICE.txt](NOTICE.txt), [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) | Licensing, the source offer, ROMs and third-party components |
 
 ## Prerequisites
 - Windows 10/11 x64
@@ -166,6 +206,19 @@ REM what CI runs
 bin\x64\Debug\HarnessTests.exe -tse=windowed,audio
 ```
 Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64, runs `HarnessTests.exe -tse=windowed,audio`, then the Python pipe tests, and then the adapter tests.
+
+## Limits
+- **Windows 10/11 x64 only.** The AppleWin core is a Win32 program.
+- **Alpha.** The pipe protocol (`protocol_version` 0.3) and the MCP tools may change before 1.0.
+- **One machine per process.** Each harness process runs one session: an enhanced Apple //e with a Disk II controller in slot 6 (two drives) and joystick 0. Run more processes for more machines.
+- **Realtime sessions** run while the agent thinks, so its think time passes in the game; send timed manoeuvres with `press_keys`. `wait_until_change` can miss a change that lasts a single frame. There are no checkpoints.
+- **Stepped sessions** run a long `wait_until_change` frame by frame, so long timeouts take real time.
+- **Local only.** No network access, no session record/replay, no sector-level disk editing.
+- **Sound in the window** plays only at authentic speed; the agent's audio capture works at every speed.
+
+## Credits
+- [AppleWin](https://github.com/AppleWin/AppleWin), the emulator this harness hosts, by Michael O'Brien, Oliver Schmidt, Tom Charlesworth, Michael Pohoreski and the AppleWin contributors.
+- [zlib](https://zlib.net/) and minizip, [libyaml](https://github.com/yaml/libyaml), [nlohmann/json](https://github.com/nlohmann/json), [doctest](https://github.com/doctest/doctest), and the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
 
 ## License
 The license is split (decision D6):

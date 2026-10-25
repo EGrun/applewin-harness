@@ -1036,7 +1036,8 @@ TEST_CASE("press_keys wait_for_ready: a program that is never ready again drops 
     REQUIRE(e.RunFrames(45));
     (void)e.TakeAppliedInputs();
 
-    // The idle place learned at the first key is the prompt's own loop, which the program leaves once it has RETURN.
+    // The idle place learned at the first key is the prompt's own loop, which the program leaves once it has RETURN, and
+    // no earlier call learned the loop it waits for commands in.
     const InputApplied a = RunReadySequence(e, {Key('\r', 0), Key('A', 0)});
     CHECK(a.discarded);
     CHECK(a.stopped == InputStop::NotReady);
@@ -1101,7 +1102,8 @@ TEST_CASE("press_keys until_ready: a program that is not ready again within 600 
     REQUIRE(e.RunFrames(45));
     (void)e.TakeAppliedInputs();
 
-    // The answer: the idle place learned at its key is the prompt's own loop, which the program does not come back to.
+    // The answer: the idle place learned at its key is the prompt's own loop, which the program does not come back to,
+    // and no earlier call learned the loop it waits for commands in.
     const InputApplied a = RunReadySequence(e, {Key('\r', 0)}, true);
     CHECK(!a.discarded);
     REQUIRE(a.then.has_value());
@@ -1109,6 +1111,41 @@ TEST_CASE("press_keys until_ready: a program that is not ready again within 600 
     REQUIRE(a.keys.size() == 1);
     CHECK(a.keys[0].readCycle > 0);
     CHECK(a.lastCycle - a.keys[0].appliedCycle >= MsToCycles(9900));   // 600 frames
+}
+
+TEST_CASE("press_keys wait_for_ready: after answering a prompt the program is ready in the loop an earlier call learned")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    const InputApplied move = RunReadySequence(e, {Key('A', 0)}, true);   // learns where it waits for commands
+    REQUIRE(move.then.has_value());
+    CHECK(*move.then == InputStop::None);
+    const InputApplied prompt = RunReadySequence(e, {Key('P', 0)}, true);
+    REQUIRE(prompt.then.has_value());
+    CHECK(*prompt.then == InputStop::InputChanged);
+
+    // An answer and a move in one call: the move waits for the answer's move, then goes in once the program is back in
+    // its command loop, although the call learned the prompt's loop at its first key.
+    const InputApplied answer = RunReadySequence(e, {Key('Y', 0), Key('\r', 0), Key('A', 0)});
+    CHECK(!answer.discarded);
+    REQUIRE(answer.keys.size() == 3);
+    const uint64_t gap = answer.keys[2].appliedCycle - answer.keys[1].appliedCycle;
+    CHECK(gap >= MsToCycles(380));
+    CHECK(gap < MsToCycles(380 + 60));
+
+    // An until_ready answer to the next prompt ends ready, once the program is back in its command loop.
+    const InputApplied again = RunReadySequence(e, {Key('P', 0)}, true);
+    REQUIRE(again.then.has_value());
+    CHECK(*again.then == InputStop::InputChanged);
+    const InputApplied done = RunReadySequence(e, {Key('\r', 0)}, true);
+    CHECK(!done.discarded);
+    REQUIRE(done.then.has_value());
+    CHECK(*done.then == InputStop::None);
+    CHECK(done.lastCycle - done.keys[0].appliedCycle >= MsToCycles(360));   // the answer's move
+    CHECK(done.lastCycle - done.keys[0].appliedCycle < MsToCycles(380 + 60));
 }
 
 TEST_CASE("press_keys wait_for_ready: only plain keys that wait for the program are allowed")

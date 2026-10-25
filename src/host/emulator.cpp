@@ -221,10 +221,12 @@ std::optional<uint64_t> g_keyboardReadAt;   // the cycle of that read, once it h
 const uint64_t kIdleWindowCycles = MsToBaseCycles(300);   // the reads before the first key was taken that make up "idle"
 constexpr uint32_t kTightLoopReads = 64;   // this many reads in a row from one place, each under
 constexpr uint64_t kTightLoopGap = 100;    // this many cycles after the last, are a tight input loop (a prompt)
+const uint64_t kPromptTakeCycles = MsToBaseCycles(1);   // a key taken this soon after a tight loop was taken at a prompt
 
 struct ReadyWatch {
     std::map<WORD, uint64_t> waiting;   // the first key's wait: each place read from while it was not taken, and when last
     std::set<WORD> idle;        // where the program reads the keyboard when it waits for input: learned from the first key
+    std::set<WORD> home;        // the idle places of the last first key not taken at a prompt: where it waits for commands
     std::set<WORD> since;       // the places it has read from since it took the last key
     bool learning = false;      // the first key of a sequence is waiting to be taken
     bool watching = false;      // a wait_for_ready key was pressed and the program has not cleared the strobe yet
@@ -235,8 +237,9 @@ struct ReadyWatch {
     WORD runPc = 0;             // the current run of reads from one place, each under kTightLoopGap after the last
     uint32_t runReads = 0;
     uint64_t runLast = 0;
+    std::optional<uint64_t> tightAt;   // the last read of a tight loop
 
-    void Reset() { *this = ReadyWatch{}; }
+    void Reset() { *this = ReadyWatch{}; }   // home too: it belongs to the program that was running
 
     // A wait_for_ready key was just put in the latch.
     void KeyPressed(bool first)
@@ -251,7 +254,9 @@ struct ReadyWatch {
     }
 
     // The idle places are where the program read the keyboard in the 300 ms before it took the first key: the loop
-    // that found it, whether the program was idle when the key went in, still busy, or at a prompt.
+    // that found it, whether the program was idle when the key went in, still busy, or at a prompt. Not taken at a
+    // prompt (just after a tight loop), they are also where it waits for commands (home), which it comes back to once
+    // a later call has answered a prompt.
     void StrobeCleared(uint64_t now)
     {
         runReads = 0;   // the program left the loop it took the key in, even if it comes back to it
@@ -261,6 +266,8 @@ struct ReadyWatch {
             for (const auto& [pc, last] : waiting)
                 if (now - last <= kIdleWindowCycles)
                     idle.insert(pc);
+            if (!idle.empty() && !(tightAt && now - *tightAt <= kPromptTakeCycles))
+                home = idle;
             learning = false;
         }
         watching = false;
@@ -274,6 +281,8 @@ struct ReadyWatch {
         runReads = (pc == runPc && now - runLast < kTightLoopGap) ? runReads + 1 : 1;
         runPc = pc;
         runLast = now;
+        if (runReads >= kTightLoopReads)
+            tightAt = now;
         if (learning)
             waiting[pc] = now;
         if (!taken || ready || changed)
@@ -281,9 +290,12 @@ struct ReadyWatch {
         since.insert(pc);
         // A tight loop is an input loop: at an idle place the program waits for the next key (an idle place that only
         // reads once a key is there, as a prompt's fetch after its wait loop does, never comes round); elsewhere it
-        // began another kind of input.
+        // began another kind of input. Back in its command loop (home) it is ready too, as after answering a prompt.
         const bool tight = runReads >= kTightLoopReads;
-        if (std::includes(since.begin(), since.end(), idle.begin(), idle.end()) || (tight && idle.count(pc)))
+        const auto all = [this](const std::set<WORD>& places) {
+            return !places.empty() && std::includes(since.begin(), since.end(), places.begin(), places.end());
+        };
+        if (all(idle) || all(home) || (tight && idle.count(pc)) || idle.empty())
             ready = true;
         else if (tight)
             changed = true;

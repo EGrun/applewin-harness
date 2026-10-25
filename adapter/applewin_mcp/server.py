@@ -205,7 +205,7 @@ def then_report(applied):
         return ("then: the program began waiting for a different kind of input (probably a prompt or a question) at "
                 "{:.1f} ms: look at the screen and answer it".format(at))
     return ("then: the program was not ready for another key within {} frames of the last key: it may still be busy, "
-            "or waiting for another kind of input (an answer to a prompt ends this way)".format(INPUT_FRAME_CAP))
+            "or waiting for another kind of input".format(INPUT_FRAME_CAP))
 
 
 def log(message):
@@ -824,14 +824,15 @@ def build_server(args, machine):
         answer it, then send the rest. Each key goes in as soon as the program is ready, so delay_ms, joystick
         entries, wait_for_read false and delay_from are not allowed with it (hold_ms is). Not for a
         program that never clears the strobe (Conan): use delay_from "read" there. Returns once the program has
-        taken the last key. It cannot answer a prompt and then move in one call: send the answer separately.
+        taken the last key. An answer to a prompt and the moves after it can go in one call (["N", "RETURN", "E"]):
+        the program counts as ready again once it is back in the command loop an earlier call saw (not straight after
+        a reset, before any wait_for_ready call has seen it).
         until_ready: true (with wait_for_ready only) makes the call return only once the program is ready for another
         key after the last one, so look or frames shows the finished move and you need not guess a wait. The report
         then ends with a "then:" line: ready (with the time), a different kind of input (the last key brought up a
         prompt; the call still succeeds, since every key was pressed, so look and answer it), or not ready within 600
         frames (still busy). Ready is the program's input loop, not the screen: a game that draws after it starts
-        waiting again can show a frame early. Do not use it to answer a prompt: the program leaves the prompt's loop for
-        another, so the call waits the whole 600 frames (about 10 s)."""
+        waiting again can show a frame early."""
         result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom, delay_from,
                                          wait_for_ready, until_ready)
         if isinstance(result, list):

@@ -159,6 +159,9 @@ struct QueuedOp {
     std::optional<uint64_t> waitingSince;   // type_text: waiting on the program (strobe set) since this cycle
     bool timed = false;         // press_keys: completes once the last key is read, with timings
     bool waitReady = false;     // timed: each key waits for the program to be ready for it (D10, "Ready input")
+    bool untilReady = false;    // waitReady: the end waits for that too, after the last key
+    std::optional<InputStop> then;   // untilReady: how the program went on after the last key, decided at thenCycle
+    uint64_t thenCycle = 0;
     std::vector<KeyTiming> timings;   // timed: one per applied entry; readCycle 0 until read (a read follows its apply)
     int lastKey = -1;           // timed: index in timings of the most recent key applied (-1: none yet)
     // Key
@@ -179,6 +182,7 @@ struct TimedOp {
     JoyState restore;
     bool completes = true;          // false for a sequence's KeyUp and JoyRestore ops (the sequence completes on its own)
     std::vector<KeyTiming> keys;    // Done: a timed sequence's completion, once its last hold is released
+    std::optional<InputStop> then;  // Done: its InputApplied::then
 };
 
 struct InputState {
@@ -227,6 +231,7 @@ struct ReadyWatch {
     bool taken = false;         // the program cleared the strobe after the last key
     bool ready = false;         // taken, and read from every idle place since, or back in a tight loop at one
     bool changed = false;       // taken, and then began a tight read loop from a place that is not an idle one
+    uint64_t at = 0;            // the cycle of the read that made it ready or changed
     WORD runPc = 0;             // the current run of reads from one place, each under kTightLoopGap after the last
     uint32_t runReads = 0;
     uint64_t runLast = 0;
@@ -282,6 +287,8 @@ struct ReadyWatch {
             ready = true;
         else if (tight)
             changed = true;
+        if (ready || changed)
+            at = now;
     }
 };
 ReadyWatch g_ready;
@@ -507,8 +514,10 @@ void FinishTimedSequence(QueuedOp& op, uint64_t now)
             lastRelease = (std::max)(lastRelease, t.due);
     if (lastRelease <= now) {   // done at the later of the last key's read (its own cycle) and the last entry's apply
         const uint64_t last = op.lastKey >= 0
-            ? (std::max)({op.timings[op.lastKey].readCycle, lastRelease, op.timings.back().appliedCycle}) : now;
-        g_input.applied.push_back(InputApplied{op.id, op.first, last, false, std::move(op.timings)});
+            ? (std::max)({op.timings[op.lastKey].readCycle, lastRelease, op.timings.back().appliedCycle, op.thenCycle})
+            : now;
+        g_input.applied.push_back(
+            InputApplied{op.id, op.first, last, false, std::move(op.timings), InputStop::None, op.then});
         return;
     }
     TimedOp done;
@@ -517,6 +526,7 @@ void FinishTimedSequence(QueuedOp& op, uint64_t now)
     done.due = lastRelease;   // after that release in the timed queue: equal dues go in push order
     done.first = op.first;
     done.keys = std::move(op.timings);
+    done.then = op.then;
     g_input.timed.push_back(std::move(done));
 }
 
@@ -556,7 +566,7 @@ void ProcessDueInput()
         TimedOp t = std::move(*best);
         g_input.timed.erase(best);
         if (t.kind == TimedOp::Kind::Done) {
-            g_input.applied.push_back(InputApplied{t.id, t.first, now, false, std::move(t.keys)});
+            g_input.applied.push_back(InputApplied{t.id, t.first, now, false, std::move(t.keys), InputStop::None, t.then});
             continue;
         }
         if (t.kind == TimedOp::Kind::KeyUp) {
@@ -592,8 +602,15 @@ void ProcessDueInput()
                     // end until it has taken the last key. If it began another kind of input first, the rest is not
                     // pressed; neither is it if the program does not get ready within 600 frames of the last key.
                     const bool changed = g_ready.changed;
-                    if (changed || !(atEnd ? g_ready.taken : g_ready.ready)) {
-                        if (changed || now - op.timings[op.lastKey].appliedCycle >= timeout) {
+                    const bool late = now - op.timings[op.lastKey].appliedCycle >= timeout;
+                    if (atEnd && op.untilReady && g_ready.taken) {
+                        // until_ready: every key was pressed, so the end only waits to report how the program went on
+                        if (!g_ready.ready && !changed && !late)
+                            break;
+                        op.then = g_ready.ready ? InputStop::None : changed ? InputStop::InputChanged : InputStop::NotReady;
+                        op.thenCycle = g_ready.ready || changed ? g_ready.at : now;
+                    } else if (changed || !(atEnd ? g_ready.taken : g_ready.ready)) {
+                        if (changed || late) {
                             ReportDiscarded(op.id, std::move(op.timings),
                                             changed ? InputStop::InputChanged : InputStop::NotReady);
                             g_input.fifo.pop_front();
@@ -1430,15 +1447,18 @@ uint64_t Emulator::QueueText(std::string_view text, uint32_t interKeyDelayMs)
     return g_input.fifo.back().id;
 }
 
-uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys, bool waitReady)
+uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys, bool waitReady, bool untilReady)
 {
     RequireStarted();
     if (keys.empty())
         throw std::invalid_argument("QueueKeys: no keys");
+    if (untilReady && !waitReady)
+        throw std::invalid_argument("QueueKeys: until_ready needs wait_for_ready");
     QueuedOp op;
     op.kind = QueuedOp::Kind::Sequence;
     op.timed = true;
     op.waitReady = waitReady;
+    op.untilReady = untilReady;
     for (const SequenceKey& k : keys) {
         if (waitReady && (k.joystick || k.delayMs > 0 || !k.waitForRead || k.delayFromRead))
             throw std::invalid_argument(

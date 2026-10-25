@@ -191,6 +191,23 @@ def key_report(keys, timings):
     return "\n".join(lines)
 
 
+def then_report(applied):
+    """until_ready's last line (D10, "Ready input"): how the program went on after the last key, in ms from the first
+    press; None without until_ready."""
+    then = applied.get("then")
+    if then is None:
+        return None
+    timings = applied.get("keys") or []
+    at = cycles_to_ms(applied["last_cycle"] - (timings[0]["applied_cycle"] if timings else applied["first_cycle"]))
+    if then == "ready":
+        return "then: the program was ready for the next key at {:.1f} ms".format(at)
+    if then == "input_changed":
+        return ("then: the program began waiting for a different kind of input (probably a prompt or a question) at "
+                "{:.1f} ms: look at the screen and answer it".format(at))
+    return ("then: the program was not ready for another key within {} frames of the last key: it may still be busy, "
+            "or waiting for another kind of input (an answer to a prompt ends this way)".format(INPUT_FRAME_CAP))
+
+
 def log(message):
     _logger.info(message)
 
@@ -387,12 +404,13 @@ class Machine:
         return "pressed {}".format(key)
 
     def press_keys(self, keys, look=False, frames=1, every_ms=None, region=None, zoom=None, delay_from="applied",
-                   wait_for_ready=False):
+                   wait_for_ready=False, until_ready=False):
         """The key report; with look, [report, PNG] (region/zoom as for look); with frames > 1, [report and tile
         times, contact sheet] of frames screenshots every_ms apart, the first as soon as the last key has been read
         and released. Strip arguments are checked before any key is sent. delay_from "read" counts each delay from the
         program's read of the key before it instead of from that key's apply (D10, "Read-anchored delays").
-        wait_for_ready sends each key only when the program is waiting for a command again (D10, "Ready input")."""
+        wait_for_ready sends each key only when the program is waiting for a command again (D10, "Ready input");
+        until_ready also waits for that after the last key, before the look or strip, and reports it."""
         _check_range("frames", frames, *STRIP_FRAMES_RANGE)
         if every_ms is not None:
             _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
@@ -415,6 +433,8 @@ class Machine:
             rpc_params["delay_from"] = delay_from
         if wait_for_ready:
             rpc_params["wait_for_ready"] = True
+        if until_ready:   # the harness checks it comes with wait_for_ready
+            rpc_params["until_ready"] = True
         with self.lock:
             reply = self.rpc(self.agent, "press_keys", **rpc_params)   # the harness validates every entry
             self.note_input_sent()
@@ -425,11 +445,14 @@ class Machine:
                     expected_ms += entry.get("delay_ms", 0) + entry.get("duration_ms", 0)
                 else:
                     expected_ms += entry.get("delay_ms", 0) + entry.get("hold_ms", DEFAULT_HOLD_MS)
-            applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys),
+            applied = self.await_input(reply["input_id"], expected_ms, keys=len(keys) + (1 if until_ready else 0),
                                        describe=lambda params: key_report(keys, params.get("keys") or []),
                                        settle=not strip)
             timings = applied.get("keys") or []
             report = key_report(keys, timings)
+            then = then_report(applied)
+            if then:
+                report += "\n" + then
             if strip:
                 png, cycles = self._strip_locked(box, zoom, frames, every_ms)
             elif look:
@@ -754,7 +777,7 @@ def build_server(args, machine):
     @mcp.tool()
     async def press_keys(keys: list[str | int | dict], look: bool = False, frames: int = 1,
                          every_ms: int | None = None, region: list[int] | None = None, zoom: int | None = None,
-                         delay_from: str = "applied", wait_for_ready: bool = False):
+                         delay_from: str = "applied", wait_for_ready: bool = False, until_ready: bool = False):
         """Press a timed sequence of keys in one call, timed in the machine's own time: use it for a game manoeuvre
         whose keys must land at exact moments (your thinking time between calls would otherwise sit between them).
         Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
@@ -801,9 +824,16 @@ def build_server(args, machine):
         answer it, then send the rest. Each key goes in as soon as the program is ready, so delay_ms, joystick
         entries, wait_for_read false and delay_from are not allowed with it (hold_ms is). Not for a
         program that never clears the strobe (Conan): use delay_from "read" there. Returns once the program has
-        taken the last key. It cannot answer a prompt and then move in one call: send the answer separately."""
+        taken the last key. It cannot answer a prompt and then move in one call: send the answer separately.
+        until_ready: true (with wait_for_ready only) makes the call return only once the program is ready for another
+        key after the last one, so look or frames shows the finished move and you need not guess a wait. The report
+        then ends with a "then:" line: ready (with the time), a different kind of input (the last key brought up a
+        prompt; the call still succeeds, since every key was pressed, so look and answer it), or not ready within 600
+        frames (still busy). Ready is the program's input loop, not the screen: a game that draws after it starts
+        waiting again can show a frame early. Do not use it to answer a prompt: the program leaves the prompt's loop for
+        another, so the call waits the whole 600 frames (about 10 s)."""
         result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom, delay_from,
-                                         wait_for_ready)
+                                         wait_for_ready, until_ready)
         if isinstance(result, list):
             return [result[0], Image(data=result[1], format="png")]
         return result

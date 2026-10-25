@@ -97,6 +97,9 @@ struct InputApplied {
     bool discarded = false;
     std::vector<KeyTiming> keys;   // press_keys only
     InputStop stopped = InputStop::None;   // a discarded wait_for_ready sequence only
+    // An until_ready sequence (completed): what the program did after taking the last key, decided at lastCycle. None:
+    // it was ready for another key; InputChanged: it began another kind of input; NotReady: neither within 600 frames.
+    std::optional<InputStop> then;
 };
 
 // Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is the session speed, applied to AppleWin's g_dwSpeed for realtime steps only (0..40; 10 = authentic,
@@ -200,7 +203,10 @@ public:
     // discarded, InputStop::InputChanged); 600 frames without either, the same (InputStop::NotReady). The sequence
     // completes when the program has taken the last key. Entries must be plain keys with no delay, waitForRead true and
     // no delayFromRead (std::invalid_argument otherwise).
-    uint64_t QueueKeys(std::vector<SequenceKey> keys, bool waitReady = false);
+    // untilReady (waitReady only, std::invalid_argument otherwise): once the program has taken the last key, the
+    // sequence completes when it is ready for another key, began another kind of input, or after 600 frames of neither
+    // (InputApplied::then); every key was pressed, so it is not discarded.
+    uint64_t QueueKeys(std::vector<SequenceKey> keys, bool waitReady = false, bool untilReady = false);
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);
     // The input events still pending (M6 queue cap): each queued key is 1, each key of a queued text or sequence still

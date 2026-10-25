@@ -401,6 +401,8 @@ void Session::SendInputApplied()
                 params["first_cycle"] = nullptr;
                 params["last_cycle"] = nullptr;
                 params["discarded"] = true;
+                if (a.stopped != InputStop::None)   // a wait_for_ready sequence that ended early (D10, "Ready input")
+                    params["stopped"] = a.stopped == InputStop::InputChanged ? "input_changed" : "not_ready";
             } else {
                 params["first_cycle"] = a.firstCycle;
                 params["last_cycle"] = a.lastCycle;
@@ -819,6 +821,9 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
         InvalidParams(std::string(where) + "delay_from must be \"applied\" or \"read\"");
     };
     const bool sequenceFromRead = *delayFrom(params, "", false);
+    // wait_for_ready (D10, "Ready input"): each key waits until the program is ready for it, so no timing of its own.
+    const bool waitReady = GetBool(params, "wait_for_ready", false);
+    if (waitReady && sequenceFromRead) InvalidParams("wait_for_ready cannot be combined with delay_from \"read\"");
     std::vector<SequenceKey> keys;
     uint64_t events = 0;   // pending-event slots: a key 1, a joystick entry 1 or, with a duration, 2
     for (const json& entry : *list) {
@@ -850,10 +855,16 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
         // from the apply, and a joystick entry counts from the read of the key before it (without the 1 ms guard).
         k.delayFromRead = entryFromRead.value_or(sequenceFromRead && (k.joystick || k.waitForRead));
         k.delayMs = uint32_t(GetUint(item, "delay_ms", 0, kMaxKeyDelayMs, 0));
+        if (waitReady) {
+            if (k.joystick) InvalidParams("wait_for_ready does not allow joystick entries");
+            if (entryFromRead) InvalidParams("wait_for_ready does not allow delay_from on an entry");
+            if (!k.waitForRead) InvalidParams("wait_for_ready does not allow wait_for_read false");
+            if (k.delayMs > 0) InvalidParams("wait_for_ready does not allow delay_ms: each key goes in when the program is ready");
+        }
         keys.push_back(k);
     }
     RequireInputRoom(events);
-    const uint64_t id = emulator_.QueueKeys(std::move(keys));
+    const uint64_t id = emulator_.QueueKeys(std::move(keys), waitReady);
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
 }

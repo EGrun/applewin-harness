@@ -344,9 +344,19 @@ class Machine:
             if input_id in self.applied:
                 params = self.applied.pop(input_id)
                 if params.get("discarded"):   # the harness dropped keys the program did not read (D10)
-                    message = ("the keyboard wasn't read within {} frames: the program may not be reading keys (it "
-                               "may be busy), and the rest of the keys were dropped. Call wait to let time pass, then "
-                               "look.".format(INPUT_FRAME_CAP))
+                    stopped = params.get("stopped")   # wait_for_ready (D10, "Ready input")
+                    if stopped == "input_changed":
+                        message = ("stopped: the program began waiting for a different kind of input (probably a "
+                                   "prompt or a question) before it was ready for the next key, so the rest of the "
+                                   "keys were not pressed. Look at the screen, answer it, then send the rest again.")
+                    elif stopped == "not_ready":
+                        message = ("the program was not ready for the next key within {} frames, so the rest of the "
+                                   "keys were not pressed. It may be busy, or waiting for another kind of input. Call "
+                                   "wait to let time pass, then look.".format(INPUT_FRAME_CAP))
+                    else:
+                        message = ("the keyboard wasn't read within {} frames: the program may not be reading keys "
+                                   "(it may be busy), and the rest of the keys were dropped. Call wait to let time "
+                                   "pass, then look.".format(INPUT_FRAME_CAP))
                     raise ToolError(message + ("\n" + describe(params) if describe else ""))
                 if settle:
                     self.advance(SETTLE_FRAMES)   # let the program echo the last key
@@ -376,11 +386,13 @@ class Machine:
             self.await_input(reply["input_id"], hold_ms if hold_ms > 0 else DEFAULT_HOLD_MS)
         return "pressed {}".format(key)
 
-    def press_keys(self, keys, look=False, frames=1, every_ms=None, region=None, zoom=None, delay_from="applied"):
+    def press_keys(self, keys, look=False, frames=1, every_ms=None, region=None, zoom=None, delay_from="applied",
+                   wait_for_ready=False):
         """The key report; with look, [report, PNG] (region/zoom as for look); with frames > 1, [report and tile
         times, contact sheet] of frames screenshots every_ms apart, the first as soon as the last key has been read
         and released. Strip arguments are checked before any key is sent. delay_from "read" counts each delay from the
-        program's read of the key before it instead of from that key's apply (D10, "Read-anchored delays")."""
+        program's read of the key before it instead of from that key's apply (D10, "Read-anchored delays").
+        wait_for_ready sends each key only when the program is waiting for a command again (D10, "Ready input")."""
         _check_range("frames", frames, *STRIP_FRAMES_RANGE)
         if every_ms is not None:
             _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
@@ -401,6 +413,8 @@ class Machine:
         rpc_params = {"keys": keys}
         if delay_from != "applied":   # the harness's default; anything else is passed on and validated there
             rpc_params["delay_from"] = delay_from
+        if wait_for_ready:
+            rpc_params["wait_for_ready"] = True
         with self.lock:
             reply = self.rpc(self.agent, "press_keys", **rpc_params)   # the harness validates every entry
             self.note_input_sent()
@@ -740,7 +754,7 @@ def build_server(args, machine):
     @mcp.tool()
     async def press_keys(keys: list[str | int | dict], look: bool = False, frames: int = 1,
                          every_ms: int | None = None, region: list[int] | None = None, zoom: int | None = None,
-                         delay_from: str = "applied"):
+                         delay_from: str = "applied", wait_for_ready: bool = False):
         """Press a timed sequence of keys in one call, timed in the machine's own time: use it for a game manoeuvre
         whose keys must land at exact moments (your thinking time between calls would otherwise sit between them).
         Each entry is a key as for press_key (not RESET), or {"key": ..., "delay_ms": ..., "hold_ms": ...}:
@@ -775,8 +789,21 @@ def build_server(args, machine):
         look: a strip of screenshots as for look, the first taken as soon as the last key has been read and released,
         with tile times in ms from the last key's press. region and zoom (as for look) apply to look or to the
         strip; region is in Apple pixels, so halve coordinates read off a 560x384 screenshot. Strip arguments are
-        checked before any key is pressed."""
-        result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom, delay_from)
+        checked before any key is pressed.
+        wait_for_ready: true sends each key only when the program is waiting for its next command again, instead of
+        after a delay you guess: use it for a run of moves in a turn-based game, where a move takes longer the more
+        the game has to do (a key sent while it is still working is lost) and a move may bring up a question. A key
+        counts as taken only when the program clears the keyboard strobe, and "ready" is the program reading the
+        keyboard again from every place it read it from while the first key waited to be taken (its input loop),
+        so the call may start while the game is still busy. If the program instead starts
+        waiting for a different kind of input before it is ready (a prompt, a question), the rest of the keys are
+        NOT pressed and the call fails, listing the keys pressed and those not, so no key lands in the answer;
+        answer it, then send the rest. Each key goes in as soon as the program is ready, so delay_ms, joystick
+        entries, wait_for_read false and delay_from are not allowed with it (hold_ms is). Not for a
+        program that never clears the strobe (Conan): use delay_from "read" there. Returns once the program has
+        taken the last key. It cannot answer a prompt and then move in one call: send the answer separately."""
+        result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom, delay_from,
+                                         wait_for_ready)
         if isinstance(result, list):
             return [result[0], Image(data=result[1], format="png")]
         return result

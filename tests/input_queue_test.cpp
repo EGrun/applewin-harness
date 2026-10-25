@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma warning(push, 3)
@@ -903,6 +904,162 @@ TEST_CASE("press_keys: a sequence ending in a joystick entry completes no earlie
     CHECK(a.lastCycle >= a.keys[0].readCycle);
     e.QueueJoystick(Centred(), 0);
     CHECK(e.RunFrames(1));
+}
+
+namespace {
+// A 6502 program that behaves like a turn-based BASIC game (D10, "Ready input"). Idle, it polls $C000 from two places
+// (A at $0300 and B at $0308), 12.5 ms apart. A key it finds there is taken (STA $C010) and starts a 380 ms "move" in
+// which it polls from a third place (C, $0324) and ignores any key it finds, as BASIC's Ctrl-C check does. After the
+// move for 'P' it asks a question, as BAM does on the staircase: a tight read loop (D, $0338) that takes keys until
+// RETURN, then makes another move (the answer's) before it is idle again.
+//   idle:  0300 LDA $C000 / BMI take / JSR delay / 0308 LDA $C000 / BMI take / JSR delay / JMP idle
+//   take:  0316 STA $C010 / STA $0381 / LDA #30 / STA $0380
+//          move: JSR delay / 0324 LDA $C000 / DEC $0380 / BNE move / LDA $0381 / CMP #$D0 / BEQ prompt / JMP idle
+//   prompt: 0338 LDA $C000 / BPL prompt / 033D LDA $C000 (the fetch, as the //e ROM's) / STA $C010 / CMP #$8D /
+//           BNE prompt / JMP $0319 (a move, RETURN kept)
+//   delay: 0360 LDX #10 / LDY #255 / DEY / BNE / DEX / BNE / RTS (about 12.5 ms)
+void StartTurnBasedGame(Emulator& e)
+{
+    const std::vector<std::pair<int, std::vector<uint8_t>>> program = {
+        {0x300, {0xAD, 0x00, 0xC0, 0x30, 0x11, 0x20, 0x60, 0x03, 0xAD, 0x00, 0xC0, 0x30, 0x09, 0x20, 0x60, 0x03,
+                 0x4C, 0x00, 0x03}},
+        {0x316, {0x8D, 0x10, 0xC0, 0x8D, 0x81, 0x03, 0xA9, 0x1E, 0x8D, 0x80, 0x03, 0x20, 0x60, 0x03, 0xAD, 0x00, 0xC0,
+                 0xCE, 0x80, 0x03, 0xD0, 0xF5, 0xAD, 0x81, 0x03, 0xC9, 0xD0, 0xF0, 0x05, 0x4C, 0x00, 0x03}},
+        {0x338, {0xAD, 0x00, 0xC0, 0x10, 0xFB, 0xAD, 0x00, 0xC0, 0x8D, 0x10, 0xC0, 0xC9, 0x8D, 0xD0, 0xF1, 0x4C, 0x19,
+                 0x03}},
+        {0x360, {0xA2, 0x0A, 0xA0, 0xFF, 0x88, 0xD0, 0xFD, 0xCA, 0xD0, 0xF8, 0x60}},
+    };
+    std::vector<std::string> pokes;
+    for (const auto& [address, bytes] : program)
+        for (size_t i = 0; i < bytes.size(); ++i)
+            pokes.push_back("POKE " + std::to_string(address + int(i)) + "," + std::to_string(bytes[i]));
+    for (size_t i = 0; i < pokes.size(); i += 12) {
+        std::string line;
+        for (size_t j = i; j < (std::min)(pokes.size(), i + 12); ++j)
+            line += (line.empty() ? "" : ":") + pokes[j];
+        e.QueueText(line + "\r", 0);
+        REQUIRE(e.RunFrames(120));
+    }
+    e.QueueText("CALL 768\r", 0);
+    REQUIRE(e.RunFrames(60));
+    (void)e.TakeAppliedInputs();
+}
+
+// Queues the sequence with wait_for_ready and runs until it is reported (completed or not); within `frames` frames.
+InputApplied RunReadySequence(Emulator& e, std::vector<SequenceKey> keys, int frames = 1500)
+{
+    const uint64_t id = e.QueueKeys(std::move(keys), true);
+    for (int i = 0; i < frames / 5; ++i) {
+        REQUIRE(e.RunFrames(5));
+        if (const auto a = FindApplied(e.TakeAppliedInputs(), id))
+            return *a;
+    }
+    FAIL("the sequence was not reported");
+    return {};
+}
+}  // namespace
+
+TEST_CASE("press_keys wait_for_ready: a key goes in only when the program is idle again, which wait_for_read does not do")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    // A move takes about 380 ms. The next key goes in about a millisecond after the previous one is read, in the middle
+    // of the move: it is not lost here only because this program keeps it, a BASIC game replaces it.
+    const InputApplied plain = RunSequence(e, {Key('A', 0), Key('A', 0)});
+    REQUIRE(plain.keys.size() == 2);
+    CHECK(plain.keys[1].appliedCycle - plain.keys[0].appliedCycle < MsToCycles(30));
+    REQUIRE(e.RunFrames(240));   // the moves finish
+    (void)e.TakeAppliedInputs();
+
+    const InputApplied ready = RunReadySequence(e, {Key('A', 0), Key('A', 0), Key('A', 0)});
+    CHECK(!ready.discarded);
+    CHECK(ready.stopped == InputStop::None);
+    REQUIRE(ready.keys.size() == 3);
+    for (size_t i = 0; i < ready.keys.size(); ++i) {
+        CHECK(ready.keys[i].readCycle >= ready.keys[i].appliedCycle);
+        if (i > 0) {   // each key waited for the whole move, then went in right after the program was idle
+            CHECK(ready.keys[i].appliedCycle - ready.keys[i - 1].appliedCycle >= MsToCycles(380));
+            CHECK(ready.keys[i].appliedCycle - ready.keys[i - 1].appliedCycle < MsToCycles(380 + 60));
+        }
+    }
+}
+
+TEST_CASE("press_keys wait_for_ready: the sequence stops when the program starts a prompt, before any stray key")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    const uint64_t id = e.QueueKeys({Key('A', 0), Key('P', 0), Key('A', 0), Key('A', 0)}, true);
+    std::optional<InputApplied> stopped;
+    for (int i = 0; i < 300 && !stopped; ++i) {   // one frame at a time, so the answer below follows the stop at once
+        REQUIRE(e.RunFrames(1));
+        stopped = FindApplied(e.TakeAppliedInputs(), id);
+    }
+    REQUIRE(stopped.has_value());
+    const InputApplied a = *stopped;
+    CHECK(a.discarded);
+    CHECK(a.stopped == InputStop::InputChanged);
+    REQUIRE(a.keys.size() == 2);   // A and P were pressed, the two after the prompt appeared were not
+    CHECK(a.keys[1].readCycle > 0);
+
+    // The prompt is still waiting for its key: nothing was typed into it, and a sequence begun here, at once, may
+    // answer it. The place the move polled from, just before the prompt began, is not an idle place here.
+    const uint64_t answerId = e.QueueKeys({Key('Y', 0), Key('\r', 0)}, true);
+    REQUIRE(e.RunFrames(2));
+    const auto answer = FindApplied(e.TakeAppliedInputs(), answerId);
+    REQUIRE(answer.has_value());
+    CHECK(!answer->discarded);
+    REQUIRE(answer->keys.size() == 2);
+    CHECK(answer->keys[1].appliedCycle - answer->keys[0].appliedCycle < MsToCycles(2));   // the prompt was ready at once
+
+    // Moves sent straight after the answer, while the program is still busy with it: the first waits until the idle
+    // loop takes it, and that loop is what the call learns, not the prompt's.
+    const InputApplied moves = RunReadySequence(e, {Key('A', 0), Key('A', 0)});
+    CHECK(!moves.discarded);
+    CHECK(moves.keys.size() == 2);
+}
+
+TEST_CASE("press_keys wait_for_ready: a program that is never ready again drops the rest after 600 frames")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    e.QueueKey(KeySpec(uint8_t('P')), 0);   // a move, then the prompt
+    REQUIRE(e.RunFrames(45));
+    (void)e.TakeAppliedInputs();
+
+    // The idle place learned at the first key is the prompt's own loop, which the program leaves once it has RETURN.
+    const InputApplied a = RunReadySequence(e, {Key('\r', 0), Key('A', 0)});
+    CHECK(a.discarded);
+    CHECK(a.stopped == InputStop::NotReady);
+    REQUIRE(a.keys.size() == 1);
+    CHECK(a.lastCycle == 0);
+}
+
+TEST_CASE("press_keys wait_for_ready: only plain keys that wait for the program are allowed")
+{
+    auto& e = StartedEmulator();
+    PowerCycleOnExit restore{e};
+    e.PowerCycle();
+    REQUIRE(e.RunFrames(2));
+
+    SequenceKey delayed = Key('A', 0);
+    delayed.delayMs = 10;
+    SequenceKey unwaiting = Key('A', 0);
+    unwaiting.waitForRead = false;
+    SequenceKey fromRead = Key('A', 0, true);
+    CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), delayed}, true), std::invalid_argument);
+    CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), unwaiting}, true), std::invalid_argument);
+    CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), fromRead}, true), std::invalid_argument);
+    CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), JoyEntry(X(10), 0, 0)}, true), std::invalid_argument);
+    CHECK(e.PendingInputEvents() == 0);
 }
 
 TEST_CASE("input: RESET returns to the BASIC prompt without waiting for the strobe")

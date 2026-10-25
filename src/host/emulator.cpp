@@ -51,6 +51,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <string>
@@ -157,6 +158,7 @@ struct QueuedOp {
     uint64_t earliest = 0;      // the next key is not due before this cycle
     std::optional<uint64_t> waitingSince;   // type_text: waiting on the program (strobe set) since this cycle
     bool timed = false;         // press_keys: completes once the last key is read, with timings
+    bool waitReady = false;     // timed: each key waits for the program to be ready for it (D10, "Ready input")
     std::vector<KeyTiming> timings;   // timed: one per applied entry; readCycle 0 until read (a read follows its apply)
     int lastKey = -1;           // timed: index in timings of the most recent key applied (-1: none yet)
     // Key
@@ -210,25 +212,135 @@ iofunction g_appleC00xRead = nullptr;   // AppleWin's handler
 bool g_awaitingRead = false;                // a timed sequence pressed a key and waits for the program's read of it
 std::optional<uint64_t> g_keyboardReadAt;   // the cycle of that read, once it happened
 
+// What the harness sees of how the program uses the keyboard, for press_keys wait_for_ready (D10, "Ready input"): the
+// places (program counters) it reads $C000-$C00F from, and the strobe being cleared.
+const uint64_t kIdleWindowCycles = MsToBaseCycles(300);   // the reads before the first key was taken that make up "idle"
+constexpr uint32_t kTightLoopReads = 64;   // this many reads in a row from one place, each under
+constexpr uint64_t kTightLoopGap = 100;    // this many cycles after the last, are a tight input loop (a prompt)
+
+struct ReadyWatch {
+    std::map<WORD, uint64_t> waiting;   // the first key's wait: each place read from while it was not taken, and when last
+    std::set<WORD> idle;        // where the program reads the keyboard when it waits for input: learned from the first key
+    std::set<WORD> since;       // the places it has read from since it took the last key
+    bool learning = false;      // the first key of a sequence is waiting to be taken
+    bool watching = false;      // a wait_for_ready key was pressed and the program has not cleared the strobe yet
+    bool taken = false;         // the program cleared the strobe after the last key
+    bool ready = false;         // taken, and read from every idle place since, or back in a tight loop at one
+    bool changed = false;       // taken, and then began a tight read loop from a place that is not an idle one
+    WORD runPc = 0;             // the current run of reads from one place, each under kTightLoopGap after the last
+    uint32_t runReads = 0;
+    uint64_t runLast = 0;
+
+    void Reset() { *this = ReadyWatch{}; }
+
+    // A wait_for_ready key was just put in the latch.
+    void KeyPressed(bool first)
+    {
+        if (first) {
+            waiting.clear();
+            idle.clear();
+            learning = true;
+        }
+        watching = true;
+        taken = ready = changed = false;
+    }
+
+    // The idle places are where the program read the keyboard in the 300 ms before it took the first key: the loop
+    // that found it, whether the program was idle when the key went in, still busy, or at a prompt.
+    void StrobeCleared(uint64_t now)
+    {
+        runReads = 0;   // the program left the loop it took the key in, even if it comes back to it
+        if (!watching)
+            return;
+        if (learning) {
+            for (const auto& [pc, last] : waiting)
+                if (now - last <= kIdleWindowCycles)
+                    idle.insert(pc);
+            learning = false;
+        }
+        watching = false;
+        taken = true;
+        since.clear();
+    }
+
+    // The program read $C000-$C00F at pc.
+    void Read(WORD pc, uint64_t now)
+    {
+        runReads = (pc == runPc && now - runLast < kTightLoopGap) ? runReads + 1 : 1;
+        runPc = pc;
+        runLast = now;
+        if (learning)
+            waiting[pc] = now;
+        if (!taken || ready || changed)
+            return;
+        since.insert(pc);
+        // A tight loop is an input loop: at an idle place the program waits for the next key (an idle place that only
+        // reads once a key is there, as a prompt's fetch after its wait loop does, never comes round); elsewhere it
+        // began another kind of input.
+        const bool tight = runReads >= kTightLoopReads;
+        if (std::includes(since.begin(), since.end(), idle.begin(), idle.end()) || (tight && idle.count(pc)))
+            ready = true;
+        else if (tight)
+            changed = true;
+    }
+};
+ReadyWatch g_ready;
+
 BYTE __stdcall KeyboardReadTap(WORD pc, WORD addr, BYTE writeFlag, BYTE writeValue, ULONG executedCycles)
 {
+    // The read's own cycle, as AppleWin's I/O handlers time themselves (JoyReadPosition): CpuCalcCycles brings
+    // g_nCumulativeCycles up to this instruction and is safe to call again in the same handler (D10).
+    CpuCalcCycles(executedCycles);
+    const uint64_t now = EmulatedNow();
+    g_ready.Read(pc, now);
     if (g_awaitingRead) {
-        // The read's own cycle, as AppleWin's I/O handlers time themselves (JoyReadPosition): CpuCalcCycles brings
-        // g_nCumulativeCycles up to this instruction and is safe to call again in the same handler (D10).
-        CpuCalcCycles(executedCycles);
-        g_keyboardReadAt = EmulatedNow();
+        g_keyboardReadAt = now;
         g_awaitingRead = false;
     }
     return g_appleC00xRead(pc, addr, writeFlag, writeValue, executedCycles);
 }
 
-// AppleWin rebuilds IORead at MemInitialize and on a snapshot load (MemInitializeFromSnapshot): re-tap when it did.
+// $C010-$C01F: whether the program cleared the strobe (it took the key) is decided by AppleWin's own handler: the strobe
+// was set before it and is clear after.
+iofunction g_appleC01xRead = nullptr;
+iofunction g_appleC01xWrite = nullptr;
+
+BYTE __stdcall StrobeReadTap(WORD pc, WORD addr, BYTE writeFlag, BYTE writeValue, ULONG executedCycles)
+{
+    if ((addr & 0xF) != 0)   // $C011-$C01F are status reads
+        return g_appleC01xRead(pc, addr, writeFlag, writeValue, executedCycles);
+    const bool wasSet = !StrobeClear();
+    const BYTE result = g_appleC01xRead(pc, addr, writeFlag, writeValue, executedCycles);
+    if (wasSet && StrobeClear()) {
+        CpuCalcCycles(executedCycles);
+        g_ready.StrobeCleared(EmulatedNow());
+    }
+    return result;
+}
+
+BYTE __stdcall StrobeWriteTap(WORD pc, WORD addr, BYTE writeFlag, BYTE writeValue, ULONG executedCycles)
+{
+    const bool wasSet = !StrobeClear();
+    const BYTE result = g_appleC01xWrite(pc, addr, writeFlag, writeValue, executedCycles);
+    if (wasSet && StrobeClear()) {
+        CpuCalcCycles(executedCycles);
+        g_ready.StrobeCleared(EmulatedNow());
+    }
+    return result;
+}
+
+// AppleWin rebuilds IORead and IOWrite at MemInitialize and on a snapshot load (MemInitializeFromSnapshot): re-tap
+// when it did.
 void TapKeyboardReads()
 {
     if (IORead[0] == KeyboardReadTap)
         return;
     g_appleC00xRead = IORead[0];
     IORead[0] = KeyboardReadTap;
+    g_appleC01xRead = IORead[1];
+    IORead[1] = StrobeReadTap;
+    g_appleC01xWrite = IOWrite[1];
+    IOWrite[1] = StrobeWriteTap;
 }
 
 // The key's own VK where AppleWin's AKD table accepts one, VK_SPACE otherwise.
@@ -269,12 +381,13 @@ void Complete(uint64_t id, uint64_t first, uint64_t last)
 }
 
 // Reports an input that never took (full) effect (ruling D1; D10's sequence timeout, with the keys it pressed).
-void ReportDiscarded(uint64_t id, std::vector<KeyTiming> keys = {})
+void ReportDiscarded(uint64_t id, std::vector<KeyTiming> keys = {}, InputStop stopped = InputStop::None)
 {
     InputApplied a;
     a.inputId = id;
     a.discarded = true;
     a.keys = std::move(keys);
+    a.stopped = stopped;
     g_input.applied.push_back(std::move(a));
 }
 
@@ -303,6 +416,7 @@ void ClearInput()
     g_input.fifo.clear();
     g_awaitingRead = false;   // no sequence waits for a read any more
     g_keyboardReadAt.reset();
+    g_ready.Reset();   // its cycles belong to the timeline that was just dropped
 }
 
 // Drops every queued input and releases held keys, reporting each dropped id once as discarded (ruling D1): the inputs
@@ -473,26 +587,42 @@ void ProcessDueInput()
                 if (op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0 && g_keyboardReadAt)
                     op.timings[op.lastKey].readCycle = *g_keyboardReadAt;   // the read's own cycle (the tap)
                 const bool atEnd = op.next >= op.steps.size();
-                // delay_from read: the delay counts from the read of the most recent key, so the entry waits for it
-                // too; with no key before it, the entry counts as delay_from applied (D10, "Read-anchored delays").
-                const bool fromRead = !atEnd && op.steps[op.next].fromRead && op.lastKey >= 0;
-                const bool dependsOnRead =
-                    atEnd || fromRead || (!op.steps[op.next].joystick && op.steps[op.next].waitForRead);
-                if (dependsOnRead && op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0) {
-                    if (now - op.timings[op.lastKey].appliedCycle >= timeout) {
-                        // unread 600 frames after its press: the rest is dropped, reported with the entries applied
-                        ReportDiscarded(op.id, std::move(op.timings));
-                        g_input.fifo.pop_front();
-                        continue;
+                if (op.waitReady && op.lastKey >= 0) {
+                    // wait_for_ready (D10, "Ready input"): the next key waits until the program is ready for it, the
+                    // end until it has taken the last key. If it began another kind of input first, the rest is not
+                    // pressed; neither is it if the program does not get ready within 600 frames of the last key.
+                    const bool changed = g_ready.changed;
+                    if (changed || !(atEnd ? g_ready.taken : g_ready.ready)) {
+                        if (changed || now - op.timings[op.lastKey].appliedCycle >= timeout) {
+                            ReportDiscarded(op.id, std::move(op.timings),
+                                            changed ? InputStop::InputChanged : InputStop::NotReady);
+                            g_input.fifo.pop_front();
+                            continue;
+                        }
+                        break;
                     }
-                    break;
+                } else {
+                    // delay_from read: the delay counts from the read of the most recent key, so the entry waits for it
+                    // too; with no key before it, the entry counts as delay_from applied (D10, "Read-anchored delays").
+                    const bool fromRead = !atEnd && op.steps[op.next].fromRead && op.lastKey >= 0;
+                    const bool dependsOnRead =
+                        atEnd || fromRead || (!op.steps[op.next].joystick && op.steps[op.next].waitForRead);
+                    if (dependsOnRead && op.lastKey >= 0 && op.timings[op.lastKey].readCycle == 0) {
+                        if (now - op.timings[op.lastKey].appliedCycle >= timeout) {
+                            // unread 600 frames after its press: the rest is dropped, reported with the entries applied
+                            ReportDiscarded(op.id, std::move(op.timings));
+                            g_input.fifo.pop_front();
+                            continue;
+                        }
+                        break;
+                    }
                 }
-                if (atEnd) {   // the last key has been read (if there is one)
+                if (atEnd) {   // the last key has been read (taken, for wait_for_ready), if there is one
                     FinishTimedSequence(op, now);
                     g_input.fifo.pop_front();
                     continue;
                 }
-                if (now < SequenceDue(op))
+                if (!op.waitReady && now < SequenceDue(op))
                     break;
             } else {
                 // type_text: each key waits until the strobe is clear.
@@ -525,6 +655,8 @@ void ProcessDueInput()
                 }
             } else {
                 PressKey(s.key, s.holdCycles, op.id, now, false);
+                if (op.waitReady)
+                    g_ready.KeyPressed(op.next == 0);
             }
             if (!op.started) {
                 op.started = true;
@@ -799,7 +931,7 @@ std::optional<uint64_t> NextSequenceDue()
             consider(t.due);
     if (!g_input.fifo.empty()) {
         const QueuedOp& op = g_input.fifo.front();
-        if (op.kind == QueuedOp::Kind::Sequence && op.timed && op.next < op.steps.size()) {
+        if (op.kind == QueuedOp::Kind::Sequence && op.timed && !op.waitReady && op.next < op.steps.size()) {
             const SeqStep& s = op.steps[op.next];
             const bool waitsForRead = (s.fromRead || (!s.joystick && s.waitForRead)) && op.lastKey >= 0;
             if (!waitsForRead || op.timings[op.lastKey].readCycle != 0)
@@ -1298,7 +1430,7 @@ uint64_t Emulator::QueueText(std::string_view text, uint32_t interKeyDelayMs)
     return g_input.fifo.back().id;
 }
 
-uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys)
+uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys, bool waitReady)
 {
     RequireStarted();
     if (keys.empty())
@@ -1306,7 +1438,11 @@ uint64_t Emulator::QueueKeys(std::vector<SequenceKey> keys)
     QueuedOp op;
     op.kind = QueuedOp::Kind::Sequence;
     op.timed = true;
+    op.waitReady = waitReady;
     for (const SequenceKey& k : keys) {
+        if (waitReady && (k.joystick || k.delayMs > 0 || !k.waitForRead || k.delayFromRead))
+            throw std::invalid_argument(
+                "QueueKeys: a wait_for_ready sequence takes plain keys, with no delay, that wait for the program");
         if (!k.joystick) {
             if (std::holds_alternative<ResetKey>(k.key))
                 throw std::invalid_argument("QueueKeys: RESET is not allowed in a sequence");

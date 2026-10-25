@@ -81,6 +81,10 @@ struct KeyTiming {
     bool joystick = false;
 };
 
+// Why a wait_for_ready sequence ended early (D10, "Ready input"): the program switched to another kind of input
+// before it was ready for the next key (a prompt), or did not become ready within 600 frames.
+enum class InputStop { None, InputChanged, NotReady };
+
 // An input that has fully taken effect. type_text: the cycles at which the first and the last key were applied.
 // press_key and set_joystick: the press (or change) and the release (or restore); equal when there is no hold or
 // duration. press_keys: the first press, and the later of the last read and the last release, with keys holding each
@@ -92,6 +96,7 @@ struct InputApplied {
     uint64_t inputId = 0, firstCycle = 0, lastCycle = 0;
     bool discarded = false;
     std::vector<KeyTiming> keys;   // press_keys only
+    InputStop stopped = InputStop::None;   // a discarded wait_for_ready sequence only
 };
 
 // Speed settings (D11; docs/specs/m3.md Part C). machineSpeed is the session speed, applied to AppleWin's g_dwSpeed for realtime steps only (0..40; 10 = authentic,
@@ -188,7 +193,14 @@ public:
     // order; the last key, or a key a waiting entry depends on, unread 600 frames after its press discards the
     // sequence (reporting the entries applied). Throws std::invalid_argument for no entries, RESET or an ASCII code
     // above 127.
-    uint64_t QueueKeys(std::vector<SequenceKey> keys);
+    // waitReady (D10, "Ready input"): each key after the first goes in when the program is waiting for a command
+    // again, not when it merely read the previous key: it took the previous key (cleared the strobe) and has since read
+    // the keyboard from every place it read from in the 300 ms before it took the first key. If, before that, it starts a tight
+    // read loop (64 reads, each under 100 cycles after the last) from another place, the rest is not pressed (reported
+    // discarded, InputStop::InputChanged); 600 frames without either, the same (InputStop::NotReady). The sequence
+    // completes when the program has taken the last key. Entries must be plain keys with no delay, waitForRead true and
+    // no delayFromRead (std::invalid_argument otherwise).
+    uint64_t QueueKeys(std::vector<SequenceKey> keys, bool waitReady = false);
     // JoySetPosition / JoySetButton. durationMs > 0 queues a restore of the previous state durationMs later.
     uint64_t QueueJoystick(JoystickChange change, uint32_t durationMs);
     // The input events still pending (M6 queue cap): each queued key is 1, each key of a queued text or sequence still

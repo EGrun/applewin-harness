@@ -789,6 +789,24 @@ class AgentMethodsTest(PipeTestCase):
             with self.subTest(**params):
                 self.assertIn("input_id", agent.call("press_keys", **params))
 
+    def test_press_keys_wait_for_ready_is_validated(self):
+        h = self.launch()
+        self.stepped_session(h)
+        agent = h.connect("agent")
+        for params in ({"keys": ["A"], "wait_for_ready": "yes"},
+                       {"keys": ["A", {"key": "B", "delay_ms": 10}], "wait_for_ready": True},
+                       {"keys": ["A", {"key": "B", "wait_for_read": False}], "wait_for_ready": True},
+                       {"keys": ["A", {"key": "B", "delay_from": "applied"}], "wait_for_ready": True},
+                       {"keys": ["A", {"joystick": {"x": 1}}], "wait_for_ready": True},
+                       {"keys": ["A", "B"], "wait_for_ready": True, "delay_from": "read"}):
+            with self.subTest(**params):
+                self.assertRpcError(-32602, agent, "press_keys", **params)
+        for params in ({"keys": ["A", "B"], "wait_for_ready": True},
+                       {"keys": ["A", {"key": "B", "hold_ms": 0}], "wait_for_ready": True, "delay_from": "applied"},
+                       {"keys": ["A", {"key": "B", "delay_ms": 10}], "wait_for_ready": False}):
+            with self.subTest(**params):
+                self.assertIn("input_id", agent.call("press_keys", **params))
+
     def poll_loop_gap(self, run_mode):
         """A 6502 loop polling $C000 every 92,240 cycles; returns (read(B) - read(A), applied(B) - read(A)) for
         press_keys A, B +200 ms counted from the read (D10, "Read-anchored delays")."""

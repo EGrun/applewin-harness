@@ -759,6 +759,100 @@ class ReadAnchoredTimingTest(AdapterTestCase):
         self.run_async(go)
 
 
+
+class ReadyInputTest(AdapterTestCase):
+    """press_keys wait_for_ready (D10, "Ready input") against a 6502 program that behaves like a turn-based BASIC game:
+    idle, it polls $C000 from two places 12.5 ms apart; a key it finds is taken (strobe cleared) and starts a 380 ms
+    "move" in which it polls from a third place and ignores keys; after the move for P it asks a question, a tight
+    read loop that takes keys until RETURN and then makes another move before it is idle again."""
+
+    PROGRAM = [
+        (0x300, [0xAD, 0x00, 0xC0, 0x30, 0x11, 0x20, 0x60, 0x03, 0xAD, 0x00, 0xC0, 0x30, 0x09, 0x20, 0x60, 0x03,
+                 0x4C, 0x00, 0x03]),
+        (0x316, [0x8D, 0x10, 0xC0, 0x8D, 0x81, 0x03, 0xA9, 0x1E, 0x8D, 0x80, 0x03, 0x20, 0x60, 0x03, 0xAD, 0x00, 0xC0,
+                 0xCE, 0x80, 0x03, 0xD0, 0xF5, 0xAD, 0x81, 0x03, 0xC9, 0xD0, 0xF0, 0x05, 0x4C, 0x00, 0x03]),
+        (0x338, [0xAD, 0x00, 0xC0, 0x10, 0xFB, 0xAD, 0x00, 0xC0, 0x8D, 0x10, 0xC0, 0xC9, 0x8D, 0xD0, 0xF1, 0x4C, 0x19,
+                 0x03]),
+        (0x360, [0xA2, 0x0A, 0xA0, 0xFF, 0x88, 0xD0, 0xFD, 0xCA, 0xD0, 0xF8, 0x60]),
+    ]
+
+    async def start_game(self, s):
+        await call(s, "wait", ms=12000)   # boot DOS 3.3
+        pokes = ["POKE {},{}".format(address + i, b) for address, code in self.PROGRAM for i, b in enumerate(code)]
+        for i in range(0, len(pokes), 12):
+            await call(s, "type_text", text=":".join(pokes[i:i + 12]) + "\n")
+        await call(s, "type_text", text="CALL 768\n")
+        await call(s, "wait", ms=500)
+
+    @staticmethod
+    def applied_ms(text):
+        return [float(v) for v in re.findall(r"applied (\d+(?:\.\d+)?) ms", text)]
+
+    def test_each_key_waits_until_the_program_is_idle_again(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_game(s)
+                r = await call(s, "press_keys", keys=["A", "A", "A"], wait_for_ready=True)
+                self.assertFalse(r.is_error, text_of(r))
+                times = self.applied_ms(text_of(r))
+                self.assertEqual(len(times), 3, text_of(r))
+                for earlier, later in zip(times, times[1:]):
+                    self.assertGreaterEqual(later - earlier, 380.0)   # a whole move later
+                    self.assertLess(later - earlier, 480.0)           # and then right away
+        self.run_async(go)
+
+    def test_it_stops_at_a_prompt_and_the_prompt_can_be_answered_next(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_game(s)
+                stopped = await call(s, "press_keys", keys=["A", "P", "A", "A"], wait_for_ready=True)
+                self.assertTrue(stopped.is_error, text_of(stopped))
+                report = text_of(stopped)
+                self.assertIn("different kind of input", report)
+                self.assertRegex(report, r"2\. P\s+applied [\d.]+ ms\s+read")
+                self.assertRegex(report, r"3\. A\s+not pressed")
+                self.assertRegex(report, r"4\. A\s+not pressed")
+                answered = await call(s, "press_keys", keys=["Y", "RETURN"], wait_for_ready=True)   # at once
+                self.assertFalse(answered.is_error, text_of(answered))
+                again = await call(s, "press_keys", keys=["A", "A"], wait_for_ready=True)   # idle again
+                self.assertFalse(again.is_error, text_of(again))
+        self.run_async(go)
+
+    def test_a_prompt_that_the_program_never_leaves_reports_not_ready(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_game(s)
+                await call(s, "press_key", key="P")
+                await call(s, "wait", ms=600)   # after the move, the prompt's loop is what the program polls from
+                r = await call(s, "press_keys", keys=["RETURN", "A"], wait_for_ready=True)
+                self.assertTrue(r.is_error, text_of(r))
+                self.assertIn("not ready for the next key", text_of(r))
+                self.assertRegex(text_of(r), r"2\. A\s+not pressed")
+        self.run_async(go)
+
+    def test_bad_combinations_are_errors_and_press_nothing(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                screen = text_of(await call(s, "read_screen"))
+                for kwargs in ({"keys": ["Z", {"key": "Z", "delay_ms": 50}]}, {"keys": ["Z", "Z"], "delay_from": "read"},
+                               {"keys": ["Z", {"joystick": {"x": 1}}]},
+                               {"keys": ["Z", {"key": "Z", "wait_for_read": False}]}):
+                    with self.subTest(**kwargs):
+                        r = await call(s, "press_keys", wait_for_ready=True, **kwargs)
+                        self.assertTrue(r.is_error)
+                self.assertEqual(text_of(await call(s, "read_screen")), screen)
+        self.run_async(go)
+
+    def test_press_keys_describes_wait_for_ready(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                tools = {t.name: t.description for t in (await s.list_tools()).tools}
+                self.assertIn("wait_for_ready", tools["press_keys"])
+                self.assertIn("NOT pressed", tools["press_keys"])
+        self.run_async(go)
+
+
 class CheckpointTest(AdapterTestCase):
     """Stepped-session checkpoints through the adapter (user ruling 2026-10-20): the harness's checkpoint methods,
     which wrap AppleWin's own save state together with the working disks."""

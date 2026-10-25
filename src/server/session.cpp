@@ -406,6 +406,9 @@ void Session::SendInputApplied()
             } else {
                 params["first_cycle"] = a.firstCycle;
                 params["last_cycle"] = a.lastCycle;
+                if (a.then)   // until_ready: how the program went on after the last key (D10, "Ready input")
+                    params["then"] = *a.then == InputStop::None ? "ready"
+                                     : *a.then == InputStop::InputChanged ? "input_changed" : "not_ready";
             }
             if (!a.keys.empty()) {   // press_keys (D10, "Key sequences"); a timed-out one: the keys it pressed
                 json keys = json::array();
@@ -824,6 +827,9 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
     // wait_for_ready (D10, "Ready input"): each key waits until the program is ready for it, so no timing of its own.
     const bool waitReady = GetBool(params, "wait_for_ready", false);
     if (waitReady && sequenceFromRead) InvalidParams("wait_for_ready cannot be combined with delay_from \"read\"");
+    // until_ready: the call also waits until the program is ready again after the last key.
+    const bool untilReady = GetBool(params, "until_ready", false);
+    if (untilReady && !waitReady) InvalidParams("until_ready needs wait_for_ready");
     std::vector<SequenceKey> keys;
     uint64_t events = 0;   // pending-event slots: a key 1, a joystick entry 1 or, with a duration, 2
     for (const json& entry : *list) {
@@ -864,7 +870,7 @@ json Session::PressKeys(const ConnectionPtr& connection, const json& params)
         keys.push_back(k);
     }
     RequireInputRoom(events);
-    const uint64_t id = emulator_.QueueKeys(std::move(keys), waitReady);
+    const uint64_t id = emulator_.QueueKeys(std::move(keys), waitReady, untilReady);
     inputOwners_[id] = connection;
     return InputReply(id, emulator_.ScheduledCycle(id));
 }

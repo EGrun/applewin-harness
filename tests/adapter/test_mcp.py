@@ -844,12 +844,48 @@ class ReadyInputTest(AdapterTestCase):
                 self.assertEqual(text_of(await call(s, "read_screen")), screen)
         self.run_async(go)
 
+    def test_until_ready_returns_once_the_program_is_ready_after_the_last_key(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_game(s)
+                r = await call(s, "press_keys", keys=["A"], wait_for_ready=True, until_ready=True)
+                self.assertFalse(r.is_error, text_of(r))
+                ready = re.search(r"then: the program was ready for the next key at (\d+(?:\.\d+)?) ms", text_of(r))
+                self.assertIsNotNone(ready, text_of(r))
+                self.assertGreaterEqual(float(ready.group(1)), 380.0)   # after the whole move
+                self.assertLess(float(ready.group(1)), 480.0)
+                plain = await call(s, "press_keys", keys=["A"], wait_for_ready=True)
+                self.assertNotIn("then:", text_of(plain))
+        self.run_async(go)
+
+    def test_until_ready_reports_a_prompt_brought_up_by_the_last_key(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_game(s)
+                r = await call(s, "press_keys", keys=["A", "P"], wait_for_ready=True, until_ready=True)
+                self.assertFalse(r.is_error, text_of(r))   # every key was pressed
+                self.assertIn("then: the program began waiting for a different kind of input", text_of(r))
+                answered = await call(s, "press_keys", keys=["Y", "RETURN"], wait_for_ready=True)
+                self.assertFalse(answered.is_error, text_of(answered))
+        self.run_async(go)
+
+    def test_until_ready_needs_wait_for_ready(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                screen = text_of(await call(s, "read_screen"))
+                r = await call(s, "press_keys", keys=["Z"], until_ready=True)
+                self.assertTrue(r.is_error)
+                self.assertEqual(text_of(await call(s, "read_screen")), screen)
+        self.run_async(go)
+
     def test_press_keys_describes_wait_for_ready(self):
         async def go():
             async with mcp_session(self.errlog) as s:
                 tools = {t.name: t.description for t in (await s.list_tools()).tools}
                 self.assertIn("wait_for_ready", tools["press_keys"])
                 self.assertIn("NOT pressed", tools["press_keys"])
+                self.assertIn("until_ready", tools["press_keys"])
         self.run_async(go)
 
 

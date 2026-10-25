@@ -945,10 +945,11 @@ void StartTurnBasedGame(Emulator& e)
     (void)e.TakeAppliedInputs();
 }
 
-// Queues the sequence with wait_for_ready and runs until it is reported (completed or not); within `frames` frames.
-InputApplied RunReadySequence(Emulator& e, std::vector<SequenceKey> keys, int frames = 1500)
+// Queues the sequence with wait_for_ready (and until_ready) and runs until it is reported (completed or not); within
+// `frames` frames.
+InputApplied RunReadySequence(Emulator& e, std::vector<SequenceKey> keys, bool untilReady = false, int frames = 1500)
 {
-    const uint64_t id = e.QueueKeys(std::move(keys), true);
+    const uint64_t id = e.QueueKeys(std::move(keys), true, untilReady);
     for (int i = 0; i < frames / 5; ++i) {
         REQUIRE(e.RunFrames(5));
         if (const auto a = FindApplied(e.TakeAppliedInputs(), id))
@@ -1043,6 +1044,73 @@ TEST_CASE("press_keys wait_for_ready: a program that is never ready again drops 
     CHECK(a.lastCycle == 0);
 }
 
+TEST_CASE("press_keys until_ready: the sequence completes once the program is ready again after the last key")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    // Without it the sequence completes when the program takes the last key, at the start of its 380 ms move.
+    const InputApplied taken = RunReadySequence(e, {Key('A', 0)});
+    REQUIRE(taken.keys.size() == 1);
+    CHECK(taken.lastCycle - taken.keys[0].appliedCycle < MsToCycles(60));
+    CHECK(!taken.then.has_value());
+    REQUIRE(e.RunFrames(60));   // the move finishes
+    (void)e.TakeAppliedInputs();
+
+    const InputApplied ready = RunReadySequence(e, {Key('A', 0), Key('A', 0)}, true);
+    CHECK(!ready.discarded);
+    REQUIRE(ready.then.has_value());
+    CHECK(*ready.then == InputStop::None);
+    REQUIRE(ready.keys.size() == 2);
+    const uint64_t after = ready.lastCycle - ready.keys[1].appliedCycle;   // the whole move, then idle again
+    CHECK(after >= MsToCycles(380));
+    CHECK(after < MsToCycles(380 + 60));
+}
+
+TEST_CASE("press_keys until_ready: a last key that brings up a prompt completes, reporting the other kind of input")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    const InputApplied a = RunReadySequence(e, {Key('A', 0), Key('P', 0)}, true);
+    CHECK(!a.discarded);   // every key was pressed
+    REQUIRE(a.then.has_value());
+    CHECK(*a.then == InputStop::InputChanged);
+    REQUIRE(a.keys.size() == 2);
+    CHECK(a.lastCycle - a.keys[1].appliedCycle >= MsToCycles(380));   // when the prompt began, after the move
+
+    // The prompt still waits for its answer.
+    const InputApplied answer = RunReadySequence(e, {Key('Y', 0), Key('\r', 0)});
+    CHECK(!answer.discarded);
+    REQUIRE(answer.keys.size() == 2);
+    CHECK(answer.keys[1].appliedCycle - answer.keys[0].appliedCycle < MsToCycles(2));
+}
+
+TEST_CASE("press_keys until_ready: a program that is not ready again within 600 frames completes, not ready")
+{
+    auto& e = StartedEmulator();
+    DosBasic dos(e);
+    REQUIRE(dos.Booted());
+    StartTurnBasedGame(e);
+
+    e.QueueKey(KeySpec(uint8_t('P')), 0);   // a move, then the prompt
+    REQUIRE(e.RunFrames(45));
+    (void)e.TakeAppliedInputs();
+
+    // The answer: the idle place learned at its key is the prompt's own loop, which the program does not come back to.
+    const InputApplied a = RunReadySequence(e, {Key('\r', 0)}, true);
+    CHECK(!a.discarded);
+    REQUIRE(a.then.has_value());
+    CHECK(*a.then == InputStop::NotReady);
+    REQUIRE(a.keys.size() == 1);
+    CHECK(a.keys[0].readCycle > 0);
+    CHECK(a.lastCycle - a.keys[0].appliedCycle >= MsToCycles(9900));   // 600 frames
+}
+
 TEST_CASE("press_keys wait_for_ready: only plain keys that wait for the program are allowed")
 {
     auto& e = StartedEmulator();
@@ -1059,6 +1127,7 @@ TEST_CASE("press_keys wait_for_ready: only plain keys that wait for the program 
     CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), unwaiting}, true), std::invalid_argument);
     CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), fromRead}, true), std::invalid_argument);
     CHECK_THROWS_AS(e.QueueKeys({Key('A', 0), JoyEntry(X(10), 0, 0)}, true), std::invalid_argument);
+    CHECK_THROWS_AS(e.QueueKeys({Key('A', 0)}, false, true), std::invalid_argument);   // until_ready needs wait_for_ready
     CHECK(e.PendingInputEvents() == 0);
 }
 

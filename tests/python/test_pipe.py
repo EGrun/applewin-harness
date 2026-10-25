@@ -798,10 +798,14 @@ class AgentMethodsTest(PipeTestCase):
                        {"keys": ["A", {"key": "B", "wait_for_read": False}], "wait_for_ready": True},
                        {"keys": ["A", {"key": "B", "delay_from": "applied"}], "wait_for_ready": True},
                        {"keys": ["A", {"joystick": {"x": 1}}], "wait_for_ready": True},
-                       {"keys": ["A", "B"], "wait_for_ready": True, "delay_from": "read"}):
+                       {"keys": ["A", "B"], "wait_for_ready": True, "delay_from": "read"},
+                       {"keys": ["A"], "until_ready": True}, {"keys": ["A"], "wait_for_ready": False, "until_ready": True},
+                       {"keys": ["A"], "wait_for_ready": True, "until_ready": "yes"}):
             with self.subTest(**params):
                 self.assertRpcError(-32602, agent, "press_keys", **params)
         for params in ({"keys": ["A", "B"], "wait_for_ready": True},
+                       {"keys": ["A", "B"], "wait_for_ready": True, "until_ready": True},
+                       {"keys": ["A"], "until_ready": False},
                        {"keys": ["A", {"key": "B", "hold_ms": 0}], "wait_for_ready": True, "delay_from": "applied"},
                        {"keys": ["A", {"key": "B", "delay_ms": 10}], "wait_for_ready": False}):
             with self.subTest(**params):

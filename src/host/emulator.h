@@ -199,7 +199,8 @@ public:
     // waitReady (D10, "Ready input"): each key after the first goes in when the program is waiting for a command
     // again, not when it merely read the previous key: it took the previous key (cleared the strobe) and has since read
     // the keyboard from every place it read from in the 300 ms before it took the first key, or from every place of its
-    // command loop (those of the last sequence whose first key was not taken at a prompt). If, before that, it starts a tight
+    // command loop (those of the last sequence whose first key was not taken at a prompt), which are then its idle places
+    // for the rest of the sequence. If, before that, it starts a tight
     // read loop (64 reads, each under 100 cycles after the last) from another place, the rest is not pressed (reported
     // discarded, InputStop::InputChanged); 600 frames without either, the same (InputStop::NotReady). The sequence
     // completes when the program has taken the last key. Entries must be plain keys with no delay, waitForRead true and

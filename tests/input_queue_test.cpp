@@ -1136,6 +1136,17 @@ TEST_CASE("press_keys wait_for_ready: after answering a prompt the program is re
     CHECK(gap >= MsToCycles(380));
     CHECK(gap < MsToCycles(380 + 60));
 
+    // Back in its command loop, the program waits for commands there, not in the prompt's loop: a prompt that a later
+    // key of the same call brings up stops it, as it does a call begun at a command.
+    const InputApplied guarded = RunReadySequence(e, {Key('A', 0), Key('P', 0)}, true);
+    REQUIRE(guarded.then.has_value());
+    CHECK(*guarded.then == InputStop::InputChanged);
+    const InputApplied mixed = RunReadySequence(e, {Key('Y', 0), Key('\r', 0), Key('A', 0), Key('P', 0), Key('A', 0)});
+    CHECK(mixed.discarded);
+    CHECK(mixed.stopped == InputStop::InputChanged);
+    CHECK(mixed.keys.size() == 4);   // the answer, A and P; not the A after the prompt appeared
+    CHECK(!RunReadySequence(e, {Key('', 0)}).discarded);   // answered: at a command again
+
     // An until_ready answer to the next prompt ends ready, once the program is back in its command loop.
     const InputApplied again = RunReadySequence(e, {Key('P', 0)}, true);
     REQUIRE(again.then.has_value());

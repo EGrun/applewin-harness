@@ -826,7 +826,7 @@ def build_server(args, machine):
         program that never clears the strobe (Conan): use delay_from "read" there. Returns once the program has
         taken the last key. An answer to a prompt and the moves after it can go in one call (["N", "RETURN", "E"]):
         the program counts as ready again once it is back in the command loop an earlier call saw (not straight after
-        a reset, before any wait_for_ready call has seen it).
+        a reset, before any wait_for_ready call has seen it), and a later prompt still stops the call.
         until_ready: true (with wait_for_ready only) makes the call return only once the program is ready for another
         key after the last one, so look or frames shows the finished move and you need not guess a wait. The report
         then ends with a "then:" line: ready (with the time), a different kind of input (the last key brought up a

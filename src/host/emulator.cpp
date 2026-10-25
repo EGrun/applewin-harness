@@ -290,12 +290,15 @@ struct ReadyWatch {
         since.insert(pc);
         // A tight loop is an input loop: at an idle place the program waits for the next key (an idle place that only
         // reads once a key is there, as a prompt's fetch after its wait loop does, never comes round); elsewhere it
-        // began another kind of input. Back in its command loop (home) it is ready too, as after answering a prompt.
+        // began another kind of input. Back in its command loop (home) it is ready too, as after answering a prompt,
+        // and waits there from now on: the prompt's loop is no longer an idle place, so a later prompt stops the call.
         const bool tight = runReads >= kTightLoopReads;
         const auto all = [this](const std::set<WORD>& places) {
             return !places.empty() && std::includes(since.begin(), since.end(), places.begin(), places.end());
         };
-        if (all(idle) || all(home) || (tight && idle.count(pc)) || idle.empty())
+        if (all(home))
+            idle = home;
+        if (all(idle) || (tight && idle.count(pc)) || idle.empty())
             ready = true;
         else if (tight)
             changed = true;

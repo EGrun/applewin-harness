@@ -881,6 +881,20 @@ class ReadyInputTest(AdapterTestCase):
                 self.assertIn("then: the program was ready for the next key", text_of(r))
         self.run_async(go)
 
+    def test_a_call_that_begins_with_an_answer_still_stops_at_a_later_prompt(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await self.start_game(s)
+                await call(s, "press_keys", keys=["A"], wait_for_ready=True, until_ready=True)   # the command loop
+                await call(s, "press_keys", keys=["P"], wait_for_ready=True, until_ready=True)   # the prompt
+                r = await call(s, "press_keys", keys=["Y", "RETURN", "A", "P", "A"], wait_for_ready=True,
+                               until_ready=True)
+                self.assertTrue(r.is_error, text_of(r))
+                self.assertIn("different kind of input", text_of(r))
+                self.assertRegex(text_of(r), r"4\. P\s+applied")
+                self.assertRegex(text_of(r), r"5\. A\s+not pressed")
+        self.run_async(go)
+
     def test_until_ready_needs_wait_for_ready(self):
         async def go():
             async with mcp_session(self.errlog) as s:

@@ -35,6 +35,7 @@
 - The PNG fetch is in this plan, although D15's token decisions don't need it: one decoded RGB path makes the hash uniform. It is gated on measurement (Task 1, Step 6).
 - Only `look` takes `force`. `press_keys` and `wait_until_change` don't, because the agent can call `look` after them.
 - One slot: the gate compares with the last image sent, not with every image ever sent, because a client may have cleared older ones.
+- Task 1 gate (Release exe, stepped, DOS 3.3 System Master after 300 frames, 100 round trips each): PNG median 4.93 ms, reply 2,584 bytes base64; BGRA32 median 11.58–11.99 ms, reply 1,146,880 bytes. PNG kept. Measured on a near-blank boot screen; a busy screen gives a larger PNG but stays far below the BGRA32 reply.
 
 ---
 

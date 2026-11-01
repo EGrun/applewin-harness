@@ -335,3 +335,28 @@ AppleWin never gets a real DirectSound buffer. The harness replaces the translat
 - D9: the realtime feedback comes from `AudioOutput`.
 - D12: no AppleWin patches; capture goes through the virtual buffers.
 - Maintenance: the replacement TU must track AppleWin's `DXSoundBuffer` interface whenever the submodule pin moves (D7).
+
+## D15 — Screenshot cost: fewer images, not smaller ones
+**Status:** Accepted (2026-11-01) for the adapter changes. The custom agent client is **Proposed** (`docs/specs/client.md`).
+
+A screenshot costs twice: bytes over the local pipe, and tokens in the agent's context.
+- **Pipe.** A plain `look` gets the harness's PNG. Everything that needs pixels (region, zoom, strips, `wait_until_change`, the screen kept after each input) fetches raw `BGRA32`: 860 KB per frame, about 1.15 MB once base64-encoded. `wait_until_change` fetches one per presented frame, about 60 a second in realtime.
+- **Tokens.** Claude bills an image as ⌈width/28⌉ × ⌈height/28⌉ visual tokens (Vision docs, 2026-11-01): the 560×384 screen is 280, `zoom` 1 (280×192) is 70, a 60×16 region at zoom 2 is 10, a 1280×1024 contact sheet is 1,702. Every image stays in the agent's context for the rest of the conversation, so the number of images sent matters more than their size.
+
+**Decisions:**
+- **No mode-sized images.** Sizing the image by the video mode (from the TEXT, MIXED, HIRES, 80COL and AN3 soft switches) was rejected:
+  - AppleWin draws Hi-Res colour on the 560-dot grid (the palette bit shifts a byte by half an Apple pixel), so halving loses colour and thin lines.
+  - 40-column text at 1× is 7×8 pixels per character, below what the model reads reliably.
+  - Double Hi-Res and 80 columns need all 560 dots, so the most a mode could save is the height (560×192, 140 tokens), at the cost of a squashed picture and per-mode coordinates.
+  - Mixed and split screens need the full frame anyway, and the image size would tell the agent the mode, information decoded from soft switches like the opt-in text screen.
+  - `look` with `zoom` 1 already gives the 70-token picture when the agent wants it.
+- **No video memory on the wire.** Sending the text, Lo-Res, Hi-Res or Double Hi-Res pages instead of pixels is a memory read, which the agent may not do (D4, user ruling 2026-10-19). Memory also misses changes that pixels see: FLASH characters, page flips and mode switches change the screen without changing memory. The PNG's zlib stream already removes most of the 2×2 duplication.
+- **The adapter fetches PNG and decodes it.** Every frame the adapter needs is fetched as `PNG` and decoded with the standard library. The harness's encoder fixes the form (8-bit RGB, filter 0 on every row, no interlace), so the decoder accepts that form only. `BGRA32` stays in the harness API for other clients.
+- **A screen the agent already has is not sent again.** The adapter keeps a hash of the last image it returned. When the next image would be identical (same size and pixels), the tool returns a short note instead, with how long ago, in emulated time, that image was sent. `look` takes `force: true` to get the image anyway. Only pixels are compared, so this gives the agent nothing a person at the screen would not have.
+- **The tool descriptions state the cost.** `look`, `press_keys` and `wait_until_change` say what a full screen, `zoom` 1 and a region cost, and point the agent at regions and `look: false` when it only needs to know that something changed.
+- **Clearing old images is the client's job.** An MCP server cannot remove what its client already holds. A custom client (`docs/specs/client.md`) runs the agent on the Claude API with context editing (`clear_tool_uses_20250919`), so old screenshots stop costing tokens on later turns.
+
+**Consequences:**
+- The note assumes the agent still holds the last image. A client that clears tool results can remove it, so the custom client keeps the most recent tool results (`keep`), and `force` covers the rest.
+- The token figures in the tool descriptions are Claude's. Other models count differently; the advice (regions, zoom 1, fewer images) holds for any of them.
+- The harness compresses every frame the adapter fetches. If that costs more than the BGRA copy it replaces, measured as a `get_frame` round trip, the PNG fetch is dropped and only the token changes remain (gate in the plan).

@@ -25,8 +25,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
-from .screen import (MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
-                     contact_sheet, crop_zoom, encode_png, frame_pixels, region_differs, sheet_size)
+from .screen import (FRAME_H, FRAME_W, MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
+                     contact_sheet, crop_zoom, decode_png, encode_png, region_differs, sheet_size)
 
 FRAMES_PER_SECOND = 60
 BASE_CLOCK_HZ = (157500000.0 / 11.0) * 65.0 / 912.0   # CLK_6502_NTSC: emulated cycles to emulated ms (D10)
@@ -490,14 +490,22 @@ class Machine:
             self.advance_ms(ms)
         return "waited {} ms".format(ms)
 
-    def frame_rgb(self):
-        """(560x384 RGB frame, emulated_cycles) from one get_frame. Call with self.lock held."""
-        frame = self.rpc(self.agent, "get_frame", format="BGRA32", borders=False)
+    def frame(self):
+        """(width, height, rgb, png, emulated_cycles) from one get_frame, at any size. Call with self.lock held."""
+        frame = self.rpc(self.agent, "get_frame", format="PNG", borders=False)
+        png = base64.b64decode(frame["data"])
         try:
-            rgb = frame_pixels(base64.b64decode(frame["data"]), frame["width"], frame["height"])
+            width, height, rgb = decode_png(png)
         except ScreenError as e:
             raise ToolError(str(e)) from None
-        return rgb, frame["emulated_cycles"]
+        return width, height, rgb, png, frame["emulated_cycles"]
+
+    def frame_rgb(self):
+        """(560x384 RGB frame, emulated_cycles) from one get_frame. Call with self.lock held."""
+        width, height, rgb, _, cycles = self.frame()
+        if (width, height) != (FRAME_W, FRAME_H):
+            raise ToolError("unsupported video mode for region/zoom/strips")
+        return rgb, cycles
 
     def wait_until_change(self, timeout_ms, region=None, look=True, since="now"):
         """Lets time pass until the pixels in region differ from the reference, or timeout_ms of emulated time have
@@ -567,8 +575,7 @@ class Machine:
     def _look_locked(self, region=None, zoom=None):
         """PNG bytes of the screen. Call with self.lock held."""
         if region is None and zoom is None:
-            frame = self.rpc(self.agent, "get_frame", format="PNG", borders=False)
-            return base64.b64decode(frame["data"])
+            return self.frame()[3]
         try:
             box = check_region(region)
             zoom = 2 if zoom is None else zoom

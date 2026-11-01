@@ -979,6 +979,35 @@ class MachineUnitTest(unittest.TestCase):
         m.collect_frames = False
         return m
 
+    def png_machine(self, width, height):
+        from applewin_mcp import screen
+        rgb = bytes(i % 251 for i in range(width * height * 3))
+        calls = []
+
+        def rpc(conn, method, **params):
+            calls.append(params)
+            return {"data": base64.b64encode(screen.encode_png(width, height, rgb)).decode(),
+                    "width": width, "height": height, "emulated_cycles": 1234, "format": "PNG"}
+        m = self.machine()
+        m.rpc, m.agent = rpc, object()
+        return m, rgb, calls
+
+    def test_frame_rgb_fetches_png(self):
+        m, rgb, calls = self.png_machine(560, 384)
+        self.assertEqual(m.frame_rgb(), (rgb, 1234))
+        self.assertEqual(calls, [{"format": "PNG", "borders": False}])
+
+    def test_frame_rgb_rejects_other_sizes(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m, _, _ = self.png_machine(600, 420)
+        with self.assertRaisesRegex(ToolError, "unsupported video mode for region/zoom/strips"):
+            m.frame_rgb()
+
+    def test_plain_look_accepts_other_sizes(self):
+        from applewin_mcp import screen
+        m, rgb, _ = self.png_machine(600, 420)
+        self.assertEqual(screen.decode_png(m._look_locked()), (600, 420, rgb))
+
     def test_whole_screen_zoom_8_is_rejected_before_a_frame_is_fetched(self):
         from mcp.server.mcpserver.exceptions import ToolError
         m = self.machine()

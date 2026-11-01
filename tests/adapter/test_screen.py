@@ -32,20 +32,28 @@ def _decode_png(png):
 
 
 class ScreenTests(unittest.TestCase):
-    def test_frame_pixels_keeps_every_pixel(self):
-        buf = bytearray(560 * 384 * 4)
-        points = [(0, 0), (559, 383), (1, 1), (301, 7)]
-        for x, y in points:
-            off = (y * 560 + x) * 4
-            buf[off:off + 4] = bytes([x % 256, y % 256, 7, 0])
-        rgb = screen.frame_pixels(bytes(buf), 560, 384)
-        self.assertEqual(len(rgb), 560 * 384 * 3)
-        for x, y in points:
-            self.assertEqual(rgb[3 * (y * 560 + x):][:3], bytes([7, y % 256, x % 256]))
+    def test_decode_png_round_trips_encode_png(self):
+        rgb = bytes(range(18))
+        self.assertEqual(screen.decode_png(screen.encode_png(3, 2, rgb)), (3, 2, rgb))
 
-    def test_frame_pixels_rejects_other_sizes(self):
-        with self.assertRaisesRegex(screen.ScreenError, "unsupported video mode"):
-            screen.frame_pixels(bytes(600 * 420 * 4), 600, 420)
+    def test_decode_png_accepts_split_idat(self):
+        rgb = bytes(range(48))
+        png = screen.encode_png(4, 4, rgb)
+        idat = zlib.compress(b"".join(b"\x00" + rgb[y * 12:(y + 1) * 12] for y in range(4)))
+        head = png[:png.index(b"IDAT") - 4]
+        split = head + screen._chunk(b"IDAT", idat[:5]) + screen._chunk(b"IDAT", idat[5:]) + screen._chunk(b"IEND", b"")
+        self.assertEqual(screen.decode_png(split), (4, 4, rgb))
+
+    def test_decode_png_rejects_other_forms(self):
+        def png(ctype=2, interlace=0, filter_byte=0, sig=b"\x89PNG\r\n\x1a\n"):
+            bpp = 4 if ctype == 6 else 3
+            raw = bytes([filter_byte]) + bytes(2 * bpp)
+            return (sig + screen._chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 8, ctype, 0, 0, interlace))
+                    + screen._chunk(b"IDAT", zlib.compress(raw)) + screen._chunk(b"IEND", b""))
+        self.assertEqual(screen.decode_png(png()), (2, 1, bytes(6)))
+        for bad in (png(sig=b"notapng!"), png(ctype=6), png(interlace=1), png(filter_byte=1)):
+            with self.assertRaisesRegex(screen.ScreenError, "unexpected PNG from the harness"):
+                screen.decode_png(bad)
 
     def test_region_outside_screen_is_rejected(self):
         for bad in ([270, 0, 20, 10], [0, 0, 0, 5], [0, 0, 5], [-1, 0, 5, 5]):

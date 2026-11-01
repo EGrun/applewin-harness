@@ -11,6 +11,7 @@ to stderr. The adapter writes the line "harness pid <N>" to stderr once the harn
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -163,6 +164,18 @@ def cycles_to_ms(cycles):
     return cycles * 1000.0 / BASE_CLOCK_HZ
 
 
+UNCHANGED_NOTE = ("the screen is the same as the last image you were sent ({ms} ms of emulated time ago), so no image "
+                  "is attached; call look with force true to get it again")
+
+
+def tool_content(result):
+    """What a tool returns for a Machine result: PNG bytes become an Image, and a note stays text."""
+    if isinstance(result, list):
+        text, image = result
+        return [text, Image(data=image, format="png")] if isinstance(image, bytes) else text + "\n" + image
+    return Image(data=result, format="png") if isinstance(result, bytes) else result
+
+
 def _entry_name(entry):
     """How key_report names a press_keys entry: "joystick", its key, or the bare key itself."""
     if not isinstance(entry, dict):
@@ -276,6 +289,7 @@ class Machine:
         self.frame_ready = []   # frame_ready params, collected only while wait_until_change is subscribed
         self.collect_frames = False
         self.input_screen = None   # (frame RGB, emulated_cycles) just after the last input was sent
+        self.last_image = None     # (digest of the last image sent, emulated_cycles then); see _offer
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
         self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
                                       stderr_line=self._forward_harness_line)
@@ -564,41 +578,54 @@ class Machine:
                         if not failing:
                             raise    # the wait itself succeeded: the failed unsubscribe is the error
                         log("unsubscribe after a failed wait_until_change also failed: {}".format(e))
+            image = self._offer(560, 384, cur, cycles) if look else None   # last, so a failure sends nothing
         text = "{} {} ms".format("changed after" if changed else "no change in",
                                  int(round(cycles_to_ms(cycles - ref_cycles))))
         if since == "last_input":
             text += " (since the last input)"
         if not look:
             return text
-        return [text, encode_png(560, 384, cur)]
+        return [text, image]
 
-    def _look_locked(self, region=None, zoom=None):
-        """PNG bytes of the screen. Call with self.lock held."""
+    def _offer(self, width, height, rgb, cycles, png=None, force=False):
+        """The image as PNG bytes, recorded as sent; or, when its pixels are those of the last image sent and force is
+        false, UNCHANGED_NOTE (and nothing recorded). Call with self.lock held, as the last step before a successful
+        return, so a call that fails afterwards never counts as having sent the image."""
+        digest = hashlib.sha256(b"%dx%d:" % (width, height) + rgb).digest()
+        if not force and self.last_image is not None and self.last_image[0] == digest:
+            return UNCHANGED_NOTE.format(ms=int(round(cycles_to_ms(cycles - self.last_image[1]))))
+        self.last_image = (digest, cycles)
+        return encode_png(width, height, rgb) if png is None else png
+
+    def _look_locked(self, region=None, zoom=None, force=False):
+        """PNG bytes of the screen, or UNCHANGED_NOTE (see _offer). Call with self.lock held."""
         if region is None and zoom is None:
-            return self.frame()[3]
+            width, height, rgb, png, cycles = self.frame()
+            return self._offer(width, height, rgb, cycles, png, force)
         try:
             box = check_region(region)
             zoom = 2 if zoom is None else zoom
             check_zoom(zoom)
             check_size(box[2] * zoom, box[3] * zoom)   # before the frame is fetched or cropped
-            rgb, _ = self.frame_rgb()
+            rgb, cycles = self.frame_rgb()
             width, height, pixels = crop_zoom(rgb, box, zoom)
-            return encode_png(width, height, pixels)
+            return self._offer(width, height, pixels, cycles, force=force)
         except ScreenError as e:
             raise ToolError(str(e)) from None
 
-    def look(self, region=None, zoom=None, frames=1, every_ms=None):
+    def look(self, region=None, zoom=None, frames=1, every_ms=None, force=False):
         """The screen as PNG bytes; with frames > 1, [tile times text, PNG of a contact sheet of the tiles taken
-        every_ms apart]. Everything is validated before the first tile, so a rejected call lets no time pass."""
+        every_ms apart]. Either image is UNCHANGED_NOTE instead when it is the last image sent, unless force.
+        Everything is validated before the first tile, so a rejected call lets no time pass."""
         _check_range("frames", frames, *STRIP_FRAMES_RANGE)
         if every_ms is not None:
             _check_range("every_ms", every_ms, *STRIP_EVERY_MS_RANGE)
         if frames == 1:
             with self.lock:
-                return self._look_locked(region, zoom)
+                return self._look_locked(region, zoom, force)
         box, zoom = self._strip_args(region, zoom, frames, every_ms)
         with self.lock:
-            png, cycles = self._strip_locked(box, zoom, frames, every_ms)
+            png, cycles = self._strip_locked(box, zoom, frames, every_ms, force)
         times = ", ".join("{:.1f}".format(cycles_to_ms(c - cycles[0])) for c in cycles)
         return ["tile times: {} ms".format(times), png]
 
@@ -618,9 +645,9 @@ class Machine:
             raise ToolError(str(e)) from None
         return box, zoom
 
-    def _strip_locked(self, box, zoom, frames, every_ms):
-        """(contact sheet PNG, each tile's emulated_cycles): frames tiles every_ms apart, the first now. Call with
-        self.lock held."""
+    def _strip_locked(self, box, zoom, frames, every_ms, force=False):
+        """(contact sheet PNG or UNCHANGED_NOTE, each tile's emulated_cycles): frames tiles every_ms apart, the first
+        now. Call with self.lock held."""
         tiles, cycles = [], []
         for i in range(frames):
             if i:
@@ -629,7 +656,7 @@ class Machine:
             tiles.append(crop_zoom(rgb, box, zoom))
             cycles.append(emulated)
         width, height, pixels = contact_sheet(tiles, STRIP_PER_ROW, STRIP_GAP)
-        return encode_png(width, height, pixels), cycles
+        return self._offer(width, height, pixels, cycles[-1], force=force), cycles
 
     def read_screen(self):
         with self.lock:
@@ -842,9 +869,7 @@ def build_server(args, machine):
         waiting again can show a frame early."""
         result = await asyncio.to_thread(machine.press_keys, keys, look, frames, every_ms, region, zoom, delay_from,
                                          wait_for_ready, until_ready)
-        if isinstance(result, list):
-            return [result[0], Image(data=result[1], format="png")]
-        return result
+        return tool_content(result)
 
     @mcp.tool()
     async def set_joystick(x: int | None = None, y: int | None = None, button0: bool | None = None,
@@ -863,7 +888,7 @@ def build_server(args, machine):
 
     @mcp.tool()
     async def look(region: list[int] | None = None, zoom: int | None = None, frames: int = 1,
-                   every_ms: int | None = None):
+                   every_ms: int | None = None, force: bool = False):
         """Look at the screen: a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2; regions are in Apple pixels
         (x 0-279, y 0-191), so halve coordinates read off a 560x384 screenshot.
         To look closer, give region [x, y, w, h] (Apple pixels) and/or zoom (1-8, default 2):
@@ -874,10 +899,8 @@ def build_server(args, machine):
         returns one contact sheet (4 tiles per row, 2 pixels of grey between them, region/zoom applying to each
         tile, the whole sheet within 1280x1024), preceded by the tiles' times in ms from the first. This lets
         that much time pass. Use a small region and zoom for long strips."""
-        result = await asyncio.to_thread(machine.look, region, zoom, frames, every_ms)
-        if isinstance(result, list):
-            return [result[0], Image(data=result[1], format="png")]
-        return Image(data=result, format="png")
+        result = await asyncio.to_thread(machine.look, region, zoom, frames, every_ms, force)
+        return tool_content(result)
 
     @mcp.tool()
     async def wait_until_change(timeout_ms: int, region: list[int] | None = None, look: bool = True,
@@ -897,9 +920,7 @@ def build_server(args, machine):
         the game keeps running while you wait. Anything that flickers in the watched region (a blinking cursor, an
         animation) counts as a change at once, so choose a region that excludes it."""
         result = await asyncio.to_thread(machine.wait_until_change, timeout_ms, region, look, since)
-        if isinstance(result, list):
-            return [result[0], Image(data=result[1], format="png")]
-        return result
+        return tool_content(result)
 
     if args.text_screen:
         @mcp.tool()

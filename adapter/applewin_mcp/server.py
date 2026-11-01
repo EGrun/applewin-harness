@@ -745,7 +745,7 @@ class Machine:
     def restore_checkpoint(self, checkpoint_id):
         """Restores the machine and its disks. Everything the adapter kept from the thrown-away timeline goes too:
         the harness reports the input it discarded (drained here), and the sound events not yet given to listen and
-        the last-input screen belong to that timeline."""
+        the last-input screen and the last image sent belong to that timeline."""
         self._require_stepped()
         with self.lock:
             try:   # the name is only for the message: looked up first, so the restore's result is what counts
@@ -762,6 +762,7 @@ class Machine:
             self.applied = {}
             self.events = []
             self.input_screen = None
+            self.last_image = None
         return "restored {} at {:.1f} ms".format(self._checkpoint_label(checkpoint_id, name),
                                                  cycles_to_ms(restored["emulated_cycles"]))
 

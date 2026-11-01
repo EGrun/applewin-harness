@@ -1164,6 +1164,30 @@ class MachineUnitTest(unittest.TestCase):
         m.pump(0.0)
         self.assertEqual((m.applied, m.events, m.input_screen), ({}, [], None))
 
+    def test_a_restore_forgets_the_last_image(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.look_machine()
+        m.stepped = True
+        m.agent, m.operator = object(), object()
+        m.pump = lambda timeout=0.0: None
+        fail = []
+
+        def rpc(conn, method, **params):
+            if method == "restore_checkpoint" and fail:
+                raise ToolError("no such checkpoint")
+            return {"emulated_cycles": 0} if method == "restore_checkpoint" else [] if method == "list_checkpoints" else {}
+        m.rpc = rpc
+        self.assertIsInstance(m.look(), bytes)
+        fail.append(True)
+        with self.assertRaises(ToolError):
+            m.restore_checkpoint("cp-1")
+        self.assertIsNotNone(m.last_image)   # a failed restore leaves it alone
+        self.assertIsInstance(m.look(), str)
+        fail.clear()
+        m.restore_checkpoint("cp-1")
+        self.assertIsNone(m.last_image)
+        self.assertIsInstance(m.look(), bytes)
+
     def test_a_failed_screen_fetch_after_an_input_does_not_fail_the_input(self):
         """The input was sent: the tool still succeeds, and since="last_input" then has no reference rather than an
         older input's screen."""

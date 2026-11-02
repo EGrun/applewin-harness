@@ -357,6 +357,6 @@ A screenshot costs twice: bytes over the local pipe, and tokens in the agent's c
 - **Clearing old images is the client's job.** An MCP server cannot remove what its client already holds. A custom client (`docs/specs/client.md`) runs the agent on the Claude API with context editing (`clear_tool_uses_20250919`), so old screenshots stop costing tokens on later turns.
 
 **Consequences:**
-- The note assumes the agent still holds the last image. A client that clears tool results can remove it, so the custom client keeps the most recent tool results (`keep`), and `force` covers the rest.
+- The note assumes the agent still holds the last image. Clearing can remove the last image, because `keep` counts tool uses rather than images. The note then refers to an image the agent no longer has, and the agent recovers with `force: true` at the cost of a call.
 - The token figures in the tool descriptions are Claude's. Other models count differently; the advice (regions, zoom 1, fewer images) holds for any of them.
 - The harness compresses every frame the adapter fetches. If that costs more than the BGRA copy it replaces, measured as a `get_frame` round trip, the PNG fetch is dropped and only the token changes remain (gate in the plan).

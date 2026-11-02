@@ -57,7 +57,7 @@ python -m applewin_client --goal TEXT | --goal-file PATH
 | `--max-turns` | 200 | Upper limit on API requests in the run. |
 | `--max-tokens` | 16000 | `max_tokens` per request. |
 | `--clear-trigger` | 40000 | Context editing `trigger`, in input tokens. |
-| `--clear-keep` | 6 | Context editing `keep`, in tool uses. Must be at least 1 (D15: the agent must still hold the last image). |
+| `--clear-keep` | 6 | Context editing `keep`, in tool uses. Must be at least 1. It counts tool uses, not images, so it does not guarantee the last image survives (D15); the agent recovers with `look` and `force: true`. |
 | `--clear-at-least` | 10000 | Context editing `clear_at_least`, in input tokens. |
 | `--no-clear` | off | Send no `context_management`. Used for A/B measurement. |
 | `--run-dir` | `runs/<UTC timestamp>` | Where the transcript goes. Must not exist yet; the client creates it. |
@@ -173,7 +173,7 @@ Records in `transcript.jsonl`:
 A fixed text, the same in every run. It says:
 - You are operating an Apple IIe through the tools. You see the screen and hear sound only through them, and your input reaches the machine only through them.
 - Work toward the user's goal. When it is done, or you are sure it cannot be done, stop calling tools and say so, in one short paragraph saying what you did.
-- Images are expensive in your context. Use `look` with a region when you know where to look, zoom 1 for a rough look, and `look: false` on `wait_until_change` when you only need to know that something changed. A note saying the screen is the same as the last image means you already have it. Older tool results may be cleared from your context; call `look` again (with `force: true` if needed) rather than relying on an image from long ago.
+- Images are expensive in your context. Use `look` with a region when you know where to look, zoom 1 for a rough look, and `look: false` on `wait_until_change` when you only need to know that something changed. A note saying the screen is the same as the last image means you already have it, unless that image has been cleared from your context. If you get the note but no longer have the image, call `look` with `force: true`. Older tool results may be cleared from your context; call `look` again (with `force: true` if needed) rather than relying on an image from long ago.
 
 It says nothing about the harness, the operator connection or checkpoints beyond what the tool list shows (D4).
 
@@ -212,6 +212,7 @@ This is where the two open points in §9 are checked.
 2. **Images in cleared results.** The docs don't say whether clearing removes image blocks inside a `tool_result`. The smoke test compares `cleared_input_tokens` with the images' visual-token cost to tell.
 3. **Defaults.** `--clear-trigger 40000`, `--clear-keep 6` and `--clear-at-least 10000` are first guesses: a screenshot is 280 tokens, and the tool list is several thousand. Tune them from measured runs (A/B against `--no-clear`).
 4. **Model.** The default is `claude-opus-5-5`. A cheaper model for long play sessions is a `--model` choice, not a code change.
+5. **Forgetting the last image.** An adapter call that forgets the last image would make the "same as the last image" note always true. The client would make it when `context_management.applied_edits` reports cleared tool uses. It is a new tool on the adapter, so the user decides whether to add it.
 
 ## 10. Done when
 - Every test in §8 except the live smoke passes on CI (`python -m unittest discover -s tests/client -v`).

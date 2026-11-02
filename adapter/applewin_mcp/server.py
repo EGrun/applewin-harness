@@ -843,7 +843,7 @@ def build_server(args, machine):
         program does not read a key within 600 frames the rest are dropped and this fails, listing the keys pressed
         (the unread one marked "never read") and those not pressed. With look true it also returns the screen after the
         last key (a 560x384 PNG: each Apple pixel (280x192) is drawn 2x2), so you see the result of the manoeuvre
-        without a second call. To watch the manoeuvre play out, give frames (2-16) and every_ms (1-1000) instead of
+        without a second call (or a note if it is the same as the last image you were sent). To watch the manoeuvre play out, give frames (2-16) and every_ms (1-1000) instead of
         look: a strip of screenshots as for look, the first taken as soon as the last key has been read and released,
         with tile times in ms from the last key's press. region and zoom (as for look) apply to look or to the
         strip; region is in Apple pixels, so halve coordinates read off a 560x384 screenshot. Strip arguments are
@@ -899,7 +899,11 @@ def build_server(args, machine):
         every_ms (1-1000, required with frames): it takes frames screenshots every_ms of emulated time apart and
         returns one contact sheet (4 tiles per row, 2 pixels of grey between them, region/zoom applying to each
         tile, the whole sheet within 1280x1024), preceded by the tiles' times in ms from the first. This lets
-        that much time pass. Use a small region and zoom for long strips."""
+        that much time pass. Use a small region and zoom for long strips.
+        Each image stays in your context: the whole screen costs about 280 tokens, zoom 1 about 70, and a small
+        region 10-40, so use a region when you know where to look and zoom 1 for a rough look. If the image would be
+        the same as the last one you were sent, you get a short note instead; give force true to get the image
+        anyway."""
         result = await asyncio.to_thread(machine.look, region, zoom, frames, every_ms, force)
         return tool_content(result)
 
@@ -917,7 +921,9 @@ def build_server(args, machine):
         N ms" or "no change in N ms", N being emulated time since the call (with since "last_input": since that
         input, and the text says so); running out of time is not an error. In a stepped session it steps frame by
         frame, so a long timeout takes real time to run. With look true (the default) it also
-        returns the whole screen at that moment as a 560x384 PNG (never cropped to region). In a realtime session
+        returns the whole screen at that moment as a 560x384 PNG (never cropped to region), or a note if it is the
+        same as the last image you were sent; give look false when you only need to know whether something changed
+        (an image costs about 280 tokens of your context). In a realtime session
         the game keeps running while you wait. Anything that flickers in the watched region (a blinking cursor, an
         animation) counts as a change at once, so choose a region that excludes it."""
         result = await asyncio.to_thread(machine.wait_until_change, timeout_ms, region, look, since)

@@ -232,6 +232,20 @@ class ToolListTest(AdapterTestCase):
                         self.assertIn("280x192", tools[name].description)
         self.run_async(go)
 
+    def test_image_tools_state_their_cost(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                tools = {t.name: t for t in (await asyncio.wait_for(s.list_tools(), CALL_TIMEOUT)).tools}
+                look = tools["look"]
+                self.assertIn("about 280 tokens", look.description)
+                self.assertIn("force true", look.description)
+                self.assertEqual(look.input_schema["properties"]["force"]["type"], "boolean")
+                self.assertIn("look false when you only need to know whether something changed",
+                              " ".join(tools["wait_until_change"].description.split()))
+                self.assertIn("the same as the last image you were sent",
+                              " ".join(tools["press_keys"].description.split()))
+        self.run_async(go)
+
     def test_read_screen_absent_without_text_screen(self):
         self.assertEqual(self.tool_names(False), NO_TEXT_TOOLS)
 

@@ -10,7 +10,10 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "adapter"))
 
-from applewin_mcp.persistence import StateDir, StateDirLocked, resume_decision  # noqa: E402
+from unittest import mock  # noqa: E402
+
+from applewin_mcp import persistence  # noqa: E402
+from applewin_mcp.persistence import StateDir, StateDirLocked, resume_decision, utc_now  # noqa: E402
 
 
 def sha(data):
@@ -129,6 +132,109 @@ class StateDirTests(unittest.TestCase):
     def test_disk_hashes(self):
         self.sd.disk_for(self.original("a"))
         self.assertEqual(self.sd.disk_hashes(), {"Game.dsk": sha(b"original")})
+
+    def test_disk_hashes_counts_only_indexed_copies(self):
+        self.sd.disk_for(self.original("a"))
+        for stray in ("desktop.ini", "Thumbs.db", "Game.tmp-abc.dsk", "dropped.dsk"):
+            with open(os.path.join(self.sd.disks_dir, stray), "wb") as f:
+                f.write(b"stray")
+        self.assertEqual(self.sd.disk_hashes(), {"Game.dsk": sha(b"original")})
+
+    def test_a_missing_copy_is_recopied_with_a_warning(self):
+        orig = self.original("a")
+        mounted = self.sd.disk_for(orig)
+        os.remove(mounted)
+        with self.assertLogs("applewin_mcp", level="WARNING") as cm:
+            again = self.sd.disk_for(orig)
+        self.assertEqual(again, mounted)
+        self.assertIn("Game.dsk", "\n".join(cm.output))
+        self.assertEqual(self.sd.disk_hashes(), {"Game.dsk": sha(b"original")})
+
+    def test_replace_is_retried_when_the_file_is_busy(self):
+        mounted = self.sd.disk_for(self.original("a"))
+        real, calls = os.replace, []
+
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) <= 2:
+                raise PermissionError(13, "busy", None, 32)
+            real(src, dst)
+
+        def write_to(tmp):
+            with open(tmp, "wb") as f:
+                f.write(b"saved")
+        with mock.patch.object(persistence.os, "replace", flaky), mock.patch.object(persistence.time, "sleep"):
+            self.sd.save("Game.dsk", write_to)
+        self.assertGreaterEqual(len(calls), 3)
+        with open(mounted, "rb") as f:
+            self.assertEqual(f.read(), b"saved")
+
+    def test_replace_gives_up_after_a_while(self):
+        mounted = self.sd.disk_for(self.original("a"))
+
+        def busy(src, dst):
+            raise PermissionError(13, "busy", None, 32)
+
+        def write_to(tmp):
+            with open(tmp, "wb") as f:
+                f.write(b"saved")
+        with mock.patch.object(persistence.os, "replace", busy), mock.patch.object(persistence.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                self.sd.save("Game.dsk", write_to)
+        self.assertEqual(sorted(os.listdir(self.sd.disks_dir)), ["Game.dsk", "index.json"])
+        with open(mounted, "rb") as f:
+            self.assertEqual(f.read(), b"original")
+
+    def test_a_hand_edited_index_is_cleaned_with_a_warning(self):
+        orig = self.original("a")
+        mounted = self.sd.disk_for(orig)
+        good = self.index()[0]
+        with open(os.path.join(self.sd.disks_dir, "index.json"), "w") as f:
+            json.dump([good, "junk", 7, {"key": "Half.dsk"}, {"original_path": "x"}], f)
+        self.sd.close()
+        with self.assertLogs("applewin_mcp", level="WARNING") as cm:
+            self.sd = StateDir(self.state)
+        self.addCleanup(self.sd.close)
+        self.assertEqual(len(cm.output), 4, cm.output)
+        self.assertEqual(self.sd.disk_for(orig), mounted)
+        self.assertEqual(self.sd.disk_hashes(), {"Game.dsk": sha(b"original")})
+        self.sd.save("Game.dsk", lambda tmp: open(tmp, "wb").close())   # the next index write drops the junk
+        self.assertEqual([e["key"] for e in self.index()], ["Game.dsk"])
+
+    def test_saving_a_key_with_no_entry_adds_one(self):
+        mounted = self.sd.disk_for(self.original("a"))
+        with open(os.path.join(self.sd.disks_dir, "index.json"), "w") as f:
+            f.write("[]")
+        self.sd.close()
+        self.sd = StateDir(self.state)
+        self.addCleanup(self.sd.close)
+
+        def write_to(tmp):
+            with open(tmp, "wb") as f:
+                f.write(b"saved")
+        self.sd.save("Game.dsk", write_to)
+        entries = self.index()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["key"], "Game.dsk")
+        self.assertIsNone(entries[0]["original_path"])
+        self.assertEqual(entries[0]["sha256"], sha(b"saved"))
+        for k in ("first_used", "saved_at", "original_sha256"):
+            self.assertIn(k, entries[0])
+        # an entry with no original is never matched by a path, and its key is taken
+        other = self.original("b")
+        self.assertEqual(os.path.basename(self.sd.disk_for(other)), "Game-2.dsk")
+        self.assertEqual(self.sd.disk_hashes()["Game.dsk"], sha(b"saved"))
+        self.assertTrue(os.path.isfile(mounted))
+
+    def test_a_moved_state_directory_still_finds_its_keys(self):
+        self.sd.disk_for(self.original("a"))
+        elsewhere = os.path.join(self.root, "old-state", "disks", "Game.dsk")
+        self.assertEqual(self.sd.key_of_moved(elsewhere), "Game.dsk")
+        self.assertIsNone(self.sd.key_of_moved(os.path.join(self.root, "old-state", "disks", "Other.dsk")))
+        self.assertIsNone(self.sd.key_of_moved(os.path.join(self.root, "somewhere", "Game.dsk")))
+
+    def test_utc_now_is_public(self):
+        self.assertRegex(utc_now(), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 
     def test_archive_disks_moves_the_copies_aside(self):
         orig = self.original("a")

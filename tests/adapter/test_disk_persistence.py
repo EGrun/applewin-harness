@@ -6,12 +6,15 @@ Every test mounts a temporary copy of the DOS 3.3 image as the original and chec
 """
 
 import asyncio
+import collections
 import glob
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -19,7 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_mcp import (ADAPTER_DIR, DOS_IMAGE, AdapterTestCase, call, mcp_session, sha256_file,  # noqa: E402
                       text_of)
-from applewin_mcp.harness_client import REPO_ROOT, exe_path  # noqa: E402
+from applewin_mcp import server  # noqa: E402
+from applewin_mcp.harness_client import REPO_ROOT, RpcError, exe_path  # noqa: E402
+from applewin_mcp.persistence import StateDir  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
 BOOT_MS = 12000    # boot DOS 3.3
 BURST_MS = 8000    # SAVE takes a few emulated seconds, then the write burst ends about one second after the last write
@@ -197,6 +203,153 @@ class DiskPersistenceTest(PersistenceTestCase):
             self.assertFalse(restored.is_error, text_of(restored))
             self.assertEqual(sha256_file(self.copy_of()), at_checkpoint)
         self.run_session(go)
+
+
+class FakeConn:
+    """A harness connection that answers from a table of methods (a value, an exception, or a function of the
+    params) and replays queued notifications; on_empty runs when they have run out."""
+
+    def __init__(self, replies=None, notes=(), on_empty=None):
+        self.replies, self.notes, self.on_empty = replies or {}, collections.deque(notes), on_empty
+        self.calls = []
+
+    def call(self, method, timeout=None, **params):
+        self.calls.append((method, params))
+        reply = self.replies[method]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply(params) if callable(reply) else reply
+
+    def next_notification(self, timeout=5.0):
+        if self.notes:
+            return self.notes.popleft()
+        if self.on_empty:
+            self.on_empty()
+        raise TimeoutError()
+
+    def methods(self):
+        return [m for m, _ in self.calls]
+
+
+class MachineStateUnitTest(unittest.TestCase):
+    """The state-directory parts of Machine against stub connections (no harness)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="awh-unit-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = StateDir(os.path.join(self.tmp, "state"))
+        self.addCleanup(self.state.close)
+
+    def machine(self, operator=None, agent=None, stepped=True):
+        m = object.__new__(server.Machine)
+        m.state, m.stepped, m.session_id = self.state, stepped, "sid"
+        m.lock, m.rpc_timeout = threading.Lock(), server.CALL_TIMEOUT
+        m.drive_keys, m.unsaved = {1: None, 2: None}, set()
+        m.watcher_stop = threading.Event()
+        m.operator, m.agent = operator or FakeConn(), agent or FakeConn()
+        m.applied, m.events, m.input_screen, m.last_image = {}, [], None, None
+        return m
+
+    def kept(self, name="Game.dsk"):
+        original = os.path.join(self.tmp, "orig", name)
+        os.makedirs(os.path.dirname(original), exist_ok=True)
+        with open(original, "wb") as f:
+            f.write(b"original")
+        return self.state.disk_for(original)
+
+    def checkpoints(self, ends, others=()):
+        rows = [{"checkpoint_id": "cp-{}".format(i), "name": server.SESSION_END} for i in range(1, ends + 1)]
+        return rows + [{"checkpoint_id": "cp-{}".format(100 + i), "name": n} for i, n in enumerate(others)]
+
+    def test_the_end_state_makes_room_by_pruning_to_one_fewer(self):
+        op = FakeConn({"list_checkpoints": self.checkpoints(7, ["mine"]), "delete_checkpoint": {},
+                       "checkpoint": {"checkpoint_id": "cp-200"}})
+        m = self.machine(op)
+        m._end_session()
+        deleted = [p["checkpoint_id"] for meth, p in op.calls if meth == "delete_checkpoint"]
+        self.assertEqual(deleted, ["cp-1", "cp-2", "cp-3"])   # oldest first: 7 -> 4, and the new one makes 5
+        self.assertLess(op.methods().index("delete_checkpoint"), op.methods().index("checkpoint"))
+        last = self.state.read_json("last_session.json")
+        self.assertEqual(last["end_checkpoint_id"], "cp-200")
+        self.assertNotIn("end_error", last)
+
+    def test_a_failed_end_state_is_a_warning_and_recorded(self):
+        op = FakeConn({"list_checkpoints": self.checkpoints(0, ["mine"]), "delete_checkpoint": {},
+                       "checkpoint": RpcError(-32004, "checkpoint limit reached (256)")})
+        m = self.machine(op)
+        with self.assertLogs("applewin_mcp", level="WARNING") as cm:
+            m._end_session()
+        self.assertIn("checkpoint limit reached (256)", "\n".join(cm.output))
+        last = self.state.read_json("last_session.json")
+        self.assertIsNone(last["end_checkpoint_id"])
+        self.assertTrue(last["ended_cleanly"])
+        self.assertIn("checkpoint limit reached (256)", last["end_error"])
+
+    def test_the_checkpoint_tool_at_the_limit_mentions_earlier_sessions(self):
+        m = self.machine(FakeConn({"checkpoint": RpcError(-32004, "checkpoint limit reached (256)")}))
+        with self.assertRaisesRegex(ToolError, r"checkpoint limit reached \(256\).*earlier sessions"):
+            m.checkpoint("mine")
+        m.state = None   # without a state directory the checkpoints are the session's own
+        with self.assertRaises(ToolError) as cm:
+            m.checkpoint("mine")
+        self.assertNotIn("earlier sessions", str(cm.exception))
+
+    def test_learn_drives_assigns_only_when_it_worked(self):
+        mounted = self.kept()
+        rows = [{"slot": 6, "drive": 1, "original_path": mounted, "write_protected": False}]
+        m = self.machine(FakeConn({"list_disks": rows}))
+        m._learn_drives()
+        self.assertEqual(m.drive_keys, {1: "Game.dsk", 2: None})
+        m.operator = FakeConn({"list_disks": RpcError(-32008, "gone")})
+        with self.assertRaises(ToolError):
+            m._learn_drives()
+        self.assertEqual(m.drive_keys, {1: "Game.dsk", 2: None})
+        stray = {"slot": 6, "drive": 2, "original_path": os.path.join(self.tmp, "x", "Other.dsk"),
+                 "write_protected": False}
+        m.operator = FakeConn({"list_disks": rows + [stray]})
+        with self.assertLogs("applewin_mcp", level="WARNING") as cm:
+            m._learn_drives()
+        self.assertIn("Other.dsk", "\n".join(cm.output))
+        self.assertEqual(m.drive_keys, {1: "Game.dsk", 2: None})
+
+    def test_a_restore_that_worked_is_not_an_error_when_the_disks_cannot_be_updated(self):
+        op = FakeConn({"list_checkpoints": [{"checkpoint_id": "cp-1", "name": None}],
+                       "restore_checkpoint": {"emulated_cycles": 1000}, "list_disks": RpcError(-32000, "boom")})
+        m = self.machine(op, FakeConn({"subscribe_frames": {}}))
+        m.pump = lambda timeout=0.0: None
+        with self.assertLogs("applewin_mcp", level="WARNING") as cm:
+            text = m.restore_checkpoint("cp-1")
+        self.assertIn("restored cp-1", text)
+        self.assertIn("boom", "\n".join(cm.output))
+
+    def test_the_agent_cannot_touch_the_state_directory(self):
+        mounted = self.kept()
+        m = self.machine(FakeConn({"export_disk": {}, "insert_disk": {}}))
+        index = os.path.join(self.state.disks_dir, "index.json")
+        startup = os.path.join(self.state.path, "startup.json")
+        state_file = os.path.join(self.state.states_dir, "cp-1", "x.dsk")
+        for inside in (startup, index, mounted, state_file):
+            with self.subTest(export=inside):
+                with self.assertRaisesRegex(ToolError, "state directory"):
+                    m.export_disk(1, inside)
+        for inside in (startup, index, state_file):
+            with self.subTest(insert=inside):
+                with self.assertRaisesRegex(ToolError, "state directory"):
+                    m.insert_disk(1, inside, False)
+        self.assertEqual(m.operator.calls, [])
+        m.insert_disk(1, mounted, False)   # a persisted copy itself may be inserted (it is mounted as it is)
+        self.assertEqual(m.operator.methods(), ["insert_disk"])
+
+    def test_the_watcher_saves_each_drive_once_per_burst_of_notices(self):
+        def note(drive):
+            return {"method": "disk_written", "params": {"drive": drive}}
+        m, saved = self.machine(), []
+        m.operator = FakeConn(notes=[note(1), note(1), {"method": "other"}, note(2), note(1)],
+                              on_empty=lambda: m.watcher_stop.set() if saved else None)   # once it has saved
+        m.drive_keys = {1: "A.dsk", 2: "B.dsk"}
+        m._save_drive = saved.append
+        m._watch_disk_writes()
+        self.assertEqual(saved, [1, 2])
 
 
 class StateDirectoryTest(PersistenceTestCase):

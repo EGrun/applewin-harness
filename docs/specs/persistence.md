@@ -28,7 +28,7 @@ One directory per program being played, chosen by the operator (the client passe
   states/             stepped-session checkpoints (§3), one directory each
   last_session.json   how the last session ended (§5)
   startup.json        what this session started from (§5), written at start
-  archive/            what --fresh-disks and --fresh-machine moved aside (never deleted by the code)
+  archive/            what --fresh-disks moved aside (never deleted by the code)
   .lock               held while a process uses the directory
 ```
 
@@ -81,14 +81,14 @@ The harness never writes an original image (D5) and already provides what is nee
 
 ## 5. Adapter: resuming a stepped session
 
-- **At shutdown of a stepped session** (the MCP session closes or the adapter is stopped normally), the adapter, in this order: saves every drive (§4); takes `checkpoint {name: "session end"}`; deletes all but the newest 5 checkpoints named `session end` (the agent's own checkpoints are never deleted automatically); writes `last_session.json`:
+- **At shutdown of a stepped session** (the MCP session closes or the adapter is stopped normally), the adapter, in this order: saves every drive (§4); takes `checkpoint {name: "session end"}`; deletes the oldest `session end` checkpoints beforehand so that, with the new one, 5 remain (before, because the harness refuses a checkpoint beyond 256 and the directory outlives sessions; the agent's own checkpoints are never deleted automatically); writes `last_session.json`:
 
   ```json
   { "session_id": "<uuid of this adapter run>", "run_mode": "stepped", "ended_cleanly": true,
     "end_checkpoint_id": "cp-41", "ended_at": "2026-11-02T21:55:03Z", "disks": { "<key>": "<sha256>" } }
   ```
 
-  The name `session end` is reserved: the agent's `checkpoint` tool refuses it, so pruning never removes an agent's checkpoint. If taking the checkpoint fails, `end_checkpoint_id` is `null` and the failure is logged.
+  The name `session end` is reserved: the agent's `checkpoint` tool refuses it, so pruning never removes an agent's checkpoint. If taking the checkpoint fails, `end_checkpoint_id` is `null`, the failure is logged as a warning and its cause is recorded as `"end_error"` in `last_session.json`.
 
 - **At shutdown of a realtime session** it saves every drive and writes `last_session.json` with `"run_mode": "realtime"`, `"end_checkpoint_id": null`. No machine state is taken.
 - **A session that ends any other way** (a crash, a kill) writes nothing at the end. The `last_session.json` of an earlier session is left, but `startup.json` of the dead session (below) shows it never ended, which the next start detects.
@@ -99,7 +99,7 @@ The harness never writes an original image (D5) and already provides what is nee
   4. the checkpoint exists and is `compatible`;
   5. every persisted disk's sha256 matches `last_session.json`'s `disks`, so no disk changed since (for example in a realtime session in between, whose disk saves a restore would undo).
 - **At start of a realtime session** the machine always boots fresh with the persisted disks.
-- `startup.json` records what happened: `{ "session_id", "run_mode", "started_at", "restored": "<checkpoint id>" | null, "reason" }`. It is written at start, after the decision, and is what rule 3 compares with: the previous `startup.json`'s `session_id` must equal `last_session.json`'s. The client reads it to tell the agent and the person (`docs/specs/client.md` §7.3). `reason` is the first of these that applies, in this order:
+- `startup.json` records what happened: `{ "session_id", "run_mode", "started_at", "restored": "<checkpoint id>" | null, "reason", "previous_session_id", "previous_ended_at" }`; the last two come from `last_session.json` (`null` when there is none), so the client can say when the restored session ended. It is written at start, after the decision, and is what rule 3 compares with: the previous `startup.json`'s `session_id` must equal `last_session.json`'s. The client reads it to tell the agent and the person (`docs/specs/client.md` §7.3). `reason` is the first of these that applies, in this order:
 
   | `reason` | When |
   |---|---|
@@ -112,6 +112,7 @@ The harness never writes an original image (D5) and already provides what is nee
   | `no_end_state` | `end_checkpoint_id` is `null` or not listed |
   | `other_build` | the end checkpoint is not `compatible` |
   | `disks_changed` | the persisted disks' sha256 differ from `last_session.json`'s |
+  | `restore_failed` | restoring the end state failed; the machine booted fresh (on a new harness if the failed restore left the session unusable) |
   | `restored` | none of the above: the end state was restored |
 - **`--fresh-machine`** boots fresh even when the rules would restore; checkpoints stay available to the agent in a stepped session.
 
@@ -131,7 +132,7 @@ The harness never writes an original image (D5) and already provides what is nee
 9. `--fresh-disks` moves the old copies to `archive/` and mounts the originals.
 10. Two originals with the same file name in different folders get different keys.
 11. Stepped: a clean shutdown writes a `session end` checkpoint and `last_session.json`; the next stepped start restores it (`startup.json.restored` set, the screen as it was).
-12. No restore when: `--fresh-machine`; the previous session was realtime; the previous session crashed (killed adapter); a disk's sha256 changed; the checkpoint is from another build. Each sets `startup.json.reason`.
+12. No restore when: `--fresh-machine`; the previous session was realtime; the previous session crashed (killed adapter); a disk's sha256 changed; the checkpoint is from another build; the restore itself fails (a boot on the persisted disks, on a new harness when the session is unusable). Each sets `startup.json.reason`.
 13. Only the newest 5 `session end` checkpoints are kept; an agent-named checkpoint survives.
 14. Realtime: no `checkpoint_dir` is sent, no checkpoint tools are listed, and no state is taken at shutdown.
 15. A second adapter on a locked `--state-dir` exits with an error naming it.

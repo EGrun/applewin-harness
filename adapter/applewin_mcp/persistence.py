@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import time
 import uuid
 
 try:
@@ -26,7 +27,13 @@ class StateDirLocked(Exception):
     """Another process holds the state directory's .lock."""
 
 
-def _now():
+REPLACE_TRIES = 6        # a rename onto a file another process has open (a virus scanner, the search indexer) fails
+REPLACE_PAUSE = 0.3      # for a moment on Windows: 6 tries over about 1.5 s
+BUSY_WINERRORS = (5, 32, 33)   # access denied, sharing violation, lock violation
+INDEX_KEYS = ("key", "original_path", "original_sha256", "saved_at", "sha256")
+
+
+def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -42,6 +49,24 @@ def _same_path(a, b):
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
+def replace_file(src, dst):
+    """os.replace that rides out a busy destination (PermissionError, or winerror 5, 32, 33)."""
+    for attempt in range(REPLACE_TRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            busy = isinstance(e, PermissionError) or getattr(e, "winerror", None) in BUSY_WINERRORS
+            if not busy or attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(REPLACE_PAUSE)
+
+
+def _within(path, root):
+    path, root = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(root))
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def _write_json_atomic(directory, name, data):
     tmp = os.path.join(directory, ".{}.{}.tmp".format(name, uuid.uuid4().hex))
     try:
@@ -49,7 +74,7 @@ def _write_json_atomic(directory, name, data):
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(directory, name))
+        replace_file(tmp, os.path.join(directory, name))
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -95,16 +120,42 @@ class StateDir:
         try:
             with open(os.path.join(self.disks_dir, "index.json"), encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, list) else []
         except (OSError, ValueError):
             return []
+        if not isinstance(data, list):
+            return []
+        kept = []
+        for entry in data:   # a hand-edited index must not stop the start
+            if isinstance(entry, dict) and isinstance(entry.get("key"), str) and all(k in entry for k in INDEX_KEYS):
+                kept.append(entry)
+            else:
+                _logger.warning("ignoring a malformed entry in disks/index.json: {!r}".format(entry))
+        return kept
 
     def _save_index(self):
         _write_json_atomic(self.disks_dir, "index.json", self._index)
 
+    def contains(self, path):
+        """Is the path inside the state directory (any file the adapter keeps there)?"""
+        return _within(path, self.path)
+
+    def is_kept_disk_path(self, path):
+        """Is the path a place for a persisted disk: in disks/, but not the index or a save in progress?"""
+        name = os.path.basename(path)
+        return _within(path, self.disks_dir) and name != "index.json" and ".tmp-" not in name
+
     def key_of(self, mounted):
         if os.path.isfile(mounted) and _same_path(os.path.dirname(os.path.abspath(mounted)), self.disks_dir):
             return os.path.basename(mounted)
+        return None
+
+    def key_of_moved(self, mounted):
+        """The key for a disk path from another state directory (a checkpoint made before this one was moved or
+        copied): a file in a folder called disks, named like one of our keys."""
+        mounted = os.path.abspath(mounted)
+        name = os.path.basename(mounted)
+        if os.path.basename(os.path.dirname(mounted)).lower() == "disks" and any(e["key"] == name for e in self._index):
+            return name
         return None
 
     def _new_key(self, name):
@@ -120,7 +171,7 @@ class StateDir:
         original = os.path.abspath(original)
         if self.key_of(original) is not None:
             return original
-        entry = next((e for e in self._index if _same_path(e["original_path"], original)), None)
+        entry = next((e for e in self._index if e["original_path"] and _same_path(e["original_path"], original)), None)
         if entry is not None and os.path.isfile(os.path.join(self.disks_dir, entry["key"])):
             now_sha = sha256_of(original) if os.path.isfile(original) else None
             if now_sha is not None and now_sha != entry["original_sha256"]:
@@ -129,6 +180,8 @@ class StateDir:
                                     original, entry["original_sha256"], now_sha, entry["key"]))
             return os.path.join(self.disks_dir, entry["key"])
         if entry is not None:
+            _logger.warning("the persisted copy {} of {} is missing; copying the original again".format(
+                entry["key"], original))
             self._index.remove(entry)
         key = self._new_key(os.path.basename(original))
         target = os.path.join(self.disks_dir, key)
@@ -136,13 +189,13 @@ class StateDir:
         tmp = os.path.join(self.disks_dir, "{}.tmp-{}{}".format(stem, uuid.uuid4().hex, ext))
         try:
             shutil.copyfile(original, tmp)
-            os.replace(tmp, target)
+            replace_file(tmp, target)
         except BaseException:
             if os.path.exists(tmp):
                 os.remove(tmp)
             raise
         digest = sha256_of(target)
-        now = _now()
+        now = utc_now()
         self._index.append({"key": key, "original_path": original, "original_sha256": digest, "first_used": now,
                             "saved_at": now, "sha256": digest})
         self._save_index()
@@ -155,16 +208,20 @@ class StateDir:
         try:
             write_to(tmp)
             digest = sha256_of(tmp)
-            os.replace(tmp, os.path.join(self.disks_dir, key))
+            replace_file(tmp, os.path.join(self.disks_dir, key))
         except BaseException:
             if os.path.exists(tmp):
                 os.remove(tmp)
             raise
         for e in self._index:
             if e["key"] == key:
-                e["saved_at"] = _now()
+                e["saved_at"] = utc_now()
                 e["sha256"] = digest
                 break
+        else:   # a copy the index lost track of (--fresh-disks, then an old checkpoint restored): keep it by key
+            now = utc_now()
+            self._index.append({"key": key, "original_path": None, "original_sha256": digest, "first_used": now,
+                                "saved_at": now, "sha256": digest})
         self._save_index()
 
     def archive_disks(self):
@@ -175,17 +232,17 @@ class StateDir:
             n += 1
         if n > 1:
             dest += "-{}".format(n)
-        os.replace(self.disks_dir, dest)
+        replace_file(self.disks_dir, dest)
         os.makedirs(self.disks_dir)
         self._index = []
         return dest
 
     def disk_hashes(self):
         out = {}
-        for name in sorted(os.listdir(self.disks_dir)):
-            p = os.path.join(self.disks_dir, name)
-            if name != "index.json" and ".tmp-" not in name and os.path.isfile(p):
-                out[name] = sha256_of(p)
+        for key in sorted(e["key"] for e in self._index):   # only the indexed copies: strays do not count
+            p = os.path.join(self.disks_dir, key)
+            if os.path.isfile(p):
+                out[key] = sha256_of(p)
         return out
 
     def read_json(self, name):

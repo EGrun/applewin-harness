@@ -331,10 +331,11 @@ The line follows `startup.json`'s `reason` (persistence spec §5), one line per 
 
 | `reason` | Line |
 |---|---|
-| `restored` | `[harness] The machine was restored to where the previous session ended (checkpoint <id>, <UTC time>).` |
+| `restored` | `[harness] The machine was restored to where the previous session ended (checkpoint <id>, <UTC time>).` (the time is `previous_ended_at`) |
 | `realtime` | `[harness] This is a realtime session: the machine was started fresh. The disks hold every save made in earlier sessions.` |
 | `fresh_machine` | `[harness] The machine was started fresh because --fresh-machine was given. The disks hold every save made in earlier sessions.` |
 | `fresh_disks` | `[harness] The machine was started fresh with the original disks (--fresh-disks).` |
+| `restore_failed` | `[harness] The machine was started fresh: restoring the previous session's state failed. The disks hold every save made in earlier sessions.` |
 | `first_session` | `[harness] This is the first session of this campaign.` |
 | `previous_unclean` | `[harness] The machine was started fresh: the previous session did not end cleanly. The disks hold every save made in earlier sessions.` |
 | `previous_realtime` | `[harness] The machine was started fresh: the previous session was realtime. The disks hold every save made in earlier sessions.` |

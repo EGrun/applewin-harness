@@ -9,16 +9,20 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_disk_persistence import BURST_MS, PersistenceTestCase  # noqa: E402
 from test_mcp import ADAPTER_DIR, CHECKPOINT_TOOLS, call, pid_alive, sha256_file, text_of  # noqa: E402
+from applewin_mcp import server  # noqa: E402
 from applewin_mcp.harness_client import REPO_ROOT, exe_path  # noqa: E402
+from applewin_mcp.persistence import StateDir  # noqa: E402
 
 OTHER_BUILD = "0.0.0+aaaaaaaaaaaa"
 SESSION_END = "session end"
@@ -112,6 +116,8 @@ class ResumeTest(ResumeTestCase):
         self.boot_and_print()
         last = self.last_session()
         first_id = self.startup()["session_id"]
+        self.assertIsNone(self.startup()["previous_session_id"])   # nothing came before
+        self.assertIsNone(self.startup()["previous_ended_at"])
         self.assertTrue(last["ended_cleanly"])
         self.assertEqual(last["session_id"], first_id)
         self.assertEqual(last["run_mode"], "stepped")
@@ -127,6 +133,8 @@ class ResumeTest(ResumeTestCase):
         self.assertNotEqual(started["session_id"], first_id)
         self.assertEqual(started["restored"], last["end_checkpoint_id"])
         self.assertEqual(started["reason"], "restored")
+        self.assertEqual(started["previous_session_id"], first_id)
+        self.assertEqual(started["previous_ended_at"], last["ended_at"])
 
     def test_no_restore_with_fresh_machine(self):
         self.boot_and_print()
@@ -231,6 +239,90 @@ class ResumeTest(ResumeTestCase):
             self.assertNotEqual(again.returncode, 0)
             self.assertFalse(os.path.exists(os.path.join(self.state, "last_session.json")))
         self.run_session(held)
+
+    def check_restore_failed(self, damage, relaunched):
+        """The last session ended cleanly with a program saved on the disk; damage(checkpoint dir) breaks its end
+        state. The next start must run, on the persisted disks, as a fresh machine with reason restore_failed."""
+        async def first(s):
+            await self.boot(s)
+            await self.save_program(s)
+            await call(s, "wait", ms=BURST_MS)
+        self.run_session(first)
+        end = self.last_session()["end_checkpoint_id"]
+        saved = sha256_file(self.copy_of())
+        damage(os.path.join(self.state, "states", end))
+
+        async def second(s):
+            self.assertEqual(sha256_file(self.copy_of()), saved)
+            await self.boot(s)
+            self.assertNotIn("PRINT", await self.screen(s))   # a fresh boot, not the saved screen
+            self.assertIn('10 PRINT "KEPT"', await self.load_and_list(s))   # on the persisted disk
+        self.run_session(second)
+        self.assertEqual(self.startup()["reason"], "restore_failed")
+        self.assertIsNone(self.startup()["restored"])
+        self.assertEqual(("starting it again" in self.stderr_text()), relaunched, self.stderr_text())
+        self.assertTrue(self.last_session()["ended_cleanly"])
+        self.assertNotEqual(self.last_session()["end_checkpoint_id"], end)
+
+    def test_a_restore_that_fails_before_the_load_boots_fresh(self):
+        def damage(cp):   # listed (the copy is there) but the restore cannot copy it: another process holds it
+            import ctypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.CreateFileW.restype = ctypes.c_void_p
+            handle = kernel.CreateFileW(os.path.join(cp, "disk1-DOS.dsk"), 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotEqual(handle, ctypes.c_void_p(-1).value, ctypes.get_last_error())
+            self.addCleanup(kernel.CloseHandle, ctypes.c_void_p(handle))
+        self.check_restore_failed(damage, relaunched=False)
+
+    def test_a_restore_that_fails_in_the_load_boots_fresh_on_a_new_harness(self):
+        def damage(cp):
+            with open(os.path.join(cp, "state.yaml"), "r+b") as f:
+                data = f.read()
+                f.seek(0)
+                f.write(data.replace(b"Unit:", b"Unix:"))
+        self.check_restore_failed(damage, relaunched=True)
+
+    def test_a_stray_file_in_disks_does_not_stop_the_resume(self):
+        self.boot_and_print()
+        for stray in ("desktop.ini", "Thumbs.db"):
+            with open(os.path.join(self.state, "disks", stray), "wb") as f:
+                f.write(b"[.ShellClassInfo]")
+        self.clean_run()
+        self.assertEqual(self.startup()["reason"], "restored")
+
+    def test_a_copied_state_directory_resumes_and_keeps_its_own_disks(self):
+        async def first(s):
+            await self.boot(s)
+            await self.save_program(s, "FIRST", '10 PRINT "FIRST"')
+            await call(s, "wait", ms=BURST_MS)
+        self.run_session(first)
+        old = self.state
+        self.state = os.path.join(self.tmp, "moved-state")
+        shutil.copytree(old, self.state)
+        before_old, before_new = sha256_file(os.path.join(old, "disks", "DOS.dsk")), sha256_file(self.copy_of())
+
+        async def second(s):   # restored from the copy's own end state; its checkpoints name the old directory
+            await self.save_program(s, "SECOND", '10 PRINT "SECOND"')
+            await call(s, "wait", ms=BURST_MS)
+        self.run_session(second)
+        self.assertEqual(self.startup()["reason"], "restored")
+        self.assertNotEqual(sha256_file(self.copy_of()), before_new)   # the copy was saved
+        self.assertEqual(sha256_file(os.path.join(old, "disks", "DOS.dsk")), before_old)   # the old one was not
+
+    def test_a_failing_session_record_still_stops_the_harness_and_frees_the_directory(self):
+        args = server.parse_args(["--exe", os.path.abspath(exe_path()), "--headless", *self.args()])
+        machine = server.Machine(args)
+        pid = machine.harness.pid
+        self.addCleanup(machine.harness.kill)
+        with mock.patch.object(StateDir, "write_json", side_effect=OSError("disk full")):
+            with self.assertLogs("applewin_mcp", level="WARNING") as cm:
+                machine.shutdown()
+        self.assertIn("disk full", "\n".join(cm.output))
+        deadline = time.monotonic() + 30
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.25)
+        self.assertFalse(pid_alive(pid))
+        StateDir(self.state).close()   # raises StateDirLocked if the lock were still held
 
     def test_list_checkpoints_marks_another_builds(self):
         self.boot_and_print()

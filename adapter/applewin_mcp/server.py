@@ -27,7 +27,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
-from .persistence import StateDir, StateDirLocked, _now, resume_decision
+from .persistence import StateDir, StateDirLocked, resume_decision, utc_now
 from .screen import (FRAME_H, FRAME_W, MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
                      contact_sheet, crop_zoom, decode_png, encode_png, region_differs, sheet_size)
 
@@ -37,6 +37,8 @@ INPUT_FRAME_CAP = 600      # frames per key the input tools wait beyond the inpu
 DEFAULT_HOLD_MS = 50       # the harness's press_key default
 SETTLE_FRAMES = 3          # frames after the last key so the program can echo it
 CALL_TIMEOUT = 600.0
+SHUTDOWN_TIMEOUT = 60.0   # the RPCs of a shutdown, and the wait for the machine's lock
+WATCHER_JOIN = 10.0
 WAIT_RANGE = (1, 60000)
 LISTEN_RANGE = (0, 60000)
 CHANGE_RANGE = (1, 60000)
@@ -298,6 +300,7 @@ class Machine:
     and self.lock keeps one tool call at a time on the emulator."""
 
     state = None   # the StateDir, with --state-dir
+    harness = None
 
     def __init__(self, args):
         self.stepped = not args.realtime
@@ -314,6 +317,7 @@ class Machine:
         self.session_id = uuid.uuid4().hex
         self.watcher = None
         self.watcher_stop = threading.Event()
+        self.rpc_timeout = CALL_TIMEOUT
         if args.state_dir:
             self.state = StateDir(args.state_dir)   # before the harness starts: a directory in use fails fast
         try:
@@ -327,57 +331,107 @@ class Machine:
         if self.state is not None and args.fresh_disks:
             log("moved the kept disks to {}".format(self.state.archive_disks()))
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
-        self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
-                                      stderr_line=self._forward_harness_line)
-        log("harness pid {}".format(self.harness.pid))
         try:
-            self.operator = self.harness.connect("operator")
-            self.operator.call("create_session", timeout=CALL_TIMEOUT, **session_params(args, self.state))
-            self.agent = self.harness.connect("agent")
-            self.agent.call("subscribe_audio", timeout=CALL_TIMEOUT)
+            self._connect(args)
             if self.state is not None:
+                restored, reason = self._resume(args)   # before the disk-write subscription: a restore is no write
                 self.operator.call("subscribe_disk_writes", timeout=CALL_TIMEOUT)
                 self._learn_drives()
+                if restored is not None:
+                    self._save_all()   # the persisted copies follow the machine
                 self.watcher = threading.Thread(target=self._watch_disk_writes, name="disk-writes", daemon=True)
                 self.watcher.start()
-                self._resume(args)
+                self._write_startup(args, restored, reason)
             self.started = True
         except BaseException:
             self.shutdown()
             raise
 
+    def _connect(self, args):
+        """Launches the harness and opens the session: both connections, the session, the audio subscription. Also
+        the second launch after a failed restore, so what the adapter holds from a machine starts empty."""
+        self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
+                                      stderr_line=self._forward_harness_line)
+        log("harness pid {}".format(self.harness.pid))
+        self.events, self.applied, self.frame_ready = [], {}, []
+        self.input_screen = self.last_image = None
+        self.operator = self.harness.connect("operator")
+        self.operator.call("create_session", timeout=CALL_TIMEOUT, **session_params(args, self.state))
+        self.agent = self.harness.connect("agent")
+        self.agent.call("subscribe_audio", timeout=CALL_TIMEOUT)
+
     def _resume(self, args):
-        """Restores the last stepped session's end state when persistence.md section 5 allows (the same path as the
-        agent's restore_checkpoint), then writes startup.json: the next start compares its session_id with
-        last_session.json's."""
+        """Restores the last stepped session's end state when persistence.md section 5 allows (the same harness
+        call as the agent's restore_checkpoint). Returns (checkpoint restored or None, reason). A restore that fails
+        is no reason to stop: the machine boots fresh (reason "restore_failed"), on a new harness if the old one's
+        session is no longer usable."""
         run_mode = "realtime" if args.realtime else "stepped"
         with self.lock:
             rows = [] if args.realtime else self.rpc(self.operator, "list_checkpoints")
             restore, reason = resume_decision(
                 run_mode, self.state.read_json("last_session.json"), self.state.read_json("startup.json"), rows,
                 self.state.disk_hashes(), args.fresh_machine, args.fresh_disks)
-        if restore is not None:
-            self.restore_checkpoint(restore)
+            if restore is not None:
+                try:
+                    self._restore_rpc(restore, raw=True)
+                except (RpcError, ConnectionClosed) as e:   # the connection's own errors; rpc() would hide the code
+                    _logger.warning("could not restore the end state {} ({}); starting a fresh machine".format(
+                        restore, e))
+                    restore, reason = None, "restore_failed"
+                    if not self._session_usable():
+                        self._relaunch(args)
         log("starting {}: {}".format(run_mode, "restored " + restore if restore else "fresh machine ({})".format(reason)))
-        self.state.write_json("startup.json", {"session_id": self.session_id, "run_mode": run_mode,
-                                               "started_at": _now(), "restored": restore, "reason": reason})
+        return restore, reason
+
+    def _session_usable(self):
+        """After a failed restore: the harness answers -32008 only once a failure in or after the load has made the
+        session unusable (a failure before the load leaves the machine as it was)."""
+        try:
+            self.operator.call("get_state_checksum", timeout=CALL_TIMEOUT)
+            return True
+        except RpcError as e:
+            return e.code != -32008
+        except (ConnectionClosed, TimeoutError, OSError):
+            return False
+
+    def _relaunch(self, args):
+        """A new harness on the same state directory, once: the old one must exit first (that releases states/.lock)."""
+        log("the emulator cannot be used after the failed restore; starting it again")
+        try:
+            self.harness.close()
+        except Exception as e:
+            log("shutdown error: {!r}".format(e))
+            self.harness.kill()
+        self._connect(args)
+
+    def _write_startup(self, args, restored, reason):
+        """startup.json: the next start compares its session_id with last_session.json's."""
+        last = self.state.read_json("last_session.json") or {}
+        self.state.write_json("startup.json", {
+            "session_id": self.session_id, "run_mode": "realtime" if args.realtime else "stepped",
+            "started_at": utc_now(), "restored": restored, "reason": reason,
+            "previous_session_id": last.get("session_id"), "previous_ended_at": last.get("ended_at")})
 
     def _end_session(self):
         """Persistence.md section 5, at a normal end: the end state (stepped), then last_session.json. Call with
         self.lock held, after _save_all."""
-        end = None
+        end, end_error = None, None
         if self.stepped:
-            try:
-                end = self.rpc(self.operator, "checkpoint", name=SESSION_END)["checkpoint_id"]
+            try:   # make room first: the harness refuses a checkpoint beyond 256, and the directory outlives sessions
                 ends = [c["checkpoint_id"] for c in self.rpc(self.operator, "list_checkpoints")
                         if c.get("name") == SESSION_END]
-                for old in ends[:-KEEP_SESSION_ENDS]:   # oldest first
+                for old in ends[:max(0, len(ends) - (KEEP_SESSION_ENDS - 1))]:   # oldest first
                     self.rpc(self.operator, "delete_checkpoint", checkpoint_id=old)
+                end = self.rpc(self.operator, "checkpoint", name=SESSION_END)["checkpoint_id"]
             except Exception as e:   # a lost end state must not stop the shutdown
-                _logger.warning("could not keep the end state: {}".format(e))
-        self.state.write_json("last_session.json", {
-            "session_id": self.session_id, "run_mode": "stepped" if self.stepped else "realtime",
-            "ended_cleanly": True, "end_checkpoint_id": end, "ended_at": _now(), "disks": self.state.disk_hashes()})
+                end_error = str(e)
+                _logger.warning("could not keep the end state; the next start will boot fresh: {}".format(e))
+        record = {"session_id": self.session_id, "run_mode": "stepped" if self.stepped else "realtime",
+                  "ended_cleanly": True, "end_checkpoint_id": end, "ended_at": utc_now(),
+                  "disks": self.state.disk_hashes()}
+        if end_error is not None:
+            record["end_error"] = end_error
+        self.state.write_json("last_session.json", record)
 
     @staticmethod
     def _forward_harness_line(line):
@@ -390,11 +444,17 @@ class Machine:
 
     def _learn_drives(self):
         """Rebuilds drive_keys from list_disks: a drive's key is the name of its persisted copy; a write-protected
-        drive, or a disk that is not a persisted copy, has none and is never saved. Call with self.lock held."""
-        self.drive_keys = {1: None, 2: None}
+        drive has none and is never saved. Call with self.lock held. drive_keys changes only if all of it worked."""
+        keys = {1: None, 2: None}
         for row in self.rpc(self.operator, "list_disks"):
-            if row.get("slot") == 6 and row.get("drive") in self.drive_keys and not row.get("write_protected"):
-                self.drive_keys[row["drive"]] = self.state.key_of(row["original_path"])
+            if row.get("slot") == 6 and row.get("drive") in keys and not row.get("write_protected"):
+                path = row["original_path"]
+                # a checkpoint made before the state directory was moved or copied names the old place
+                keys[row["drive"]] = self.state.key_of(path) or self.state.key_of_moved(path)
+                if keys[row["drive"]] is None:
+                    _logger.warning("drive {} holds {}, which is not one of the persisted copies; its writes will "
+                                    "not be kept".format(row["drive"], path))
+        self.drive_keys = keys
 
     def _save_drive(self, drive):
         """Exports the drive's disk over its persisted copy. A failure is logged and remembered, never raised.
@@ -422,22 +482,33 @@ class Machine:
                 continue
             if note.get("method") != "disk_written":
                 continue
+            drives = {(note.get("params") or {}).get("drive")}
+            while True:   # one save per drive for the notices already waiting
+                try:
+                    more = self.operator.next_notification(timeout=0)
+                except TimeoutError:
+                    break
+                if more.get("method") == "disk_written":
+                    drives.add((more.get("params") or {}).get("drive"))
             with self.lock:
                 if self.watcher_stop.is_set():
                     return
-                self._save_drive((note.get("params") or {}).get("drive"))
-                for drive in sorted(self.unsaved):   # a drive that failed before gets another try
+                for drive in sorted(d for d in drives | self.unsaved if d in self.drive_keys):   # failed ones retry
                     self._save_drive(drive)
 
     # ---- helpers (call with self.lock held) ----
 
+    @staticmethod
+    def _tool_error(e):
+        if isinstance(e, RpcError):
+            return ToolError(e.message)
+        return ToolError("the emulator is not responding ({!r})".format(e))
+
     def rpc(self, conn, method, **params):
         try:
-            return conn.call(method, timeout=CALL_TIMEOUT, **params)
-        except RpcError as e:
-            raise ToolError(e.message) from None
-        except (ConnectionClosed, TimeoutError, OSError) as e:
-            raise ToolError("the emulator is not responding ({!r})".format(e)) from None
+            return conn.call(method, timeout=self.rpc_timeout, **params)
+        except (RpcError, ConnectionClosed, TimeoutError, OSError) as e:
+            raise self._tool_error(e) from None
 
     def pump(self, timeout=0.0):
         """Moves queued notifications into self.events / self.applied."""
@@ -808,6 +879,9 @@ class Machine:
 
     def insert_disk(self, drive, path, write_protected):
         path = self._local_path(path)
+        if self.state is not None and self.state.contains(path) and not self.state.is_kept_disk_path(path):
+            raise ToolError("{} is in the state directory, which the adapter manages; only the disks in {} can be "
+                            "inserted from there".format(path, self.state.disks_dir))
         with self.lock:
             mounted, key = path, None
             if self.state is not None:
@@ -829,6 +903,9 @@ class Machine:
 
     def export_disk(self, drive, path):
         path = self._local_path(path)
+        if self.state is not None and self.state.contains(path):
+            raise ToolError("{} is in the state directory, which the adapter manages; export to another folder".format(
+                path))
         with self.lock:
             self.rpc(self.operator, "export_disk", slot=6, drive=drive, dest_path=path)
         return "exported drive {} to {}".format(drive, path)
@@ -878,14 +955,39 @@ class Machine:
                 SESSION_END))
         params = {} if name is None else {"name": name}
         with self.lock:
-            saved = self.rpc(self.operator, "checkpoint", **params)
+            try:
+                saved = self.rpc(self.operator, "checkpoint", **params)
+            except ToolError as e:
+                if self.state is not None and "checkpoint limit reached" in str(e):
+                    raise ToolError("{}; with a state directory the limit also counts the checkpoints of earlier "
+                                    "sessions: delete some with delete_checkpoint".format(e)) from None
+                raise
         return "saved {} at {:.1f} ms".format(self._checkpoint_label(saved["checkpoint_id"], name),
                                               cycles_to_ms(saved["emulated_cycles"]))
 
+    def _restore_rpc(self, checkpoint_id, raw=False):
+        """The harness restore and what follows from it, for the agent's tool and for the start. Everything the
+        adapter kept from the thrown-away timeline goes too: the harness reports the input it discarded (drained
+        here), and the sound events not yet given to listen and the last-input screen and the last image sent
+        belong to that timeline. A refused restore changes none of this. It raises ToolError, or with raw the
+        connection's own errors (RpcError: the start-up reads its code). Call with self.lock held."""
+        if raw:
+            restored = self.operator.call("restore_checkpoint", timeout=self.rpc_timeout, checkpoint_id=checkpoint_id)
+        else:
+            restored = self.rpc(self.operator, "restore_checkpoint", checkpoint_id=checkpoint_id)
+        # The discarded-input notices and the old timeline's last sound events come on the agent connection,
+        # which may not have been read yet. A reply there follows that connection's earlier notifications, so
+        # once this no-op unsubscribe returns they have all arrived and can be drained.
+        self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
+        self.pump(0.0)
+        self.applied = {}
+        self.events = []
+        self.input_screen = None
+        self.last_image = None
+        return restored
+
     def restore_checkpoint(self, checkpoint_id):
-        """Restores the machine and its disks. Everything the adapter kept from the thrown-away timeline goes too:
-        the harness reports the input it discarded (drained here), and the sound events not yet given to listen and
-        the last-input screen and the last image sent belong to that timeline."""
+        """Restores the machine and its disks."""
         self._require_stepped()
         with self.lock:
             try:   # the name is only for the message: looked up first, so the restore's result is what counts
@@ -893,19 +995,13 @@ class Machine:
                 name = next((c.get("name") for c in rows if c["checkpoint_id"] == checkpoint_id), None)
             except ToolError:
                 name = None
-            restored = self.rpc(self.operator, "restore_checkpoint", checkpoint_id=checkpoint_id)
-            # The discarded-input notices and the old timeline's last sound events come on the agent connection,
-            # which may not have been read yet. A reply there follows that connection's earlier notifications, so
-            # once this no-op unsubscribe returns they have all arrived and can be drained.
-            self.rpc(self.agent, "subscribe_frames", every_n_frames=0)
-            self.pump(0.0)
-            self.applied = {}
-            self.events = []
-            self.input_screen = None
-            self.last_image = None
-            if self.state is not None:   # the persisted copies follow the machine
-                self._learn_drives()
-                self._save_all()
+            restored = self._restore_rpc(checkpoint_id)
+            if self.state is not None:   # the persisted copies follow the machine; a problem here is not the restore's
+                try:
+                    self._learn_drives()
+                    self._save_all()
+                except Exception as e:
+                    _logger.warning("could not update the persisted disks after the restore: {}".format(e))
         return "restored {} at {:.1f} ms".format(self._checkpoint_label(checkpoint_id, name),
                                                  cycles_to_ms(restored["emulated_cycles"]))
 
@@ -927,22 +1023,35 @@ class Machine:
 
     def shutdown(self):
         """Saves the kept disks, then close_session, then waits for the process to exit (Harness.close waits 5 s,
-        then kills it)."""
-        if self.state is not None:
-            self.watcher_stop.set()
-            if self.watcher is not None:
-                self.watcher.join()
-            if self.started:
-                with self.lock:
-                    self._save_all()
-                    self._end_session()
+        then kills it). Each step is bounded and none can stop the ones after it: the harness must exit and the
+        state directory's lock must be released however the saving went."""
         try:
-            self.harness.close()
-        except Exception as e:   # never let cleanup hide the reason we are stopping
-            log("shutdown error: {!r}".format(e))
-            self.harness.kill()
-        if self.state is not None:
-            self.state.close()
+            if self.state is not None:
+                self.rpc_timeout = SHUTDOWN_TIMEOUT
+                self.watcher_stop.set()
+                if self.watcher is not None:
+                    self.watcher.join(WATCHER_JOIN)
+                if self.started:
+                    if self.lock.acquire(timeout=SHUTDOWN_TIMEOUT):
+                        try:
+                            self._save_all()
+                            self._end_session()
+                        except Exception as e:
+                            _logger.warning("could not record the end of the session: {}".format(e))
+                        finally:
+                            self.lock.release()
+                    else:
+                        _logger.warning("a tool call did not finish; the end of the session is not recorded")
+        finally:
+            try:
+                if self.harness is not None:
+                    self.harness.close()
+            except Exception as e:   # never let cleanup hide the reason we are stopping
+                log("shutdown error: {!r}".format(e))
+                self.harness.kill()
+            finally:
+                if self.state is not None:
+                    self.state.close()
 
 
 def build_server(args, machine):

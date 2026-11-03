@@ -70,8 +70,8 @@ A save state from another harness or AppleWin build may not load, and a failed l
 
 The harness never writes an original image (D5) and already provides what is needed: `export_disk` flushes and copies a working image, and `disk_written` (after `subscribe_disk_writes`) says when a drive has new writes. The adapter keeps one persisted copy per original image in `DIR/disks/`.
 
-- **Key.** An original image is identified by its absolute path. Its key is its file name; if `index.json` already has that file name for a different original path, the key gets `-2`, `-3` and so on. `index.json` records the original's path and sha256 at first use.
-- **Mounting.** For `--disk` at start, and for every `insert_disk`, the adapter looks the original up in `index.json`. If a persisted copy exists, it mounts that copy instead (the harness copies it into its work directory, as for any image, so the persisted copy is never opened for writing). Otherwise it mounts the original and adds an index entry. A `write_protected` insert is mounted the same way but never saved.
+- **Key.** An original image is identified by its absolute path (compared case-insensitively). Its key is its file name; if `index.json` already has that file name for a different original path, the key gets `-2`, `-3` and so on before the extension (`Game.dsk`, `Game-2.dsk`), because the harness tells disk formats by extension. `index.json` records the original's path and sha256 at first use.
+- **Mounting.** For `--disk` at start, and for every `insert_disk`, the adapter looks the original up in `index.json`. The first time an original is used, the adapter copies it to `DIR/disks/<key>`. Either way it mounts the persisted copy, never the original (the harness copies it into its work directory, as for any image, so the persisted copy is never opened for writing). So every mounted disk's `list_disks.original_path` is a file in `DIR/disks/`, and its key is that file's name, even after a restore. A path that is already inside `DIR/disks/` is mounted as it is. A `write_protected` insert is mounted the same way but never saved.
 - **Saving.** The adapter subscribes to disk writes at start. After each `disk_written` for a drive, and for every drive at shutdown, it calls `export_disk` to a temporary file in `DIR/disks/` and renames it over the key's copy, then updates `saved_at` and `sha256`. Before `eject_disk`, or an `insert_disk` that replaces a disk, it saves the outgoing disk first. After a `restore_checkpoint` it saves every drive, so the persisted copies follow the machine.
 - **What a crash loses.** At most the writes of the burst in progress: each burst is saved when it ends (about one emulated second after the last write, api_spec `disk_written`).
 - **A changed original.** If the original's sha256 differs from the one recorded, the persisted copy is still used (it holds the game's saves) and the adapter logs a warning naming both files. `--fresh-disks` is how to start over.
@@ -84,9 +84,11 @@ The harness never writes an original image (D5) and already provides what is nee
 - **At shutdown of a stepped session** (the MCP session closes or the adapter is stopped normally), the adapter, in this order: saves every drive (§4); takes `checkpoint {name: "session end"}`; deletes all but the newest 5 checkpoints named `session end` (the agent's own checkpoints are never deleted automatically); writes `last_session.json`:
 
   ```json
-  { "run_mode": "stepped", "ended_cleanly": true, "end_checkpoint_id": "cp-41",
-    "ended_at": "2026-11-02T21:55:03Z", "disks": { "<key>": "<sha256>" } }
+  { "session_id": "<uuid of this adapter run>", "run_mode": "stepped", "ended_cleanly": true,
+    "end_checkpoint_id": "cp-41", "ended_at": "2026-11-02T21:55:03Z", "disks": { "<key>": "<sha256>" } }
   ```
+
+  The name `session end` is reserved: the agent's `checkpoint` tool refuses it, so pruning never removes an agent's checkpoint. If taking the checkpoint fails, `end_checkpoint_id` is `null` and the failure is logged.
 
 - **At shutdown of a realtime session** it saves every drive and writes `last_session.json` with `"run_mode": "realtime"`, `"end_checkpoint_id": null`. No machine state is taken.
 - **A session that ends any other way** (a crash, a kill) writes nothing at the end. The `last_session.json` of an earlier session is left, but `startup.json` of the dead session (below) shows it never ended, which the next start detects.
@@ -97,7 +99,20 @@ The harness never writes an original image (D5) and already provides what is nee
   4. the checkpoint exists and is `compatible`;
   5. every persisted disk's sha256 matches `last_session.json`'s `disks`, so no disk changed since (for example in a realtime session in between, whose disk saves a restore would undo).
 - **At start of a realtime session** the machine always boots fresh with the persisted disks.
-- `startup.json` records what happened: `{ "run_mode", "started_at", "restored": "<checkpoint id>" | null, "reason": "<which rule above decided>" }`. The client reads it to tell the agent and the person (`docs/specs/client.md` §7).
+- `startup.json` records what happened: `{ "session_id", "run_mode", "started_at", "restored": "<checkpoint id>" | null, "reason" }`. It is written at start, after the decision, and is what rule 3 compares with: the previous `startup.json`'s `session_id` must equal `last_session.json`'s. The client reads it to tell the agent and the person (`docs/specs/client.md` §7.3). `reason` is the first of these that applies, in this order:
+
+  | `reason` | When |
+  |---|---|
+  | `realtime` | this session is realtime |
+  | `fresh_machine` | `--fresh-machine` was given |
+  | `fresh_disks` | `--fresh-disks` was given |
+  | `first_session` | there is no `last_session.json` |
+  | `previous_unclean` | the previous session started after the last clean end, or `ended_cleanly` is false, or there is no previous `startup.json` |
+  | `previous_realtime` | the last session was realtime |
+  | `no_end_state` | `end_checkpoint_id` is `null` or not listed |
+  | `other_build` | the end checkpoint is not `compatible` |
+  | `disks_changed` | the persisted disks' sha256 differ from `last_session.json`'s |
+  | `restored` | none of the above: the end state was restored |
 - **`--fresh-machine`** boots fresh even when the rules would restore; checkpoints stay available to the agent in a stepped session.
 
 ## 6. Tests

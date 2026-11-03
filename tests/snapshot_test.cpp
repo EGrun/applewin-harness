@@ -503,6 +503,22 @@ TEST_CASE("ckpt: RewriteSaveStateImages replaces only the named absolute paths")
     }
     CHECK(differing == 1);
 
+    // Other shapes of value. SaveString writes a text that already holds a doubled backslash (a UNC path) as it is, and
+    // the loader would then read it back with one backslash less: the rewriter refuses it and leaves no file. An 8.3
+    // short path is plain ASCII. An empty value is written as "" and reads back empty.
+    const std::string unc = "\\\\server\\share\\x.dsk";
+    const fs::path uncOut = boot.dir.path / "unc.yaml";
+    CHECK_THROWS_AS(RewriteSaveStateImages(state, uncOut, {{oldPath, unc}}), std::runtime_error);
+    CHECK_FALSE(fs::exists(uncOut));
+    for (const std::string& value : {std::string("C:\\PROGRA~1\\AWH\\TESTDI~1\\DISK1.DSK"), std::string()}) {
+        INFO(value);
+        const fs::path other = boot.dir.path / "other.yaml";
+        RewriteSaveStateImages(state, other, {{oldPath, value}});
+        const auto got = SaveStateImages(other);
+        REQUIRE(got.size() == before.size());
+        CHECK(got[drive1].second == value);
+    }
+
     CHECK_THROWS_AS(RewriteSaveStateImages(state, boot.dir.path / "x.yaml", {{"Z:\\not\\there.dsk", newPath}}),
                     std::runtime_error);
 }

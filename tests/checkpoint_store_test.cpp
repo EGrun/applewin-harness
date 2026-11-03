@@ -11,6 +11,7 @@
 #include <memory>
 #include <regex>
 #include <string>
+#include <thread>
 
 using namespace harness;
 namespace fs = std::filesystem;
@@ -158,10 +159,13 @@ TEST_CASE("persist: leftover tmp directories and pending.yaml are deleted at ope
     TempDir t;
     const fs::path dir = t.path / "states";
     fs::create_directories(dir / "cp-9.tmp");
+    fs::create_directories(dir / "backup.tmp");
+    WriteFile(dir / "backup.tmp" / "keep.txt", "x");
     WriteFile(dir / "cp-9.tmp" / "state.yaml", "x");
     WriteFile(dir / "pending.yaml", "x");
     CheckpointStore s(t.path / "work", dir);
     CHECK_FALSE(fs::exists(dir / "cp-9.tmp"));
+    CHECK(fs::exists(dir / "backup.tmp" / "keep.txt"));   // an unrelated folder is never touched
     CHECK_FALSE(fs::exists(dir / "pending.yaml"));
     const fs::path scratch = t.path / "scratch";
     fs::create_directories(scratch);
@@ -235,4 +239,25 @@ TEST_CASE("persist: the ephemeral store records build, run mode and paths too")
     CHECK(e.disks[0].originalPath == scratch / "orig1.dsk");
     CHECK(e.disks[0].statePath == "C:\\short\\orig1.dsk");
     CHECK(e.dir == t.path / "work" / "checkpoints" / "cp-1");
+}
+
+TEST_CASE("persist: Delete tries again while another process holds a file in the directory")
+{
+    TempDir t;
+    const fs::path dir = t.path / "states";
+    const fs::path scratch = t.path / "scratch";
+    fs::create_directories(scratch);
+    CheckpointStore s(t.path / "work", dir);
+    const auto e = Make(s, "", scratch);
+    // Held without FILE_SHARE_DELETE: removing the file fails with a sharing violation until the handle is closed.
+    HANDLE h = CreateFileW((e.dir / "state.yaml").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    std::thread release([&] {
+        Sleep(120);
+        CloseHandle(h);
+    });
+    CHECK_NOTHROW(s.Delete(e.id));
+    release.join();
+    CHECK_FALSE(fs::exists(e.dir));
 }

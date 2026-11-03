@@ -542,6 +542,11 @@ json Session::CreateSession(const json& params)
     const fs::path dir = fs::temp_directory_path() / "applewin-harness";
     fs::create_directories(dir);
     const fs::path work = fs::absolute(dir / pid);
+    if (persistentDir) {   // close_session deletes the work directory, and the checkpoints with it
+        const std::wstring w = work.lexically_normal().native() + L"\\", c = persistentDir->lexically_normal().native() + L"\\";
+        if (c.size() >= w.size() && _wcsnicmp(c.c_str(), w.c_str(), w.size()) == 0)
+            InvalidParams("checkpoint_dir must not be inside the session's work directory: " + PathUtf8(work));
+    }
 
     // The checkpoint store first: a locked or unusable directory fails before anything is started (the lock is released
     // with the store if a later step fails).

@@ -194,6 +194,18 @@ class PersistentCheckpointsTest(PersistentCheckpointTestCase):
         self.assertRpcError(-32602, op, "create_session", run_mode="stepped", checkpoint_dir=file_path)
         op.call("create_session", run_mode="stepped")
 
+    def test_a_checkpoint_dir_inside_the_work_directory_gets_32602(self):
+        h = Harness.launch(headless=True)
+        self.addCleanup(h.close)
+        op = h.connect("operator")
+        inside = os.path.join(work_dir(h), "states")
+        with self.assertRaises(RpcError) as ctx:
+            op.call("create_session", run_mode="stepped", checkpoint_dir=inside)
+        self.assertEqual(ctx.exception.code, -32602)
+        self.assertIn("work directory", ctx.exception.message)
+        self.assertFalse(os.path.exists(inside))
+        op.call("create_session", run_mode="stepped")
+
     def test_a_failed_restore_from_an_earlier_process_leaves_the_session_as_it_was(self):
         self.first_checkpoint()
         h, op, agent = self.process(boot=True)

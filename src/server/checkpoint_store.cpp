@@ -42,6 +42,20 @@ fs::path FromUtf8(const std::string& s)
     return fs::path(std::u8string(s.begin(), s.end()));
 }
 
+// An antivirus scanner, the indexer or a cloud-sync client may hold a freshly written file for a moment: a rename or a
+// delete that fails with access denied or a sharing violation is tried again, about 5 times 75 ms apart.
+template <class Op>
+void RetryWhileBusy(Op op, std::error_code& ec)
+{
+    for (int attempt = 0;; ++attempt) {
+        op(ec);
+        const bool busy = ec && ec.category() == std::system_category() &&
+                          (ec.value() == ERROR_ACCESS_DENIED || ec.value() == ERROR_SHARING_VIOLATION);
+        if (!busy || attempt >= 4) return;
+        Sleep(75);
+    }
+}
+
 [[noreturn]] void Fail(const std::string& what, const std::error_code& ec)
 {
     throw std::runtime_error(what + (ec ? ": " + ec.message() : std::string()));
@@ -96,7 +110,8 @@ void CheckpointStore::Open()
         std::error_code tec;
         if (!it->is_directory(tec)) continue;
         const std::string leaf = Utf8(it->path().filename());
-        if (leaf.size() > 4 && leaf.compare(leaf.size() - 4, 4, ".tmp") == 0) {
+        static const std::regex kTmp(R"(cp-\d+\.tmp)");   // only what Create leaves behind, never an operator's folder
+        if (std::regex_match(leaf, kTmp)) {
             fs::remove_all(it->path(), tec);
             if (tec) Fail("cannot delete the leftover " + Utf8(it->path()), tec);
             continue;
@@ -239,7 +254,8 @@ CheckpointStore::Entry CheckpointStore::Create(std::string name, const SnapshotM
         out << j.dump(2);
         out.close();
         if (!out) throw std::runtime_error("cannot write " + Utf8(tmp / "meta.json"));
-        fs::rename(tmp, e.dir, ec);
+        // The .tmp name protects against the process dying mid-write, not against power loss: nothing is flushed.
+        RetryWhileBusy([&](std::error_code& c) { fs::rename(tmp, e.dir, c); }, ec);
         if (ec) Fail("cannot move " + Utf8(tmp) + " to " + Utf8(e.dir), ec);
     } catch (...) {
         fs::remove_all(tmp, ec);
@@ -270,7 +286,7 @@ void CheckpointStore::Delete(const std::string& id)
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
         if (it->second.id != id) continue;
         std::error_code ec;
-        fs::remove_all(it->second.dir, ec);
+        RetryWhileBusy([&](std::error_code& c) { fs::remove_all(it->second.dir, c); }, ec);
         if (ec) throw std::runtime_error("cannot delete " + Utf8(it->second.dir) + ": " + ec.message());
         entries_.erase(it);
         return;

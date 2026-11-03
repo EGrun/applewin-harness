@@ -20,13 +20,14 @@ import queue
 import sys
 import threading
 import time
+import uuid
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
-from .persistence import StateDir, StateDirLocked
+from .persistence import StateDir, StateDirLocked, _now, resume_decision
 from .screen import (FRAME_H, FRAME_W, MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
                      contact_sheet, crop_zoom, decode_png, encode_png, region_differs, sheet_size)
 
@@ -43,6 +44,8 @@ STRIP_FRAMES_RANGE = (1, 16)
 STRIP_EVERY_MS_RANGE = (1, 1000)
 STRIP_PER_ROW = 4
 STRIP_GAP = 2
+SESSION_END = "session end"   # the checkpoint the adapter takes at a stepped shutdown; the agent may not use the name
+KEEP_SESSION_ENDS = 5          # how many of them survive (persistence.md section 5)
 
 
 _logger = logging.getLogger("applewin_mcp")
@@ -267,8 +270,11 @@ def parse_args(argv=None):
 
 
 def session_params(args, state=None):
-    """The create_session parameters for the command line; with a state directory the disk is its persisted copy."""
+    """The create_session parameters for the command line; with a state directory the disk is its persisted copy,
+    and a stepped session keeps its checkpoints there (a realtime session takes no machine state)."""
     params = {"run_mode": "realtime" if args.realtime else "stepped", "allow_text_screen": bool(args.text_screen)}
+    if state is not None and not args.realtime:
+        params["checkpoint_dir"] = state.states_dir
     if args.disk:
         disk = os.path.abspath(args.disk)
         params["disks"] = [{"slot": 6, "drive": 1, "path": state.disk_for(disk) if state else disk}]
@@ -304,7 +310,8 @@ class Machine:
         self.last_image = None     # (digest of the last image sent, emulated_cycles then); see _offer
         self.drive_keys = {1: None, 2: None}   # drive -> key of the persisted copy it holds (None: empty or not kept)
         self.unsaved = set()       # drives whose last save failed
-        self.started = False       # create_session and the drive setup succeeded
+        self.started = False       # create_session, the drive setup and the resume succeeded, startup.json is written
+        self.session_id = uuid.uuid4().hex
         self.watcher = None
         self.watcher_stop = threading.Event()
         if args.state_dir:
@@ -333,10 +340,44 @@ class Machine:
                 self._learn_drives()
                 self.watcher = threading.Thread(target=self._watch_disk_writes, name="disk-writes", daemon=True)
                 self.watcher.start()
+                self._resume(args)
             self.started = True
         except BaseException:
             self.shutdown()
             raise
+
+    def _resume(self, args):
+        """Restores the last stepped session's end state when persistence.md section 5 allows (the same path as the
+        agent's restore_checkpoint), then writes startup.json: the next start compares its session_id with
+        last_session.json's."""
+        run_mode = "realtime" if args.realtime else "stepped"
+        with self.lock:
+            rows = [] if args.realtime else self.rpc(self.operator, "list_checkpoints")
+            restore, reason = resume_decision(
+                run_mode, self.state.read_json("last_session.json"), self.state.read_json("startup.json"), rows,
+                self.state.disk_hashes(), args.fresh_machine, args.fresh_disks)
+        if restore is not None:
+            self.restore_checkpoint(restore)
+        log("starting {}: {}".format(run_mode, "restored " + restore if restore else "fresh machine ({})".format(reason)))
+        self.state.write_json("startup.json", {"session_id": self.session_id, "run_mode": run_mode,
+                                               "started_at": _now(), "restored": restore, "reason": reason})
+
+    def _end_session(self):
+        """Persistence.md section 5, at a normal end: the end state (stepped), then last_session.json. Call with
+        self.lock held, after _save_all."""
+        end = None
+        if self.stepped:
+            try:
+                end = self.rpc(self.operator, "checkpoint", name=SESSION_END)["checkpoint_id"]
+                ends = [c["checkpoint_id"] for c in self.rpc(self.operator, "list_checkpoints")
+                        if c.get("name") == SESSION_END]
+                for old in ends[:-KEEP_SESSION_ENDS]:   # oldest first
+                    self.rpc(self.operator, "delete_checkpoint", checkpoint_id=old)
+            except Exception as e:   # a lost end state must not stop the shutdown
+                _logger.warning("could not keep the end state: {}".format(e))
+        self.state.write_json("last_session.json", {
+            "session_id": self.session_id, "run_mode": "stepped" if self.stepped else "realtime",
+            "ended_cleanly": True, "end_checkpoint_id": end, "ended_at": _now(), "disks": self.state.disk_hashes()})
 
     @staticmethod
     def _forward_harness_line(line):
@@ -832,6 +873,9 @@ class Machine:
     def checkpoint(self, name=None):
         self._require_stepped()
         name = name or None   # an empty name is no name
+        if name == SESSION_END:
+            raise ToolError("the name \"{}\" is reserved for the end state the adapter keeps; choose another".format(
+                SESSION_END))
         params = {} if name is None else {"name": name}
         with self.lock:
             saved = self.rpc(self.operator, "checkpoint", **params)
@@ -871,8 +915,9 @@ class Machine:
             rows = self.rpc(self.operator, "list_checkpoints")
         if not rows:
             return "no checkpoints"
-        return "\n".join("{}  {}  {:.1f} ms".format(c["checkpoint_id"], c.get("name") or "-",
-                                                    cycles_to_ms(c["emulated_cycles"])) for c in rows)
+        return "\n".join("{}  {}  {:.1f} ms{}".format(
+            c["checkpoint_id"], c.get("name") or "-", cycles_to_ms(c["emulated_cycles"]),
+            "  (made by another build; cannot be restored)" if c.get("compatible") is False else "") for c in rows)
 
     def delete_checkpoint(self, checkpoint_id):
         self._require_stepped()
@@ -890,6 +935,7 @@ class Machine:
             if self.started:
                 with self.lock:
                     self._save_all()
+                    self._end_session()
         try:
             self.harness.close()
         except Exception as e:   # never let cleanup hide the reason we are stopping
@@ -1085,7 +1131,7 @@ def build_server(args, machine):
             """Save the whole machine (memory, CPU, video, sound, joystick, and the floppies in both drives) as a
             checkpoint you can return to with restore_checkpoint, e.g. before a risky jump. name is an optional label
             (up to 64 printable characters). Returns the checkpoint id (cp-1, cp-2, ...) and the emulated time. Up to 256
-            checkpoints; they last as long as this session. Only in a stepped session."""
+            checkpoints; they are kept between sessions. The name "session end" is reserved. Only in a stepped session."""
             return await asyncio.to_thread(machine.checkpoint, name)
 
         @mcp.tool()
@@ -1093,13 +1139,13 @@ def build_server(args, machine):
             """Put the machine and its floppies back exactly as they were at a checkpoint (an id such as cp-1 from
             checkpoint or list_checkpoints). Input still waiting to take effect is dropped, and the time continues
             from the checkpoint's. Replaying the same input from the same checkpoint gives exactly the same result,
-            so you can retry a manoeuvre with different timing. The checkpoint is kept; restore it as often as you
-            like. Only in a stepped session. If a restore itself fails, the session cannot be used any further."""
+            so you can retry a manoeuvre with different timing. The disks go back as they were then too, undoing any
+            disk saves made since. The checkpoint is kept; restore it as often as you like. Only in a stepped session. If a restore itself fails, the session cannot be used any further."""
             return await asyncio.to_thread(machine.restore_checkpoint, checkpoint_id)
 
         @mcp.tool()
         async def list_checkpoints() -> str:
-            """List this session's checkpoints, oldest first: id, name ("-" if none) and emulated time."""
+            """List this and earlier sessions' checkpoints, oldest first: id, name ("-" if none) and emulated time."""
             return await asyncio.to_thread(machine.list_checkpoints)
 
         @mcp.tool()

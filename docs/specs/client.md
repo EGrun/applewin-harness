@@ -327,10 +327,20 @@ The agent should know which checkpoint or in-game save holds what; that goes in 
 ### 7.3 The startup note
 After the adapter starts, the client reads `machine/startup.json` and puts one line, marked as the harness's, at the start of the first user message of the process (never into the system prompt, §5.3). It is one of:
 
-- `[harness] The machine was restored to where the previous session ended (checkpoint <id>, <UTC time>).`
-- `[harness] The machine was started fresh: <reason>. The disks hold every save made in earlier sessions.` with the reason from `startup.json` in plain words (the previous session was realtime; it did not end cleanly; a disk changed since; its state is from another build; `--fresh-machine` was given).
-- `[harness] The machine was started fresh with the original disks (--fresh-disks).`
-- `[harness] This is the first session of this campaign.`
+The line follows `startup.json`'s `reason` (persistence spec §5), one line per code:
+
+| `reason` | Line |
+|---|---|
+| `restored` | `[harness] The machine was restored to where the previous session ended (checkpoint <id>, <UTC time>).` |
+| `realtime` | `[harness] This is a realtime session: the machine was started fresh. The disks hold every save made in earlier sessions.` |
+| `fresh_machine` | `[harness] The machine was started fresh because --fresh-machine was given. The disks hold every save made in earlier sessions.` |
+| `fresh_disks` | `[harness] The machine was started fresh with the original disks (--fresh-disks).` |
+| `first_session` | `[harness] This is the first session of this campaign.` |
+| `previous_unclean` | `[harness] The machine was started fresh: the previous session did not end cleanly. The disks hold every save made in earlier sessions.` |
+| `previous_realtime` | `[harness] The machine was started fresh: the previous session was realtime. The disks hold every save made in earlier sessions.` |
+| `no_end_state` | `[harness] The machine was started fresh: the previous session left no saved state. The disks hold every save made in earlier sessions.` |
+| `other_build` | `[harness] The machine was started fresh: the previous session's state is from another build. The disks hold every save made in earlier sessions.` |
+| `disks_changed` | `[harness] The machine was started fresh: a disk changed since the previous session ended. The disks hold every save made in earlier sessions.` |
 
 The same line is shown as a notice. `/new` adds no note: the machine is the one the agent left, as the system prompt says.
 

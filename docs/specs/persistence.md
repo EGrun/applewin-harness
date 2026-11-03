@@ -1,6 +1,6 @@
 # Machine and disk persistence spec
 
-**Status:** Proposed (D18). §3.1–3.2 implemented. It changes the harness and the adapter; the agent client (`docs/specs/client.md`) uses it.
+**Status:** Implemented (D18). It changes the harness and the adapter; the agent client (`docs/specs/client.md`) uses it.
 
 ## 1. Purpose
 

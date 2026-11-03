@@ -6,6 +6,7 @@
 #include "host/emulator.h"
 #include "server/checkpoint_store.h"
 #include "server/pipe_server.h"
+#include "server/protocol.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <cstdint>
@@ -137,6 +138,14 @@ private:
 
     void RequireUsable() const;   // -32008 once a restore has failed in or after the load
 
+    // restore_checkpoint, shared by both paths. AbandonRestore: a failure after EjectAll and before the load (the drives
+    // are put back when disksRestored; if that fails too, or they were not, the session is unusable). FinishRestore: the
+    // restore purity owned by the session, after a successful load. RestoreForeign: a checkpoint an earlier process made
+    // (docs/specs/persistence.md 3.1): onto new working copies in <work>/restore-<k>/.
+    RpcError AbandonRestore(std::string what, bool disksRestored);
+    nlohmann::json FinishRestore();
+    void RestoreForeign(const CheckpointStore::Entry& entry);
+
     DisplayMode display_;
     Emulator& emulator_;
 
@@ -157,6 +166,7 @@ private:
     // with the user's image it came from. Not by drive: a swap or a restore changes which copy a drive holds.
     std::vector<std::pair<std::filesystem::path, std::filesystem::path>> originals_;   // {working copy, original}
     unsigned swapCopies_ = 0;   // numbers the insert_disk work subdirectories, so copies never collide
+    unsigned restoreDirs_ = 0;  // numbers the restore-<k> work subdirectories of checkpoints from earlier processes
     std::unique_ptr<CheckpointStore> checkpoints_;
     uint64_t audioFloor_ = 0;   // get_audio refuses cycles before this: the restored checkpoint's cycle
     bool unusable_ = false;   // a restore failed in or after Snapshot_LoadState: run commands reply -32008

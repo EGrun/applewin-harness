@@ -34,6 +34,7 @@ inline constexpr int kBusy = -32007;
 inline constexpr int kInvalidState = -32008;
 inline constexpr int kAudioNotBuffered = -32009;
 inline constexpr int kInputQueueFull = -32010;     // data {pending, limit}
+inline constexpr int kCheckpointOtherBuild = -32011;   // restore_checkpoint of a checkpoint another build made (D18)
 
 // A JSON-RPC error a method handler reports; method handlers throw it and the dispatcher turns it into MakeError.
 struct RpcError {

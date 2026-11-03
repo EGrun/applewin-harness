@@ -486,7 +486,7 @@ class CheckpointApiTest(CheckpointTestCase):
         listed = op.call("list_checkpoints")
         self.assertEqual(len(listed), 2)
         for entry in listed:
-            self.assertEqual(sorted(entry), ["checkpoint_id", "created_at", "emulated_cycles", "name"])
+            self.assertEqual(sorted(entry), ["checkpoint_id", "compatible", "created_at", "emulated_cycles", "name"])
             self.assertRegex(entry["created_at"], ISO_UTC)
         self.assertEqual([(e["checkpoint_id"], e["name"], e["emulated_cycles"]) for e in listed],
                          [("cp-1", "first", a["emulated_cycles"]), ("cp-2", None, b["emulated_cycles"])])

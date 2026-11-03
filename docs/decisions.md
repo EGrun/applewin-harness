@@ -360,3 +360,78 @@ A screenshot costs twice: bytes over the local pipe, and tokens in the agent's c
 - The note assumes the agent still holds the last image. Clearing can remove the last image, because `keep` counts tool uses rather than images. The note then refers to an image the agent no longer has, and the agent recovers with `force: true` at the cost of a call.
 - The token figures in the tool descriptions are Claude's. Other models count differently; the advice (regions, zoom 1, fewer images) holds for any of them.
 - The harness compresses every frame the adapter fetches. If that costs more than the BGRA copy it replaces, measured as a `get_frame` round trip, the PNG fetch is dropped and only the token changes remain (gate in the plan).
+
+## D16 — The agent client is a chat session
+**Status:** **Proposed** (2026-11-02), with `docs/specs/client.md` revision 2. It replaces the one-goal run in the first draft of that spec.
+
+A long play session goes off track, and a run that takes one goal and cannot be reached until it stops wastes the tokens D15 saves. The user asked for a chat in the manner of Claude Code: send messages while the agent works, interrupt it, and give it the next goal in the same dialogue.
+
+**Decisions:**
+- **A terminal chat with a live prompt.** The client is a scrolling terminal program (not full-screen) with an always-open input line over streaming output, built on `prompt_toolkit`. It is a new dependency (BSD-3-Clause); the standard library cannot read a line on Windows while another task prints, which is what a chat needs.
+- **Streaming requests.** The agent's text is shown as it arrives, and an interrupt cancels a request in flight. The partial response is dropped and was never part of the history, so the history stays append-only and preserved thinking stays valid.
+- **Steering at boundaries.** A message typed while the agent works is delivered with the next tool results (as text after the `tool_result` blocks), or as a new message when the agent has just ended its turn. It is never injected into a request already sent.
+- **Interrupt waits for a started tool call.** The adapter runs one call at a time under a lock and calls take emulated time, so a call that has started is allowed to finish. Calls not yet started are answered with an error result, so no `tool_use` lacks a `tool_result`.
+- **One conversation, many goals.** The emulator and adapter live for the whole session, so the machine keeps its state from one goal to the next. `/new` starts a fresh history on the same machine.
+- **`--once` keeps the scripted run.** The same engine runs one goal without a terminal and exits with a status code, for the integration test, the live smoke test and A/B measurement of D15. It takes no guidance.
+- **The human gets no new power over the machine.** The client has no pause, no memory access, no checkpoints; messages are chat. This is a client feature, not an operator tool on the adapter, so the agent-power rules (D4) are unchanged.
+
+**Consequences:**
+- A run with steering or interrupts is not comparable with an unaided one. The transcript marks every human message and `summary.json` counts them; benchmarks use `--once`.
+- Long chats outgrow the context window even with screenshots cleared. v1 shows the context size and offers `/new`; compaction is an open point in the spec.
+- A closed session cannot be resumed, because the transcript does not keep thinking blocks or their signatures.
+- The API must accept a user message that follows another user message (after an interrupt). The live smoke test checks it; the spec states the fallback.
+
+## D17 — The agent keeps a notebook
+**Status:** **Proposed** (2026-11-02), with `docs/specs/client.md` revision 3.
+
+Some goals take longer than one context can hold: a game played over hours, a puzzle solved by trial. Context editing (D15) and `/new` (D16) keep the context small by forgetting, and what is forgotten has to be found again. The user asked for persistent memory that records every known fact, theory and hypothesis still to be tested.
+
+**Decisions:**
+- **Anthropic's memory tool, run by the client.** The client lists `memory_20250818` beside the adapter's tools and runs its commands on a directory of Markdown files. It is generally available and needs no beta; the API adds its own memory protocol to the system prompt (look at memory first, write progress as you go, assume the context may be reset). A tool of our own design was rejected: the model is trained on this one.
+- **One notebook per program.** The store is the campaign's `notebook/` (D18), and the campaign defaults to the disk's name, so notes about two programs never mix. It persists across sessions, `/new` and crashes; the conversation itself still does not.
+- **A fixed layout with hypotheses as first-class entries.** `README.md` (scope, goals, index), `facts.md` (verified, with evidence and when), `hypotheses.md` (`H<n>` with status untested, testing, confirmed or refuted, why, test, result), `progress.md` (plan, next steps, dead ends), and topic files. A refuted hypothesis stays, with its evidence, so it is not tried again. Facts about the machine's state are marked as state and dated, because the next session may start from a fresh boot.
+- **Our own handler, strictly bounded.** Paths are confined to the store (no `..`, no hidden names, no symlink out), `create` does not overwrite, writes are atomic, and a file, the store and the file count have limits. The SDK's file-system helper is built for its tool runner and has none of the limits.
+- **Recall, not new senses.** The client never writes into the notebook, and nothing in it comes from the harness, the operator connection or emulator memory (D4). Notes are the agent's own observations and conclusions, made through the adapter's tools. Nothing from the notebook goes into the system prompt; the agent reads it through the tool.
+
+**Consequences:**
+- A person may edit the notebook between sessions; that is guidance. The client records the notebook's state at the end of each session in a hidden file and marks the next session `memory_edited_outside` when it differs.
+- Runs with a notebook are not comparable with runs without one. Unaided runs use `--no-memory` or a fresh store.
+- Memory calls are tool uses, so they count toward context editing's `keep` and make the last screenshot more likely to be cleared (D15's `force` covers it). They also cost a request each.
+- Whether the agent keeps the notebook useful is a prompt question, to be judged from the first real notebooks.
+
+## D18 — Campaigns: the machine and its disks carry over
+**Status:** **Proposed** (2026-11-02), user ruling the same day. Specified in `docs/specs/persistence.md` (harness and adapter) and `docs/specs/client.md` §7 (client).
+
+A goal that spans sessions needs the machine it was working on. Until now nothing carried over: checkpoints lived and died with the harness process, `close_session` deleted the working disk copies, and every session booted a fresh machine from the original images.
+
+**User ruling (2026-11-02):**
+- In stepped (non-realtime) mode, saved machine states carry over between sessions and are available to the next run.
+- In realtime mode, only the game's own saving is available, such as saving to and loading from a disk with the game's features.
+- Modified disks survive harness restarts, in both modes.
+
+**Decisions:**
+- **A campaign per program.** `campaigns/<name>/` holds the notebook (D17), the machine (`machine/`, the adapter's `--state-dir`), the shell's container id and the manuals folder (D19). It defaults to the boot disk's name.
+- **Disks persist in the adapter, in both modes.** The adapter keeps one saved copy per original image, mounts it instead of the original, and saves it after every write burst (`disk_written`), before a disk leaves a drive, after a restore and at shutdown. The harness is unchanged here (it never writes an original, D5). A crash loses at most the burst in progress. `--fresh-disks` archives the copies and starts from the originals.
+- **Checkpoints persist in the harness, stepped only.** `create_session` gains `checkpoint_dir`; checkpoints there survive the process, keep ids unique, and record the build that made them. A checkpoint from another build is refused with an error that leaves the session usable, because a failed load would not. The adapter passes `checkpoint_dir` only in stepped sessions; the agent's checkpoint tools still exist only there (D4 rules unchanged).
+- **A stepped session resumes where the last one ended.** At a clean stepped shutdown the adapter takes a `session end` checkpoint; the next stepped start restores it, unless anything happened since that a restore would undo: a realtime session or a crash in between, a changed disk, another build, or `--fresh-machine`. Otherwise the machine boots fresh with the saved disks. The agent is told which, in a `[harness]` line.
+- **Realtime takes no machine state at all**, not even at shutdown. Its carry-over is the disks, which hold the game's own saves.
+
+**Consequences:**
+- Restoring a checkpoint puts the disks back too (as it always has), so in stepped mode the saved disks follow the machine's timeline and a restore undoes later in-game saves. The tool descriptions and the system prompt say so.
+- Moving the AppleWin submodule pin makes older checkpoints unrestorable; the disks still carry over.
+- A campaign is used by one client and one adapter at a time (locks on both).
+
+## D19 — A sandboxed shell and the person's manuals
+**Status:** **Proposed** (2026-11-02), user ruling the same day. Specified in `docs/specs/client.md` §8 and §9.
+
+The research behind the BG3 harness found that code (a pathfinder, a puzzle solver) multiplies an agent's progress, and Apple II programs often cannot be played without their manuals. The user ruled that the agent gets a shell for running bash and code, and that the person can supply manuals as a folder.
+
+**Decisions:**
+- **The shell is Anthropic's code execution tool.** It runs bash and Python in a container on Anthropic's side, with no network and no access to this computer. That makes it fair by construction: it cannot reach the harness, the disks, the campaign or emulator memory, so it gives the agent what a player with paper and a calculator has. A client-run bash tool was rejected: the API hosts no sandbox for client tools, so we would have to build one on Windows and filter every command for fairness.
+- **One container per campaign**, reused across sessions until it expires (up to 30 days). Code worth keeping goes into the notebook's `scripts/`, which outlives any container.
+- **Manuals through a read-only client tool.** `--manuals DIR` (remembered in the campaign) offers text, PDF and image files. The agent lists, searches text layers, and reads up to 5 PDF pages or 400 lines at a time; PDF pages arrive as a document, so scanned manuals are read as images. Manuals are also uploaded into the container so the shell can search them. Nothing else from this computer is ever uploaded.
+
+**Consequences:**
+- Container time is billed beyond a free allowance; sessions record container use.
+- The code execution tool's exact version, beta and container fields must be read from the live docs before implementation (client spec §15).
+- Code in the container may not call the adapter's tools (programmatic tool calling is not used); every machine action still goes through the agent, one at a time.

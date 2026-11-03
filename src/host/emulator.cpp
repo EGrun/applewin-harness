@@ -1594,6 +1594,8 @@ bool SurvivesSaveState(const std::string& ansi)
 // form is passed on as ANSI (SaveSnapshot then refuses it); one that has no ANSI form at all is an error here.
 bool g_noShortPathsForTest = false;   // test seam (SetShortPathsDisabledForTest): behave as if 8.3 names were off
 
+}  // namespace
+
 std::string ImagePathForAppleWin(const std::filesystem::path& image)
 {
     const std::wstring& wide = image.native();
@@ -1630,6 +1632,8 @@ std::string ImagePathForAppleWin(const std::filesystem::path& image)
                                  "no ASCII short (8.3) path exists for it");
     return ansi;
 }
+
+namespace {
 
 // The long path of every image inserted through a different (short) string, keyed by that string upper-cased: list_disks
 // keeps reporting the long path although AppleWin (and so the save state) holds the short one.
@@ -2451,6 +2455,122 @@ void Emulator::ReinsertAll()
                 what += "\n  " + msgs[i];
             throw std::runtime_error(what);
         }
+    }
+}
+
+void Emulator::NoteImagePath(const std::filesystem::path& image)
+{
+    RequireStarted();
+    g_longPaths[UpperAscii(ImagePathForAppleWin(image))] = image;
+}
+
+std::vector<std::pair<std::string, std::string>> SaveStateImages(const std::filesystem::path& stateFile)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const NamedImage& image : ImagesNamedBy(stateFile))
+        out.emplace_back(image.filename, image.absolutePath);
+    return out;
+}
+
+namespace {
+
+// What YamlSaveHelper::SaveString (YamlHelper.cpp) writes after "key: " for `value` (ANSI bytes): ANSI -> UTF-16 ->
+// UTF-8; backslashes doubled unless the text already holds a doubled one; an empty value as ""; double quotes when the
+// text contains '#'. Returns the UTF-8 bytes the loader will see, and the text as written.
+std::string SaveStringText(const std::string& value, std::string& utf8Out)
+{
+    if (value.empty()) {
+        utf8Out.clear();
+        return "\"\"";
+    }
+    const int wideLen = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, value.c_str(), -1, nullptr, 0);
+    if (wideLen <= 0)
+        throw std::runtime_error("Unable to convert to unicode: " + value);
+    std::wstring wide(size_t(wideLen), L'\0');
+    if (!MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, value.c_str(), -1, wide.data(), wideLen))
+        throw std::runtime_error("Unable to convert to unicode: " + value);
+    const int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), -1, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0)
+        throw std::runtime_error("Unable to convert to UTF-8: " + value);
+    std::string text(size_t(utf8Len), '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, wide.data(), -1, text.data(), utf8Len, nullptr, nullptr))
+        throw std::runtime_error("Unable to convert to UTF-8: " + value);
+    text.resize(strlen(text.c_str()));
+    utf8Out = text;
+    if (text.find('\\') != std::string::npos && text.find("\\\\") == std::string::npos) {
+        std::string doubled;
+        for (const char c : text) {
+            doubled += c;
+            if (c == '\\')
+                doubled += '\\';
+        }
+        text = doubled;
+    }
+    return text.find('#') == std::string::npos ? text : "\"" + text + "\"";
+}
+
+}  // namespace
+
+void RewriteSaveStateImages(const std::filesystem::path& from, const std::filesystem::path& to,
+                            const std::map<std::string, std::string>& absoluteOldToNew)
+{
+    std::string content;
+    {
+        std::ifstream in(from, std::ios::binary);
+        if (!in)
+            throw std::runtime_error("cannot read " + Shown(from));
+        content.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    static const std::string kAbsolute = "Absolute Path:";
+    std::set<std::string> found;
+    std::string out;
+    out.reserve(content.size() + 256);
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t eol = content.find('\n', pos);
+        eol = eol == std::string::npos ? content.size() : eol + 1;
+        const std::string line = content.substr(pos, eol - pos);
+        pos = eol;
+        const size_t b = line.find_first_not_of(' ');
+        if (b == std::string::npos || line.compare(b, kAbsolute.size(), kAbsolute) != 0) {
+            out += line;
+            continue;
+        }
+        const size_t valueFrom = b + kAbsolute.size();
+        const std::optional<std::string> old = YamlStringValue(line.substr(valueFrom));
+        const auto hit = old ? absoluteOldToNew.find(*old) : absoluteOldToNew.end();
+        if (hit == absoluteOldToNew.end()) {
+            out += line;
+            continue;
+        }
+        std::string utf8;
+        const std::string text = SaveStringText(hit->second, utf8);
+        const std::optional<std::string> back = YamlStringValue(text);
+        if (!back || *back != utf8)
+            throw std::runtime_error("the save state cannot hold the disk path " + hit->second + " so that it reads back the same");
+        const size_t ws = line.find_first_not_of(" \t", valueFrom);
+        const size_t valueEnd = line.find_last_not_of(" \t\r\n");
+        const size_t keepFrom = ws == std::string::npos ? valueFrom : ws;
+        out.append(line, 0, keepFrom);
+        if (keepFrom == valueFrom)
+            out += ' ';
+        out += text;
+        if (valueEnd != std::string::npos && valueEnd >= valueFrom)
+            out.append(line, valueEnd + 1, std::string::npos);   // the line's trailing "\r\n" or "\n", if any
+        else if (line.back() == '\n')
+            out += '\n';
+        found.insert(hit->first);
+    }
+    for (const auto& [oldPath, newPath] : absoluteOldToNew)
+        if (!found.count(oldPath))
+            throw std::runtime_error("the save state names no disk at " + oldPath);
+    std::ofstream o(to, std::ios::binary | std::ios::trunc);
+    o.write(out.data(), std::streamsize(out.size()));
+    o.close();
+    if (!o) {
+        std::error_code ec;
+        std::filesystem::remove(to, ec);
+        throw std::runtime_error("cannot write " + Shown(to));
     }
 }
 

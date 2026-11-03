@@ -205,7 +205,7 @@ bin\x64\Debug\HarnessTests.exe
 REM what CI runs
 bin\x64\Debug\HarnessTests.exe -tse=windowed,audio
 ```
-Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64, runs `HarnessTests.exe -tse=windowed,audio`, then the Python pipe tests, and then the adapter tests.
+Suites with special needs are tagged: `realtime` (paced runs), `windowed` (needs a desktop session) and `audio` (needs an audio device; includes a 60-second underrun test, about 70 s). CI (`.github/workflows/ci.yml`, windows-2022) builds Debug and Release x64 once each, then runs `HarnessTests.exe -tse=windowed,audio`, the Python pipe tests and the adapter tests as parallel jobs against each build.
 
 ## Limits
 - **Windows 10/11 x64 only.** The AppleWin core is a Win32 program.

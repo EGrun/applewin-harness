@@ -16,7 +16,7 @@ Run it from the `adapter` directory, or put that directory on `PYTHONPATH`:
 
 ```
 cd adapter
-python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk <image>] [--realtime [--speed <0..40|authentic|max>] [--no-disk-boost]] [--text-screen] [--log-format text|json]
+python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk <image>] [--realtime [--speed <0..40|authentic|max>] [--no-disk-boost]] [--text-screen] [--log-format text|json] [--state-dir <dir> [--fresh-disks] [--fresh-machine]]
 ```
 
 | Flag | Meaning |
@@ -30,8 +30,33 @@ python -m applewin_mcp --exe <path\to\AppleWinHarness.exe> [--headless] [--disk 
 | `--log-format text\|json` | Format of the log lines on stderr (default `text`). It is also passed to the harness, whose stderr lines are forwarded unchanged, so in `json` mode every stderr line is one JSON object `{ts, level, msg, component, ...}` (`component` is `adapter` for the adapter's own lines). stdout is always MCP only. |
 | `--version` | Prints the adapter version and exits. |
 | `--text-screen` | Turn on the `read_screen` tool (the session is created with `allow_text_screen`). |
+| `--state-dir <dir>` | Keep state between runs in this directory (see State directory below). Only one adapter at a time may use it; a second exits with an error naming it. |
+| `--fresh-disks` | With `--state-dir`. Moves the kept disks to `archive/` and starts again from the original images. The machine is not resumed either. |
+| `--fresh-machine` | With `--state-dir`. Boots the machine afresh instead of resuming the last stepped session. The kept disks are still used. |
 
 The server starts the harness (`--serve`), creates the session and serves MCP on stdio. stdout carries MCP frames only; log lines go to stderr. When the server exits it closes the session and the harness exits. To run a task, see [examples/basic_count.md](examples/basic_count.md).
+
+## State directory
+With `--state-dir <dir>` the adapter keeps what the machine wrote, so the next run goes on where this one stopped. Without it nothing is kept, as before.
+
+```
+<dir>/
+  disks/              one persisted copy per original image, and index.json
+  states/             stepped-session checkpoints, one directory each
+  last_session.json   how the last session ended
+  startup.json        what this session started from: restored (a checkpoint id or null) and reason
+  archive/            what --fresh-disks moved aside (never deleted by the adapter)
+  .lock               held while a process uses the directory
+```
+
+| | Stepped | Realtime |
+|---|---|---|
+| Disks | Mounted from `disks/`, saved after each write burst, before a swap and at shutdown. The original image is never written. | The same. |
+| Checkpoints | Kept in `states/` between sessions (the agent's own too). | None: no checkpoint tools, nothing in `states/`. |
+| End of the session | The adapter saves the disks, takes a checkpoint named `session end` (the newest 5 are kept) and writes `last_session.json`. | The adapter saves the disks and writes `last_session.json`. |
+| Start of the session | Resumes the last session's `session end` checkpoint when that session was stepped and ended cleanly, no other session ran since, the checkpoint is from this build and no disk changed. Otherwise the machine boots fresh from the kept disks; `startup.json` says why. | Always boots fresh from the kept disks. |
+
+A killed adapter writes no end state: the next start boots fresh (`previous_unclean`) with the disks as last saved (at most the writes of the burst in progress are lost). `session end` is a reserved name; the `checkpoint` tool refuses it.
 
 ## Tools
 | Tool | Parameters | What it does |
@@ -49,9 +74,9 @@ The server starts the harness (`--serve`), creates the session and serves MCP on
 | `eject_disk` | `drive` (1 or 2) | Takes the floppy out of the drive. An empty drive is an error. |
 | `export_disk` | `drive` (1 or 2), `path` | Saves the floppy in the drive, with everything written to it so far, as a new image file in the disk's own format. The disk stays in the drive. |
 | `set_speed` | `speed?` (`authentic`, `max` or 0-40), `disk_boost?` | Realtime only (an error in stepped mode). Changes the speed while the machine runs, with the same values as `--speed` and `--no-disk-boost`. Anything left out is unchanged; with no arguments it reports the current speed. |
-| `checkpoint` | `name?` (up to 64 characters) | Stepped only (absent with `--realtime`). Saves the whole machine and both floppies (AppleWin's save state plus the working disks) and returns its id (`cp-1`, `cp-2`, ...) and emulated time. Up to 256 per session. |
-| `restore_checkpoint` | `checkpoint_id` | Stepped only. Puts the machine and its floppies back as they were at the checkpoint; input still waiting is dropped. The same input after the same checkpoint gives the same result, so a manoeuvre can be retried with different timing. |
-| `list_checkpoints` | none | Stepped only. The session's checkpoints, oldest first: id, name (`-` if none), emulated time. |
+| `checkpoint` | `name?` (up to 64 characters) | Stepped only (absent with `--realtime`). Saves the whole machine and both floppies (AppleWin's save state plus the working disks) and returns its id (`cp-1`, `cp-2`, ...) and emulated time. Up to 256. With `--state-dir` they are kept between sessions; the name `session end` is reserved. |
+| `restore_checkpoint` | `checkpoint_id` | Stepped only. Puts the machine and its floppies back as they were at the checkpoint (undoing disk saves made since); input still waiting is dropped. The same input after the same checkpoint gives the same result, so a manoeuvre can be retried with different timing. |
+| `list_checkpoints` | none | Stepped only. This and earlier sessions' checkpoints, oldest first: id, name (`-` if none), emulated time; a checkpoint made by another build is marked `made by another build; cannot be restored`. |
 | `delete_checkpoint` | `checkpoint_id` | Stepped only. Deletes a checkpoint. |
 
 No other operator method (sessions, stepping, state checksums) is reachable through the server, and no checkpoint tool exists in a realtime session.

@@ -177,9 +177,10 @@ Returns `{ start_cycle, end_cycle, sample_rate: 44100, channels: 2, format, data
 ## Operator API
 
 ### Sessions
-**`create_session`** `{ model?: "apple2ee" = "apple2ee", disks?: [ { slot: 6, drive: 1|2, path } ], run_mode?: "realtime" | "stepped" = "realtime", speed?: {...}, allow_text_screen?: bool = false, shared_memory_frames?: bool = false }`
+**`create_session`** `{ model?: "apple2ee" = "apple2ee", disks?: [ { slot: 6, drive: 1|2, path } ], run_mode?: "realtime" | "stepped" = "realtime", speed?: {...}, allow_text_screen?: bool = false, shared_memory_frames?: bool = false, checkpoint_dir?: string }`
 
 Returns `{ session_id }`.
+- `checkpoint_dir` (D18) keeps the session's checkpoints in that directory, so they survive the process (see Checkpoints). It must be an absolute path (`-32602`) and, if it exists, a directory (`-32602`); it is created if missing. If another process has the directory open, `-32003`. Any other file-system failure is `-32000` with the cause. Without it, checkpoints live in the work directory and die with the session. Either run mode accepts it. It must not be inside the session's work directory (`%TEMP%\applewin-harness\<pid>`, which `close_session` deletes): `-32602`.
 - `path` must be absolute (`-32602`). A missing file returns `-32005`.
 - The harness copies each image into a working directory (`%TEMP%\applewin-harness\<pid>\`) and mounts the copies. The original files are never opened for writing (D5).
 - A realtime session starts running. A stepped session starts paused, and emulation only advances in response to `step_frames`.
@@ -187,7 +188,7 @@ Returns `{ session_id }`.
 - **Not supported yet (`-32006`):** models other than `apple2ee`, `hard_disks`, `shared_memory_frames: true`, and `speed.video_refresh: 50` (PAL).
 - `speed` is `{ video_refresh?: 50 | 60 = 60, ...set_speed params }`. It is validated before anything starts (`-32602`), and applied right after the emulator starts. `video_refresh: 50` returns `-32006`.
 
-**`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and checkpoints and exits the process with code 0. It is also valid when no session exists, and when the session is unusable. Use `export_disk` first to keep any results.
+**`close_session`** `{}` — replies `{}`, then stops the session, deletes its working copies and checkpoints and exits the process with code 0. A `checkpoint_dir` and the checkpoints in it are left as they are. It is also valid when no session exists, and when the session is unusable. Use `export_disk` first to keep any results.
 
 **`list_disks`** `{}` — returns `[ { slot: 6, drive: 1|2, original_path, working_path, write_protected, format } ]`, with empty drives left out. `format` is the image type AppleWin reports (`"DO"`, `"PO"`, `"NIB"`, `"WOZ"`, ...). Before a session exists: `-32002`.
 
@@ -254,7 +255,15 @@ Any field left out keeps its current value. Returns the same result as `get_spee
 - **Speed is a session setting.** `restore_checkpoint` doesn't change it: the session's current settings are re-applied after the load, and the speed stored with a checkpoint is informational only (D8).
 
 ### Checkpoints (D5)
-A checkpoint is an AppleWin save state plus copies of the working disks, stored under `<work>/checkpoints/<checkpoint_id>/`. Checkpoints live and die with the session's work directory: they do not survive the process.
+A checkpoint is an AppleWin save state plus copies of the working disks, stored under `<work>/checkpoints/<checkpoint_id>/`. Without `checkpoint_dir`, checkpoints live and die with the session's work directory: they do not survive the process.
+
+**Persistent checkpoints (D18).** With `create_session.checkpoint_dir`, each checkpoint is stored in `<checkpoint_dir>/<checkpoint_id>/` instead, and the next process that opens the directory finds it.
+- A checkpoint's `meta.json` records `build` (the harness version and the first 12 digits of the AppleWin commit, for example `0.1.0+6c579da5bd94`, or `<version>+unknown` when the build could not run git), `run_mode` (`"stepped"` or `"realtime"`, informational) and, for each disk, `original_path` and `state_path` (the disk's path as the save state holds it).
+- A checkpoint is written to `<checkpoint_id>.tmp/` and renamed when complete. At `create_session`, leftover `.tmp` directories and a leftover `pending.yaml` are deleted. Every complete `cp-<n>` directory (a `meta.json` that parses, the save state and the disk copies present) is listed by `list_checkpoints` with the ones made in this process, oldest first. Other directories are skipped, logged as warnings and left alone.
+- Ids continue from the highest `cp-<n>` directory, complete or not: an id is never reused in a directory. The limit of 256 checkpoints counts the ones in the directory. `delete_checkpoint` deletes the checkpoint's directory.
+- One process at a time: the process holds `<checkpoint_dir>\.lock` open without sharing until it exits (a killed process releases it), and a second `create_session` on the directory gets `-32003`.
+- **Restoring a checkpoint from an earlier process.** Its disks' working paths were in that process's work directory, and the save state names them. So `restore_checkpoint` copies each disk copy to `<work>\restore-<k>\disks\`, loads a copy of the save state that names those new working copies, and mounts them with the `original_path` from `meta.json`. `list_disks` then reports that `original_path` and a `working_path` under `restore-<k>\disks\`; `export_disk` and later checkpoints work as after any restore. A checkpoint made in this process restores as before.
+- **Builds.** A save state may not load in another build, and a failed load leaves the session unusable. So a checkpoint whose `build` differs from this harness's is listed with `compatible: false`, and `restore_checkpoint` of it returns `-32011`. `<version>+unknown` is compatible with any AppleWin. Only the AppleWin submodule's HEAD commit is recorded, so a locally modified submodule is not detected. Nothing is deleted automatically.
 
 **`checkpoint`** `{ name?: string }` — returns `{ checkpoint_id, emulated_cycles }`.
 - If the session is running, it first pauses at the next present and ends the realtime run (full speed and the Mockingboard mute are cleared). It then writes the save state, flushes the disk buffers and copies the working disks. The session is left paused.
@@ -262,7 +271,7 @@ A checkpoint is an AppleWin save state plus copies of the working disks, stored 
 - Errors: `-32004` with the cause on any failure, and when there are already 256 checkpoints.
 - **Non-ASCII working paths (D10):** AppleWin stores image paths as UTF-8 but loads them through the ANSI file API. The harness therefore inserts a working copy through its ASCII 8.3 short path when the long path would not survive that round trip (for example a `%TEMP%` path with non-ASCII characters); `list_disks.working_path` still reports the long path. Only when no ASCII path exists (8.3 names disabled on the volume), `checkpoint` returns `-32004` and writes nothing.
 
-**`restore_checkpoint`** `{ checkpoint_id }` — returns `{ emulated_cycles }`. It restores the save state and the disks together, and leaves the session paused in both run modes (use `resume` to start a realtime run). An unknown id is `-32602`.
+**`restore_checkpoint`** `{ checkpoint_id }` — returns `{ emulated_cycles }`. It restores the save state and the disks together, and leaves the session paused in both run modes (use `resume` to start a realtime run). An unknown id is `-32602`. A checkpoint made by another build is `-32011` ("checkpoint cp-1 was made by build 0.0.0+aaaaaaaaaaaa; this harness is 0.1.0+6c579da5bd94"), before anything is touched: the session stays usable.
 - After a restore, everything observable depends only on the checkpoint (see D5), except the frame id counter (below): the machine, the disks, the video scanner position, the speaker, the random stream and the harness's own queues. Running the same script from the same checkpoint always gives the same state checksum, frames and audio, whatever happened before the restore.
 - `emulated_cycles` continues from the checkpoint's value. Input still queued is discarded and reported with `discarded: true` (see Input replies), held keys and joystick buttons are released, and the joystick returns to the position it had at the checkpoint.
 - The audio capture is cleared: `get_audio` for audio from before the restore returns `-32009`. `subscribe_audio` detectors restart at the restored cycle. `get_frame` straight after a restore shows the restored screen.
@@ -270,10 +279,10 @@ A checkpoint is an AppleWin save state plus copies of the working disks, stored 
 - The drives end up as they were at the checkpoint, even if `insert_disk` or `eject_disk` changed them since: a disk inserted since is ejected, a drive that was empty is empty again, and a disk that was replaced or ejected comes back (its working copy is kept until `close_session`). Each checkpointed disk's contents are those of the checkpoint.
 - Frame ids and `frame_ready` cadence continue across a restore; they are not reset. `frame_id` only counts up: the re-rendered frame straight after a restore keeps the last id (its pixels are the restored screen), no `frame_ready` is sent for it, and the `every_n_frames` phase carries on from before the restore.
 - AppleWin looks each disk image up by its bare file name in the process's current directory before its absolute path. The harness makes the checkpoint's own directory current for the load and puts the previous one back, so the server's working directory may hold files of any name.
-- **Failure before the load** (for example a missing checkpoint disk copy): `-32004`. The session stays usable and unchanged: `get_state_checksum` equals its value before the call (D7). Every check that does not need the drives empty (the save state, the disk copies, the image names) runs before the drives are ejected, so those failures leave the drives untouched. A failure after ejecting (a disk copy that can't be read or written) rolls the working disks back and re-inserts them; such a failure may reset the drive's rotational position. If the working disks can't be put back or re-inserted, the reply is still `-32004` and the session is then unusable, as below.
+- **Failure before the load** (for example a missing checkpoint disk copy, or for a checkpoint from an earlier process a copy that cannot be made or a save state that cannot be rewritten): `-32004`. The session stays usable and unchanged: `get_state_checksum` equals its value before the call (D7). Every check that does not need the drives empty (the save state, the disk copies, the image names) runs before the drives are ejected, so those failures leave the drives untouched. A failure after ejecting (a disk copy that can't be read or written) rolls the working disks back and re-inserts them; such a failure may reset the drive's rotational position. If the working disks can't be put back or re-inserted, the reply is still `-32004` and the session is then unusable, as below.
 - **Failure in or after the load:** `-32004`, and the session is then unusable. `resume`, `step_frames`, `step_cycles`, `type_text`, `press_key`, `press_keys`, `set_joystick`, `set_speed`, `checkpoint`, `restore_checkpoint`, `get_state_checksum`, `export_disk`, `insert_disk` and `eject_disk` return `-32008` until `close_session`. The other calls (`pause`, `get_frame`, `get_audio`, `get_speed`, `list_disks`, `list_checkpoints`, `delete_checkpoint`, `close_session`) still work.
 
-**`list_checkpoints`** `{}` — returns `[ { checkpoint_id, name, created_at, emulated_cycles } ]`, oldest first. `created_at` is ISO 8601 UTC; `name` may be `null`.
+**`list_checkpoints`** `{}` — returns `[ { checkpoint_id, name, created_at, emulated_cycles, compatible } ]`, oldest first. `created_at` is ISO 8601 UTC; `name` may be `null`. `compatible` is `false` for a checkpoint another build made (`restore_checkpoint` returns `-32011` for it) and `true` otherwise.
 
 **`delete_checkpoint`** `{ checkpoint_id }` — returns `{}`. An unknown id is `-32602`.
 
@@ -326,7 +335,7 @@ Harness-specific codes:
 | -32000 | Generic harness error |
 | -32001 | Unauthorized: bad token, or method not allowed for this role |
 | -32002 | No session (agent or operator method that needs one, before `create_session`) |
-| -32003 | Resource locked |
+| -32003 | Resource locked (`create_session` with a `checkpoint_dir` another process has open) |
 | -32004 | Checkpoint or restore failed |
 | -32005 | Disk not found |
 | -32006 | Not supported (by this model or build, or not yet implemented) |
@@ -334,6 +343,7 @@ Harness-specific codes:
 | -32008 | Invalid state (e.g. `resume` in stepped mode, a second `create_session`, window closed during a step, run/input/checkpoint/export calls after a failed restore) |
 | -32009 | Audio no longer buffered |
 | -32010 | Input queue full: `data` is `{ pending, limit }` |
+| -32011 | Checkpoint from another build (`restore_checkpoint`); the message names both builds |
 
 Error objects look like `{ code, message, data? }`. `-32603` carries the C++ exception's `what()` in `message`.
 

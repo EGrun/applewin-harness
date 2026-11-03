@@ -5,10 +5,10 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  # Builds each configuration once; the test jobs below run the suites in parallel against its executables.
+  build:
     runs-on: windows-2022
-    # Debug takes about 30 minutes (Release about 15); the margin is for slow runners
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -25,37 +25,19 @@ jobs:
         run: msbuild AppleWinHarness.sln -m -p:Configuration=${{ matrix.config }} -p:Platform=x64
         # a failing msbuild exits non-zero, which fails the step
 
+      - name: Upload the executables for the test jobs
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bin-${{ matrix.config }}
+          path: |
+            bin/x64/${{ matrix.config }}/AppleWinHarness.exe
+            bin/x64/${{ matrix.config }}/HarnessTests.exe
+          if-no-files-found: error
+
       - uses: actions/setup-python@v7.0.0
+        if: matrix.config == 'Release'
         with:
           python-version: '3.13'
-
-      - name: Record harness temp path
-        shell: pwsh
-        run: '"HARNESS_TMP=$env:TEMP\applewin-harness" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
-
-      - name: Test (headless suites; windowed and audio need a desktop and sound device)
-        shell: pwsh
-        run: |
-          & "bin\x64\${{ matrix.config }}\HarnessTests.exe" "-tse=windowed,audio"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Python pipe tests (--serve --headless)
-        shell: pwsh
-        env:
-          HARNESS_EXE: ${{ github.workspace }}\bin\x64\${{ matrix.config }}\AppleWinHarness.exe
-        run: |
-          python -m unittest discover -s tests/python -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Adapter tests (MCP server, headless)
-        shell: pwsh
-        env:
-          HARNESS_EXE: ${{ github.workspace }}\bin\x64\${{ matrix.config }}\AppleWinHarness.exe
-        run: |
-          python -m pip install -r adapter/requirements.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest discover -s tests/adapter -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build the release bundle
         if: matrix.config == 'Release'
@@ -80,6 +62,8 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
+          python -m pip install -r adapter/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $tests = Join-Path $env:GITHUB_WORKSPACE 'tests'
           # test_mcp's module fixture launches HARNESS_EXE (default: the Debug exe, which this job doesn't build).
           $env:HARNESS_EXE = Join-Path $env:HARNESS_BUNDLE_DIR 'AppleWinHarness.exe'
@@ -113,10 +97,64 @@ jobs:
           path: ${{ env.SOURCE_ZIP }}
           if-no-files-found: error
 
+  test:
+    needs: build
+    runs-on: windows-2022
+    # The slowest suite (adapter, Debug) takes about 12 minutes
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+        suite: [harness, python, adapter]
+    env:
+      HARNESS_EXE: ${{ github.workspace }}\bin\x64\${{ matrix.config }}\AppleWinHarness.exe
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive   # the tests boot the DOS 3.3 image in external/AppleWin
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: bin-${{ matrix.config }}
+          path: bin/x64/${{ matrix.config }}
+
+      - uses: actions/setup-python@v7.0.0
+        if: matrix.suite != 'harness'
+        with:
+          python-version: '3.13'
+
+      - name: Record harness temp path
+        shell: pwsh
+        run: '"HARNESS_TMP=$env:TEMP\applewin-harness" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
+
+      - name: HarnessTests (headless suites; windowed and audio need a desktop and sound device)
+        if: matrix.suite == 'harness'
+        shell: pwsh
+        run: |
+          & "bin\x64\${{ matrix.config }}\HarnessTests.exe" "-tse=windowed,audio"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Python pipe tests (--serve --headless)
+        if: matrix.suite == 'python'
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests/python -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Adapter tests (MCP server, headless)
+        if: matrix.suite == 'adapter'
+        shell: pwsh
+        run: |
+          python -m pip install -r adapter/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests/adapter -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload harness temp files on failure
         if: failure()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: applewin-harness-temp-${{ matrix.config }}
+          name: applewin-harness-temp-${{ matrix.config }}-${{ matrix.suite }}
           path: ${{ env.HARNESS_TMP }}
           if-no-files-found: ignore

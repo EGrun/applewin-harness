@@ -87,7 +87,13 @@ class PersistenceTestCase(AdapterTestCase):
         await self.type_ok(s, "LOAD {}\n".format(name))
         await call(s, "wait", ms=6000)
         await self.type_ok(s, "LIST\n")
-        return await self.screen(s)
+        # In realtime the listing is still printing when type_text returns: wait for the prompt after it.
+        for _ in range(50):
+            screen = await self.screen(s)
+            if screen.rpartition("]LIST")[2].rstrip().endswith("]"):
+                return screen
+            await call(s, "wait", ms=100)
+        return screen
 
     def wait_for_change(self, path, before, seconds=30.0):
         deadline = time.monotonic() + seconds

@@ -26,6 +26,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .harness_client import ConnectionClosed, Harness, RpcError
+from .persistence import StateDir, StateDirLocked
 from .screen import (FRAME_H, FRAME_W, MAX_SHEET_H, MAX_SHEET_W, ScreenError, check_region, check_size, check_zoom,
                      contact_sheet, crop_zoom, decode_png, encode_png, region_differs, sheet_size)
 
@@ -251,17 +252,26 @@ def parse_args(argv=None):
                    help="stderr log format, also passed to the harness (default: text)")
     p.add_argument("--version", action="version", version="applewin_mcp " + __version__)
     p.add_argument("--text-screen", action="store_true", help="enable the read_screen tool")
+    p.add_argument("--state-dir", metavar="DIR",
+                   help="keep the disks the machine writes (and, in a stepped session, its checkpoints) in DIR between runs")
+    p.add_argument("--fresh-disks", action="store_true",
+                   help="with --state-dir: move the kept disks aside and start again from the original images")
+    p.add_argument("--fresh-machine", action="store_true",
+                   help="with --state-dir: do not resume the last stepped session; boot the machine afresh")
     args = p.parse_args(argv)
+    if (args.fresh_disks or args.fresh_machine) and not args.state_dir:
+        p.error("--fresh-disks and --fresh-machine need --state-dir")
     if (args.speed is not None or args.no_disk_boost) and not args.realtime:
         p.error("--speed and --no-disk-boost only apply with --realtime (stepped runs always use authentic speed)")
     return args
 
 
-def session_params(args):
-    """The create_session parameters for the command line."""
+def session_params(args, state=None):
+    """The create_session parameters for the command line; with a state directory the disk is its persisted copy."""
     params = {"run_mode": "realtime" if args.realtime else "stepped", "allow_text_screen": bool(args.text_screen)}
     if args.disk:
-        params["disks"] = [{"slot": 6, "drive": 1, "path": os.path.abspath(args.disk)}]
+        disk = os.path.abspath(args.disk)
+        params["disks"] = [{"slot": 6, "drive": 1, "path": state.disk_for(disk) if state else disk}]
     speed = {}
     if args.speed is not None:
         speed["machine_speed"] = args.speed
@@ -281,6 +291,8 @@ class Machine:
     """The running harness and its two connections. Methods block; the tools call them through a worker thread,
     and self.lock keeps one tool call at a time on the emulator."""
 
+    state = None   # the StateDir, with --state-dir
+
     def __init__(self, args):
         self.stepped = not args.realtime
         self.lock = threading.Lock()
@@ -290,15 +302,38 @@ class Machine:
         self.collect_frames = False
         self.input_screen = None   # (frame RGB, emulated_cycles) just after the last input was sent
         self.last_image = None     # (digest of the last image sent, emulated_cycles then); see _offer
+        self.drive_keys = {1: None, 2: None}   # drive -> key of the persisted copy it holds (None: empty or not kept)
+        self.unsaved = set()       # drives whose last save failed
+        self.started = False       # create_session and the drive setup succeeded
+        self.watcher = None
+        self.watcher_stop = threading.Event()
+        if args.state_dir:
+            self.state = StateDir(args.state_dir)   # before the harness starts: a directory in use fails fast
+        try:
+            self._start(args)
+        except BaseException:
+            if self.state is not None:
+                self.state.close()
+            raise
+
+    def _start(self, args):
+        if self.state is not None and args.fresh_disks:
+            log("moved the kept disks to {}".format(self.state.archive_disks()))
         os.environ["HARNESS_EXE"] = os.path.abspath(args.exe)
         self.harness = Harness.launch(headless=args.headless, extra_args=["--log-format", args.log_format],
                                       stderr_line=self._forward_harness_line)
         log("harness pid {}".format(self.harness.pid))
         try:
             self.operator = self.harness.connect("operator")
-            self.operator.call("create_session", timeout=CALL_TIMEOUT, **session_params(args))
+            self.operator.call("create_session", timeout=CALL_TIMEOUT, **session_params(args, self.state))
             self.agent = self.harness.connect("agent")
             self.agent.call("subscribe_audio", timeout=CALL_TIMEOUT)
+            if self.state is not None:
+                self.operator.call("subscribe_disk_writes", timeout=CALL_TIMEOUT)
+                self._learn_drives()
+                self.watcher = threading.Thread(target=self._watch_disk_writes, name="disk-writes", daemon=True)
+                self.watcher.start()
+            self.started = True
         except BaseException:
             self.shutdown()
             raise
@@ -309,6 +344,49 @@ class Machine:
         if not line.endswith(b"\n"):
             line += b"\n"
         write_stderr(line)
+
+    # ---- kept disks (--state-dir; docs/specs/persistence.md section 4) ----
+
+    def _learn_drives(self):
+        """Rebuilds drive_keys from list_disks: a drive's key is the name of its persisted copy; a write-protected
+        drive, or a disk that is not a persisted copy, has none and is never saved. Call with self.lock held."""
+        self.drive_keys = {1: None, 2: None}
+        for row in self.rpc(self.operator, "list_disks"):
+            if row.get("slot") == 6 and row.get("drive") in self.drive_keys and not row.get("write_protected"):
+                self.drive_keys[row["drive"]] = self.state.key_of(row["original_path"])
+
+    def _save_drive(self, drive):
+        """Exports the drive's disk over its persisted copy. A failure is logged and remembered, never raised.
+        Call with self.lock held."""
+        key = self.drive_keys.get(drive)
+        if key is None:
+            return
+        try:
+            self.state.save(key, lambda tmp: self.rpc(self.operator, "export_disk", slot=6, drive=drive, dest_path=tmp))
+            self.unsaved.discard(drive)
+        except Exception as e:   # never fail a tool call over a save; the next burst and the shutdown try again
+            self.unsaved.add(drive)
+            _logger.warning("could not save drive {} ({}): {}".format(drive, key, e))
+
+    def _save_all(self):
+        for drive in sorted(self.drive_keys):
+            self._save_drive(drive)
+
+    def _watch_disk_writes(self):
+        """Saves a drive each time the harness says it has new writes (a thread: a realtime session needs no tool call)."""
+        while not self.watcher_stop.is_set():
+            try:
+                note = self.operator.next_notification(timeout=0.5)
+            except TimeoutError:
+                continue
+            if note.get("method") != "disk_written":
+                continue
+            with self.lock:
+                if self.watcher_stop.is_set():
+                    return
+                self._save_drive((note.get("params") or {}).get("drive"))
+                for drive in sorted(self.unsaved):   # a drive that failed before gets another try
+                    self._save_drive(drive)
 
     # ---- helpers (call with self.lock held) ----
 
@@ -690,8 +768,22 @@ class Machine:
     def insert_disk(self, drive, path, write_protected):
         path = self._local_path(path)
         with self.lock:
-            self.rpc(self.operator, "insert_disk", slot=6, drive=drive, path=path,
+            mounted, key = path, None
+            if self.state is not None:
+                try:
+                    mounted = self.state.disk_for(path)
+                except OSError as e:
+                    raise ToolError("cannot keep a copy of {} ({})".format(path, e)) from None
+                key = None if write_protected else self.state.key_of(mounted)
+                other = 3 - drive
+                if key is not None and self.drive_keys.get(other) == key:
+                    raise ToolError("{} is already in drive {}; one disk image cannot be in both drives".format(
+                        path, other))
+                self._save_drive(drive)   # the disk going out
+            self.rpc(self.operator, "insert_disk", slot=6, drive=drive, path=mounted,
                      write_protected=write_protected)
+            if drive in self.drive_keys:
+                self.drive_keys[drive] = key
         return "inserted {} in drive {}".format(path, drive)
 
     def export_disk(self, drive, path):
@@ -720,7 +812,11 @@ class Machine:
 
     def eject_disk(self, drive):
         with self.lock:
+            if self.state is not None:
+                self._save_drive(drive)
             self.rpc(self.operator, "eject_disk", slot=6, drive=drive)
+            if drive in self.drive_keys:
+                self.drive_keys[drive] = None
         return "ejected the disk from drive {}".format(drive)
 
     # ---- checkpoints: stepped sessions only (user ruling 2026-10-20; the tools are not registered in realtime) ----
@@ -763,6 +859,9 @@ class Machine:
             self.events = []
             self.input_screen = None
             self.last_image = None
+            if self.state is not None:   # the persisted copies follow the machine
+                self._learn_drives()
+                self._save_all()
         return "restored {} at {:.1f} ms".format(self._checkpoint_label(checkpoint_id, name),
                                                  cycles_to_ms(restored["emulated_cycles"]))
 
@@ -782,12 +881,22 @@ class Machine:
         return "deleted {}".format(checkpoint_id)
 
     def shutdown(self):
-        """close_session, then wait for the process to exit (Harness.close waits 5 s, then kills it)."""
+        """Saves the kept disks, then close_session, then waits for the process to exit (Harness.close waits 5 s,
+        then kills it)."""
+        if self.state is not None:
+            self.watcher_stop.set()
+            if self.watcher is not None:
+                self.watcher.join()
+            if self.started:
+                with self.lock:
+                    self._save_all()
         try:
             self.harness.close()
         except Exception as e:   # never let cleanup hide the reason we are stopping
             log("shutdown error: {!r}".format(e))
             self.harness.kill()
+        if self.state is not None:
+            self.state.close()
 
 
 def build_server(args, machine):
@@ -1010,7 +1119,12 @@ def build_server(args, machine):
 def main(argv=None):
     args = parse_args(argv)
     configure_logging(args.log_format)
-    machine = Machine(args)
+    try:
+        machine = Machine(args)
+    except StateDirLocked as e:
+        _logger.error(str(e))
+        _writer.close()
+        return 1
     try:
         build_server(args, machine).run("stdio")
     finally:

@@ -232,6 +232,20 @@ class ToolListTest(AdapterTestCase):
                         self.assertIn("280x192", tools[name].description)
         self.run_async(go)
 
+    def test_image_tools_state_their_cost(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                tools = {t.name: t for t in (await asyncio.wait_for(s.list_tools(), CALL_TIMEOUT)).tools}
+                look = tools["look"]
+                self.assertIn("about 280 tokens", look.description)
+                self.assertIn("force true", look.description)
+                self.assertEqual(look.input_schema["properties"]["force"]["type"], "boolean")
+                self.assertIn("look false when you only need to know whether something changed",
+                              " ".join(tools["wait_until_change"].description.split()))
+                self.assertIn("the same as the last image you were sent",
+                              " ".join(tools["press_keys"].description.split()))
+        self.run_async(go)
+
     def test_read_screen_absent_without_text_screen(self):
         self.assertEqual(self.tool_names(False), NO_TEXT_TOOLS)
 
@@ -311,6 +325,20 @@ class EndToEndTest(AdapterTestCase):
                 self.assertIn("280x192", text_of(bad))
         self.run_async(go)
 
+    def test_a_repeated_look_is_a_note_until_forced(self):
+        async def go():
+            async with mcp_session(self.errlog) as s:
+                await call(s, "wait", ms=12000)
+                first = await call(s, "look")
+                self.assertEqual([c.type for c in first.content], ["image"])
+                second = await call(s, "look")
+                self.assertEqual([c.type for c in second.content], ["text"])
+                self.assertTrue(text_of(second).startswith("the screen is the same as the last image you were sent ("),
+                                text_of(second))
+                forced = await call(s, "look", force=True)
+                self.assertEqual([c.type for c in forced.content], ["image"])
+        self.run_async(go)
+
     def test_look_zoom_2_matches_plain_look_in_80_columns(self):
         """Zoom 2 over the whole screen is the full 560x384 frame, dot for dot (80-column text uses every dot)."""
         async def go():
@@ -325,7 +353,7 @@ class EndToEndTest(AdapterTestCase):
                     r = await call(s, "look", **args)
                     self.assertFalse(r.is_error, text_of(r))
                     return decode_png_rgb(base64.b64decode([c for c in r.content if c.type == "image"][0].data))
-                plain, zoomed = await image(), await image(zoom=2)
+                plain, zoomed = await image(), await image(zoom=2, force=True)
                 self.assertEqual(plain[:2], (560, 384))
                 self.assertEqual(zoomed[:2], (560, 384))
                 self.assertTrue(plain[2] == zoomed[2], "adapter zoom=2 differs from the harness PNG")
@@ -350,7 +378,7 @@ class EndToEndTest(AdapterTestCase):
                     with self.subTest(args=args):
                         r = await call(s, "look", **args)
                         self.assertTrue(r.is_error, args)
-                self.assertEqual(await png(zoom=1), before)
+                self.assertEqual(await png(zoom=1, force=True), before)
         self.run_async(go)
 
     def test_strip_tile_times_are_exact_in_stepped_mode(self):
@@ -648,7 +676,7 @@ class WaitUntilChangeTest(AdapterTestCase):
                 pressed = await call(s, "press_key", key="Q")   # HOME, PRINT, then a JMP loop: a static screen
                 self.assertFalse(pressed.is_error, text_of(pressed))
                 await call(s, "wait", ms=300)
-                self.check_no_change(await call(s, "wait_until_change", timeout_ms=200), 200, 220)
+                self.check_no_change(await call(s, "wait_until_change", timeout_ms=200, look=False), 200, 220)
                 r = await call(s, "wait_until_change", timeout_ms=200, since="last_input")
                 self.assertFalse(r.is_error, text_of(r))
                 m = re.fullmatch(r"changed after (\d+) ms \(since the last input\)", r.content[0].text)
@@ -941,7 +969,7 @@ class CheckpointTest(AdapterTestCase):
                     await call(s, "restore_checkpoint", checkpoint_id="cp-1")
                     await call(s, "press_keys", keys=["P", "R", "I", "N", "T"])
                     await call(s, "wait", ms=250)
-                    shots.append(base64.b64decode((await call(s, "look")).content[0].data))
+                    shots.append(base64.b64decode((await call(s, "look", force=True)).content[0].data))
                 self.assertEqual(shots[0], shots[1])
 
                 listed = text_of(await call(s, "list_checkpoints"))
@@ -977,7 +1005,37 @@ class MachineUnitTest(unittest.TestCase):
         m.stepped = False
         m.frame_ready = []
         m.collect_frames = False
+        m.last_image = None
         return m
+
+    def png_machine(self, width, height):
+        from applewin_mcp import screen
+        rgb = bytes(i % 251 for i in range(width * height * 3))
+        calls = []
+
+        def rpc(conn, method, **params):
+            calls.append(params)
+            return {"data": base64.b64encode(screen.encode_png(width, height, rgb)).decode(),
+                    "width": width, "height": height, "emulated_cycles": 1234, "format": "PNG"}
+        m = self.machine()
+        m.rpc, m.agent = rpc, object()
+        return m, rgb, calls
+
+    def test_frame_rgb_fetches_png(self):
+        m, rgb, calls = self.png_machine(560, 384)
+        self.assertEqual(m.frame_rgb(), (rgb, 1234))
+        self.assertEqual(calls, [{"format": "PNG", "borders": False}])
+
+    def test_frame_rgb_rejects_other_sizes(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m, _, _ = self.png_machine(600, 420)
+        with self.assertRaisesRegex(ToolError, "unsupported video mode for region/zoom/strips"):
+            m.frame_rgb()
+
+    def test_plain_look_accepts_other_sizes(self):
+        from applewin_mcp import screen
+        m, rgb, _ = self.png_machine(600, 420)
+        self.assertEqual(screen.decode_png(m._look_locked()), (600, 420, rgb))
 
     def test_whole_screen_zoom_8_is_rejected_before_a_frame_is_fetched(self):
         from mcp.server.mcpserver.exceptions import ToolError
@@ -990,6 +1048,73 @@ class MachineUnitTest(unittest.TestCase):
             m._look_locked(None, 8)
         with self.assertRaisesRegex(ToolError, "1120x768"):
             m._look_locked([0, 0, 200, 100], 8)
+
+    def look_machine(self):
+        """A machine whose frame and frame_rgb come from the settable m.shot = (rgb, cycles)."""
+        from applewin_mcp import screen
+        m = self.machine()
+        m.shot = (bytes(i % 251 for i in range(560 * 384 * 3)), 1000)
+        m.frame = lambda: (560, 384, m.shot[0], screen.encode_png(560, 384, m.shot[0]), m.shot[1])
+        m.frame_rgb = lambda: m.shot
+        return m
+
+    def test_a_repeated_look_returns_the_note(self):
+        from applewin_mcp import server
+        m = self.look_machine()
+        self.assertIsInstance(m.look(), bytes)
+        self.assertEqual(m.look(), server.UNCHANGED_NOTE.format(ms=0))
+
+    def test_the_note_counts_emulated_time(self):
+        m = self.look_machine()
+        m.look()
+        m.shot = (m.shot[0], m.shot[1] + 102180)
+        self.assertIn("(100 ms of emulated time ago)", m.look())
+
+    def test_force_returns_the_image_again(self):
+        m = self.look_machine()
+        m.look()
+        m.shot = (m.shot[0], m.shot[1] + 5000)
+        self.assertIsInstance(m.look(force=True), bytes)
+        self.assertEqual(m.last_image[1], 6000)
+
+    def test_a_changed_screen_is_sent(self):
+        m = self.look_machine()
+        m.look()
+        rgb = bytearray(m.shot[0])
+        rgb[0] ^= 1
+        m.shot = (bytes(rgb), m.shot[1])
+        self.assertIsInstance(m.look(), bytes)
+
+    def test_a_crop_after_a_full_look_is_sent(self):
+        m = self.look_machine()
+        self.assertIsInstance(m.look(), bytes)
+        self.assertIsInstance(m.look(region=[0, 0, 280, 192], zoom=1), bytes)
+
+    def test_a_failed_call_records_nothing(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.look_machine()
+        m.agent = object()
+        m.rpc = lambda conn, method, **params: {"input_id": 1}
+        m.note_input_sent = lambda: None
+
+        def dropped(*args, **kwargs):
+            raise ToolError("dropped")
+        m.await_input = dropped
+        with self.assertRaises(ToolError):
+            m.press_keys(["A"], look=True)
+        self.assertIsNone(m.last_image)
+
+    def test_tool_content_maps_each_shape(self):
+        from mcp.server.mcpserver import Image
+        from applewin_mcp.server import tool_content
+        image = tool_content(b"png")
+        self.assertIsInstance(image, Image)
+        self.assertEqual((image.data, image._mime_type), (b"png", "image/png"))
+        self.assertEqual(tool_content("note"), "note")
+        text, pair = tool_content(["report", b"png"])
+        self.assertEqual(text, "report")
+        self.assertIsInstance(pair, Image)
+        self.assertEqual(tool_content(["report", "note"]), "report\nnote")
 
     def stub_wait(self, pump_raises):
         from mcp.server.mcpserver.exceptions import ToolError
@@ -1052,6 +1177,30 @@ class MachineUnitTest(unittest.TestCase):
         arrive()      # whatever was still in flight has arrived by now
         m.pump(0.0)
         self.assertEqual((m.applied, m.events, m.input_screen), ({}, [], None))
+
+    def test_a_restore_forgets_the_last_image(self):
+        from mcp.server.mcpserver.exceptions import ToolError
+        m = self.look_machine()
+        m.stepped = True
+        m.agent, m.operator = object(), object()
+        m.pump = lambda timeout=0.0: None
+        fail = []
+
+        def rpc(conn, method, **params):
+            if method == "restore_checkpoint" and fail:
+                raise ToolError("no such checkpoint")
+            return {"emulated_cycles": 0} if method == "restore_checkpoint" else [] if method == "list_checkpoints" else {}
+        m.rpc = rpc
+        self.assertIsInstance(m.look(), bytes)
+        fail.append(True)
+        with self.assertRaises(ToolError):
+            m.restore_checkpoint("cp-1")
+        self.assertIsNotNone(m.last_image)   # a failed restore leaves it alone
+        self.assertIsInstance(m.look(), str)
+        fail.clear()
+        m.restore_checkpoint("cp-1")
+        self.assertIsNone(m.last_image)
+        self.assertIsInstance(m.look(), bytes)
 
     def test_a_failed_screen_fetch_after_an_input_does_not_fail_the_input(self):
         """The input was sent: the tool still succeeds, and since="last_input" then has no reference rather than an

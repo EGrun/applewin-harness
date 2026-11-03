@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Screen helpers: RGB out of a harness frame, region crop and zoom, PNG encoding (stdlib only)."""
+"""Screen helpers: RGB out of a harness PNG frame, region crop and zoom, PNG encoding (stdlib only)."""
 
 import struct
 import zlib
@@ -12,18 +12,6 @@ MAX_SHEET_W, MAX_SHEET_H = 1280, 1024   # a frame strip's contact sheet (four fu
 
 class ScreenError(ValueError):
     """The message is the user-facing tool error text."""
-
-
-def frame_pixels(bgra, width, height):
-    """560x384 RGB from a 560x384 BGRA frame: every pixel is kept (Double Hi-Res, 80-column text and NTSC colour
-    use all 560 dots of a line)."""
-    if (width, height) != (FRAME_W, FRAME_H) or len(bgra) != FRAME_W * FRAME_H * 4:
-        raise ScreenError("unsupported video mode for region/zoom/strips")
-    out = bytearray(FRAME_W * FRAME_H * 3)
-    out[0::3] = bgra[2::4]
-    out[1::3] = bgra[1::4]
-    out[2::3] = bgra[0::4]
-    return bytes(out)
 
 
 def check_region(region):
@@ -103,6 +91,44 @@ def encode_png(width, height, rgb):
             + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
             + _chunk(b"IDAT", zlib.compress(raw))
             + _chunk(b"IEND", b""))
+
+
+def decode_png(data):
+    """(width, height, rgb) from an 8-bit RGB, uninterlaced PNG whose rows all use filter 0, as the harness writes
+    them; any other PNG is a ScreenError. The IDAT data may be split over any number of chunks."""
+    bad = ScreenError("unexpected PNG from the harness")
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise bad
+    pos, header, idat = 8, None, []
+    while pos + 8 <= len(data):
+        length, tag = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if tag == b"IHDR":
+            header = body
+        elif tag == b"IDAT":
+            idat.append(body)
+        elif tag == b"IEND":
+            break
+    if header is None or len(header) != 13:
+        raise bad
+    width, height, depth, ctype, _, _, interlace = struct.unpack(">IIBBBBB", header)
+    if (depth, ctype, interlace) != (8, 2, 0):
+        raise bad
+    try:
+        raw = zlib.decompress(b"".join(idat))
+    except zlib.error:
+        raise bad from None
+    stride = width * 3
+    if len(raw) != height * (stride + 1):
+        raise bad
+    rows = []
+    for y in range(height):
+        row = raw[y * (stride + 1):(y + 1) * (stride + 1)]
+        if row[0] != 0:
+            raise bad
+        rows.append(row[1:])
+    return width, height, b"".join(rows)
 
 
 def region_differs(ref_rgb, cur_rgb, region):

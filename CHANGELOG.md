@@ -10,4 +10,5 @@ First public release.
 - The MCP adapter `applewin_mcp`: lets an LLM agent type, press timed key sequences (`press_keys`, with `delay_from` for read-anchored timing and `wait_for_ready` to send each key only when the game is waiting for a command, stopping at a prompt, and `until_ready` to return only once the game is ready again after the last key), use the joystick, look at the screen (regions, zoom, frame strips), wait for changes, listen, swap disks and, in stepped sessions, save and restore checkpoints.
 - Stepped and realtime modes; Double Hi-Res and 80-column text are shown at full resolution.
 - A release zip (`tools/make_release.ps1`) and a source archive that includes AppleWin (`tools/make_source_archive.ps1`).
+- Adapter: frames are fetched as PNG; an image identical to the last one sent is replaced by a note (`look` takes `force`); tool descriptions state image cost (D15).
 - Licensing: MIT for the harness's own code, GPL-2.0-or-later for the binaries that link AppleWin. See [NOTICE.txt](NOTICE.txt).

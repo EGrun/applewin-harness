@@ -1158,7 +1158,10 @@ json Session::Checkpoint(const json& params)
     try {
         const SnapshotMeta meta = emulator_.SaveSnapshot(checkpoints_->PendingStateFile());
         emulator_.FlushDisks();
-        const CheckpointStore::Entry e = checkpoints_->Create(name, meta, emulator_.Disks());
+        std::vector<CheckpointStore::DiskSource> sources;
+        for (const DiskInfo& d : emulator_.Disks())
+            sources.push_back({d.drive, d.workingPath, OriginalOf(d.workingPath), std::string()});   // statePath: Task 2
+        const CheckpointStore::Entry e = checkpoints_->Create(name, meta, sources, realtime_ ? "realtime" : "stepped");
         state_ = State::Paused;   // SaveSnapshot ended the realtime run
         return json{{"checkpoint_id", e.id}, {"emulated_cycles", meta.emulatedCycles}};
     } catch (const std::exception& e) {

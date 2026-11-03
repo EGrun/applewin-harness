@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: MIT
 #include "server/checkpoint_store.h"
+#include "host/harness_version.h"
 #include <nlohmann/json.hpp>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <fstream>
+#include <regex>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -32,6 +37,11 @@ std::string NowIsoUtc()
     return buf;
 }
 
+fs::path FromUtf8(const std::string& s)
+{
+    return fs::path(std::u8string(s.begin(), s.end()));
+}
+
 [[noreturn]] void Fail(const std::string& what, const std::error_code& ec)
 {
     throw std::runtime_error(what + (ec ? ": " + ec.message() : std::string()));
@@ -41,15 +51,136 @@ std::string NowIsoUtc()
 
 CheckpointStore::CheckpointStore(fs::path workDir) : workDir_(std::move(workDir)) {}
 
+CheckpointStore::CheckpointStore(fs::path workDir, fs::path persistentDir)
+    : workDir_(std::move(workDir)), persistentDir_(std::move(persistentDir))
+{
+    std::error_code ec;
+    fs::create_directories(persistentDir_, ec);
+    if (ec) Fail("cannot create " + Utf8(persistentDir_), ec);
+    const fs::path lockFile = persistentDir_ / ".lock";
+    HANDLE h = CreateFileW(lockFile.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION)
+            throw CheckpointDirLocked("checkpoint directory is in use by another process: " + Utf8(persistentDir_));
+        Fail("cannot open " + Utf8(lockFile), std::error_code(static_cast<int>(err), std::system_category()));
+    }
+    lock_ = h;
+    try {
+        Open();
+    } catch (...) {
+        CloseHandle(h);   // the destructor does not run for a constructor that throws
+        throw;
+    }
+}
+
+CheckpointStore::~CheckpointStore()
+{
+    if (lock_) CloseHandle(static_cast<HANDLE>(lock_));
+}
+
+fs::path CheckpointStore::Root() const
+{
+    return persistentDir_.empty() ? workDir_ / "checkpoints" : persistentDir_;
+}
+
+void CheckpointStore::Open()
+{
+    std::error_code ec;
+    fs::remove(persistentDir_ / "pending.yaml", ec);
+    static const std::regex kCp(R"(cp-(\d+))");
+    uint64_t highest = 0;
+    std::vector<std::pair<uint64_t, fs::path>> found;
+    for (fs::directory_iterator it(persistentDir_, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code tec;
+        if (!it->is_directory(tec)) continue;
+        const std::string leaf = Utf8(it->path().filename());
+        if (leaf.size() > 4 && leaf.compare(leaf.size() - 4, 4, ".tmp") == 0) {
+            fs::remove_all(it->path(), tec);
+            if (tec) Fail("cannot delete the leftover " + Utf8(it->path()), tec);
+            continue;
+        }
+        std::smatch m;
+        if (!std::regex_match(leaf, m, kCp)) continue;
+        uint64_t n = 0;
+        try {
+            n = std::stoull(m[1].str());
+        } catch (const std::exception&) {
+            skipped_.push_back(leaf + ": the number is out of range");
+            continue;
+        }
+        highest = std::max(highest, n);
+        found.emplace_back(n, it->path());
+    }
+    if (ec) Fail("cannot read " + Utf8(persistentDir_), ec);
+    for (const auto& [n, dir] : found) {
+        const std::string id = "cp-" + std::to_string(n);
+        if (Utf8(dir.filename()) != id) {   // "cp-007": not a name Create would have made
+            skipped_.push_back(Utf8(dir.filename()) + ": not a canonical checkpoint id");
+            continue;
+        }
+        try {
+            entries_.emplace(n, ReadEntry(dir, id));
+        } catch (const std::exception& e) {
+            skipped_.push_back(id + ": " + e.what());
+        }
+    }
+    nextNumber_ = highest + 1;
+}
+
+CheckpointStore::Entry CheckpointStore::ReadEntry(const fs::path& dir, const std::string& id) const
+{
+    std::ifstream in(dir / "meta.json", std::ios::binary);
+    if (!in) throw std::runtime_error("meta.json is missing");
+    const json j = json::parse(in, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) throw std::runtime_error("meta.json does not parse");
+    Entry e;
+    try {
+        if (j.at("checkpoint_id").get<std::string>() != id) throw std::runtime_error("meta.json names another checkpoint");
+        e.id = id;
+        e.name = j.at("name").get<std::string>();
+        e.createdAt = j.at("created_at").get<std::string>();
+        e.meta.emulatedCycles = j.at("emulated_cycles").get<uint64_t>();
+        e.meta.powerOnOrigin = j.at("power_on_origin").get<uint64_t>();
+        const json& sp = j.at("speed");
+        e.meta.speed.machineSpeed = sp.at("machine_speed").get<uint32_t>();
+        e.meta.speed.enhanceDisk = sp.at("enhance_disk").get<bool>();
+        e.meta.speed.fullSpeedOverride = sp.at("full_speed_override").get<bool>();
+        e.meta.joystickX = static_cast<uint8_t>(j.at("joystick_x").get<int>());
+        e.meta.joystickY = static_cast<uint8_t>(j.at("joystick_y").get<int>());
+        e.build = j.at("build").get<std::string>();
+        e.runMode = j.at("run_mode").get<std::string>();
+        e.dir = dir;
+        e.foreign = true;
+        for (const json& d : j.at("disks")) {
+            DiskCopy c;
+            c.drive = d.at("drive").get<int>();
+            c.workingPath = FromUtf8(d.at("working_path").get<std::string>());
+            c.copy = dir / FromUtf8(d.at("copy").get<std::string>()).filename();
+            c.originalPath = FromUtf8(d.at("original_path").get<std::string>());
+            c.statePath = d.at("state_path").get<std::string>();
+            e.disks.push_back(std::move(c));
+        }
+    } catch (const json::exception& ex) {
+        throw std::runtime_error(std::string("meta.json is malformed: ") + ex.what());
+    }
+    std::error_code ec;
+    if (!fs::is_regular_file(e.StateFile(), ec)) throw std::runtime_error("state.yaml is missing");
+    for (const DiskCopy& c : e.disks)
+        if (!fs::is_regular_file(c.copy, ec)) throw std::runtime_error("disk copy missing: " + Utf8(c.copy.filename()));
+    return e;
+}
+
 fs::path CheckpointStore::PendingStateFile() const
 {
     std::error_code ec;
-    fs::create_directories(workDir_ / "checkpoints", ec);   // a failure shows when the file is written
-    return workDir_ / "checkpoints" / "pending.yaml";
+    fs::create_directories(Root(), ec);   // a failure shows when the file is written
+    return Root() / "pending.yaml";
 }
 
 CheckpointStore::Entry CheckpointStore::Create(std::string name, const SnapshotMeta& meta,
-                                               const std::vector<DiskInfo>& disks)
+                                               const std::vector<DiskSource>& disks, std::string runMode)
 {
     if (entries_.size() >= kMaxCheckpoints)
         throw std::runtime_error("checkpoint limit reached (" + std::to_string(kMaxCheckpoints) + ")");
@@ -59,20 +190,27 @@ CheckpointStore::Entry CheckpointStore::Create(std::string name, const SnapshotM
     e.name = std::move(name);
     e.createdAt = NowIsoUtc();
     e.meta = meta;
-    e.dir = workDir_ / "checkpoints" / e.id;
+    e.build = BuildId();
+    e.runMode = std::move(runMode);
+    e.dir = Root() / e.id;
+    const fs::path tmp = Root() / (e.id + ".tmp");   // renamed to e.dir once complete: a crash never leaves half a checkpoint
 
     std::error_code ec;
     try {
-        fs::create_directories(e.dir, ec);
-        if (ec) Fail("cannot create " + Utf8(e.dir), ec);
-        fs::rename(PendingStateFile(), e.StateFile(), ec);
-        if (ec) Fail("cannot move the save state into " + Utf8(e.dir), ec);
-        for (const DiskInfo& d : disks) {
+        fs::remove_all(tmp, ec);
+        fs::create_directories(tmp, ec);
+        if (ec) Fail("cannot create " + Utf8(tmp), ec);
+        fs::rename(PendingStateFile(), tmp / "state.yaml", ec);
+        if (ec) Fail("cannot move the save state into " + Utf8(tmp), ec);
+        for (const DiskSource& d : disks) {
             DiskCopy c;
             c.drive = d.drive;
             c.workingPath = d.workingPath;
-            c.copy = e.dir / ("disk" + std::to_string(d.drive + 1) + "-" + Utf8(d.workingPath.filename()));
-            fs::copy_file(d.workingPath, c.copy, fs::copy_options::overwrite_existing, ec);
+            c.originalPath = d.originalPath;
+            c.statePath = d.statePath;
+            const std::string leaf = "disk" + std::to_string(d.drive + 1) + "-" + Utf8(d.workingPath.filename());
+            c.copy = e.dir / leaf;
+            fs::copy_file(d.workingPath, tmp / leaf, fs::copy_options::overwrite_existing, ec);
             if (ec) Fail("cannot copy disk image " + Utf8(d.workingPath), ec);
             e.disks.push_back(std::move(c));
         }
@@ -80,6 +218,8 @@ CheckpointStore::Entry CheckpointStore::Create(std::string name, const SnapshotM
         j["checkpoint_id"] = e.id;
         j["name"] = e.name;
         j["created_at"] = e.createdAt;
+        j["build"] = e.build;
+        j["run_mode"] = e.runMode;
         j["emulated_cycles"] = meta.emulatedCycles;
         j["power_on_origin"] = meta.powerOnOrigin;
         j["speed"] = {{"machine_speed", meta.speed.machineSpeed},
@@ -89,14 +229,20 @@ CheckpointStore::Entry CheckpointStore::Create(std::string name, const SnapshotM
         j["joystick_y"] = meta.joystickY;
         json arr = json::array();
         for (const DiskCopy& c : e.disks)
-            arr.push_back({{"drive", c.drive}, {"working_path", Utf8(c.workingPath)}, {"copy", Utf8(c.copy.filename())}});
+            arr.push_back({{"drive", c.drive},
+                           {"working_path", Utf8(c.workingPath)},
+                           {"copy", Utf8(c.copy.filename())},
+                           {"original_path", Utf8(c.originalPath)},
+                           {"state_path", c.statePath}});
         j["disks"] = arr;
-        std::ofstream out(e.dir / "meta.json", std::ios::binary | std::ios::trunc);
+        std::ofstream out(tmp / "meta.json", std::ios::binary | std::ios::trunc);
         out << j.dump(2);
         out.close();
-        if (!out) throw std::runtime_error("cannot write " + Utf8(e.dir / "meta.json"));
+        if (!out) throw std::runtime_error("cannot write " + Utf8(tmp / "meta.json"));
+        fs::rename(tmp, e.dir, ec);
+        if (ec) Fail("cannot move " + Utf8(tmp) + " to " + Utf8(e.dir), ec);
     } catch (...) {
-        fs::remove_all(e.dir, ec);
+        fs::remove_all(tmp, ec);
         throw;
     }
     entries_.emplace(nextNumber_, e);

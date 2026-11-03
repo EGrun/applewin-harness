@@ -47,4 +47,19 @@
       <OptimizeReferences>true</OptimizeReferences>
     </Link>
   </ItemDefinitionGroup>
+  <!-- The AppleWin submodule's commit (12 hex digits), or "unknown" without git: harness_version.cpp's APPLEWIN_COMMIT, half of BuildId() (D18). -->
+  <Target Name="HarnessAppleWinCommit" BeforeTargets="ClCompile">
+    <Exec Command="git -C &quot;$(HarnessRoot)external\AppleWin&quot; rev-parse --short=12 HEAD" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="AppleWinCommitRaw" />
+    </Exec>
+    <PropertyGroup>
+      <AppleWinCommit Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(AppleWinCommitRaw)', '^[0-9a-f]{12}$'))">$(AppleWinCommitRaw)</AppleWinCommit>
+      <AppleWinCommit Condition="'$(AppleWinCommit)'==''">unknown</AppleWinCommit>
+    </PropertyGroup>
+    <ItemGroup>
+      <ClCompile Update="$(HarnessRoot)src\host\harness_version.cpp">
+        <PreprocessorDefinitions>APPLEWIN_COMMIT="$(AppleWinCommit)";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      </ClCompile>
+    </ItemGroup>
+  </Target>
 </Project>

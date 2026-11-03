@@ -11,4 +11,5 @@ First public release.
 - Stepped and realtime modes; Double Hi-Res and 80-column text are shown at full resolution.
 - A release zip (`tools/make_release.ps1`) and a source archive that includes AppleWin (`tools/make_source_archive.ps1`).
 - Adapter: frames are fetched as PNG; an image identical to the last one sent is replaced by a note (`look` takes `force`); tool descriptions state image cost (D15).
+- Harness: `create_session` takes `checkpoint_dir`; checkpoints there persist across processes and record their build; `-32011` for a checkpoint from another build (D18).
 - Licensing: MIT for the harness's own code, GPL-2.0-or-later for the binaries that link AppleWin. See [NOTICE.txt](NOTICE.txt).

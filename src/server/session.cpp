@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "server/session.h"
+#include "host/harness_version.h"
 #include "host/log.h"
 #include "server/protocol.h"
 #include "core/audio_capture.h"
@@ -507,6 +508,17 @@ json Session::CreateSession(const json& params)
     const std::string runMode = GetString(params, "run_mode", std::string("realtime"));
     if (runMode != "realtime" && runMode != "stepped") InvalidParams("run_mode must be \"realtime\" or \"stepped\"");
 
+    // D18: checkpoints that persist (docs/specs/persistence.md 3.1).
+    std::optional<fs::path> persistentDir;
+    if (const json* cd = Field(params, "checkpoint_dir")) {
+        if (!cd->is_string()) InvalidParams("checkpoint_dir must be a string");
+        const fs::path p = Utf8Path(cd->get<std::string>());
+        if (p.empty() || !p.is_absolute()) InvalidParams("checkpoint_dir must be an absolute path");
+        std::error_code ec;
+        if (fs::exists(p, ec) && !fs::is_directory(p, ec)) InvalidParams("checkpoint_dir is not a directory: " + PathUtf8(p));
+        persistentDir = p;
+    }
+
     fs::path images[2];
     if (const json* disks = Field(params, "disks")) {
         if (!disks->is_array()) InvalidParams("disks must be an array");
@@ -529,7 +541,26 @@ json Session::CreateSession(const json& params)
     const std::string pid = std::to_string(GetCurrentProcessId());
     const fs::path dir = fs::temp_directory_path() / "applewin-harness";
     fs::create_directories(dir);
-    workDir_ = fs::absolute(dir / pid);
+    const fs::path work = fs::absolute(dir / pid);
+
+    // The checkpoint store first: a locked or unusable directory fails before anything is started (the lock is released
+    // with the store if a later step fails).
+    std::unique_ptr<CheckpointStore> store;
+    if (persistentDir) {
+        try {
+            store = std::make_unique<CheckpointStore>(work, *persistentDir);
+        } catch (const CheckpointDirLocked& e) {
+            throw RpcError{kResourceLocked, e.what()};
+        } catch (const std::exception& e) {
+            throw RpcError{kHarnessError, e.what()};
+        }
+        for (const std::string& skipped : store->Skipped())
+            log::Warning(log::Component::Session, "checkpoint skipped: " + skipped);
+    } else {
+        store = std::make_unique<CheckpointStore>(work);
+    }
+
+    workDir_ = work;
     ini_ = fs::absolute(dir / (pid + ".ini"));
 
     // Working copies (D5). Two images with the same file name keep apart: drive 2's then goes in a subdirectory.
@@ -570,7 +601,7 @@ json Session::CreateSession(const json& params)
     swapCopies_ = 0;
     for (int i = 0; i < 2; ++i)
         if (!copyPaths[i].empty()) originals_.emplace_back(copyPaths[i], images[i]);
-    checkpoints_ = std::make_unique<CheckpointStore>(workDir_);
+    checkpoints_ = std::move(store);
     unusable_ = false;
     allowTextScreen_ = allowTextScreen;
     audioFloor_ = 0;
@@ -1160,7 +1191,7 @@ json Session::Checkpoint(const json& params)
         emulator_.FlushDisks();
         std::vector<CheckpointStore::DiskSource> sources;
         for (const DiskInfo& d : emulator_.Disks())
-            sources.push_back({d.drive, d.workingPath, OriginalOf(d.workingPath), std::string()});   // statePath: Task 2
+            sources.push_back({d.drive, d.workingPath, OriginalOf(d.workingPath), ImagePathForAppleWin(d.workingPath)});
         const CheckpointStore::Entry e = checkpoints_->Create(name, meta, sources, realtime_ ? "realtime" : "stepped");
         state_ = State::Paused;   // SaveSnapshot ended the realtime run
         return json{{"checkpoint_id", e.id}, {"emulated_cycles", meta.emulatedCycles}};
@@ -1182,9 +1213,19 @@ json Session::RestoreCheckpoint(const json& params)
     } catch (const std::out_of_range&) {
         InvalidParams("unknown checkpoint: " + id);
     }
+    // A save state loads only in the build that made it, and a failed load leaves the session unusable (D18): refuse
+    // before anything is touched.
+    if (entry.build != BuildId())
+        throw RpcError{kCheckpointOtherBuild,
+                       "checkpoint " + id + " was made by build " + entry.build + "; this harness is " + BuildId()};
     if (!PauseRunning()) {
         exitRequested_ = true;
         throw RpcError{kInvalidState, "the window was closed"};
+    }
+
+    if (entry.foreign) {
+        RestoreForeign(entry);
+        return FinishRestore();
     }
 
     // Before the load (ruling D7): a failure leaves the session usable with its machine state unchanged. Review I-3:
@@ -1201,33 +1242,20 @@ json Session::RestoreCheckpoint(const json& params)
     // After EjectAll a failure before the load puts the working copies and the drives back (re-inserting may reset a
     // drive's rotational position: docs/api_spec.md). If that fails too, the drives no longer hold what they held and
     // the session is unusable (review I-2): -32004 now, -32008 for the gated methods after.
-    auto abandon = [&](std::string what, bool disksRestored) -> RpcError {
-        if (disksRestored) {
-            try {
-                emulator_.ReinsertAll();
-                return RpcError{kCheckpointFailed, what};
-            } catch (const std::exception& e) {
-                what += "; re-inserting the disks failed: " + std::string(e.what());
-            }
-        }
-        unusable_ = true;
-        state_ = State::Paused;
-        return RpcError{kCheckpointFailed, what + "; the session is unusable, close_session"};
-    };
     try {
         emulator_.EjectAll();
         checkpoints_->RestoreDisks(entry);
     } catch (const RestoreRollbackError& e) {
-        throw abandon(e.what(), false);
+        throw AbandonRestore(e.what(), false);
     } catch (const std::exception& e) {
-        throw abandon(e.what(), true);
+        throw AbandonRestore(e.what(), true);
     }
     try {
         emulator_.LoadSnapshot(entry.StateFile(), entry.meta);
     } catch (const SnapshotPreLoadError& e) {   // the machine is untouched: put the disks and drives back
         const std::string rollback = checkpoints_->RollbackRestore(entry);
-        if (!rollback.empty()) throw abandon(std::string(e.what()) + "; " + rollback, false);
-        throw abandon(e.what(), true);
+        if (!rollback.empty()) throw AbandonRestore(std::string(e.what()) + "; " + rollback, false);
+        throw AbandonRestore(e.what(), true);
     } catch (const std::exception& e) {   // in or after the load: the restored disks stay, the session is unusable
         checkpoints_->CommitRestore(entry);
         unusable_ = true;
@@ -1236,7 +1264,26 @@ json Session::RestoreCheckpoint(const json& params)
         throw RpcError{kCheckpointFailed, e.what()};
     }
     checkpoints_->CommitRestore(entry);
+    return FinishRestore();
+}
 
+RpcError Session::AbandonRestore(std::string what, bool disksRestored)
+{
+    if (disksRestored) {
+        try {
+            emulator_.ReinsertAll();
+            return RpcError{kCheckpointFailed, what};
+        } catch (const std::exception& e) {
+            what += "; re-inserting the disks failed: " + std::string(e.what());
+        }
+    }
+    unusable_ = true;
+    state_ = State::Paused;
+    return RpcError{kCheckpointFailed, what + "; the session is unusable, close_session"};
+}
+
+json Session::FinishRestore()
+{
     // Restore purity owned by the session: discarded inputs reported (D1), detectors reset to the restored cycle.
     SendInputApplied();
     const uint64_t at = emulator_.EmulatedCycles();
@@ -1248,6 +1295,71 @@ json Session::RestoreCheckpoint(const json& params)
     return json{{"emulated_cycles", at}};
 }
 
+// A checkpoint an earlier process made: its disks' working paths were in that process's work directory and the save
+// state names them. So each disk copy goes to <work>/restore-<k>/disks/, a copy of the save state naming those new
+// working copies is written to <work>/restore-<k>/state/state.yaml, and that copy is loaded. The entry's stale
+// workingPath is never touched. Ruling D7 holds as for any restore: a failure before the load removes restore-<k> and
+// leaves the machine, the drives and the session as they were.
+void Session::RestoreForeign(const CheckpointStore::Entry& entry)
+{
+    const unsigned k = ++restoreDirs_;
+    const fs::path root = workDir_ / ("restore-" + std::to_string(k));
+    const fs::path rewritten = root / "state" / "state.yaml";
+    auto discard = [&] {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    };
+
+    std::vector<fs::path> newPaths;
+    try {
+        std::error_code ec;
+        fs::create_directories(root / "state", ec);
+        if (ec) throw std::runtime_error("cannot create " + PathUtf8(root / "state") + ": " + ec.message());
+        std::map<std::string, std::string> oldToNew;
+        for (const CheckpointStore::DiskCopy& c : entry.disks) {
+            if (c.statePath.empty())
+                throw std::runtime_error("checkpoint " + entry.id + " does not record the save state's path for drive " +
+                                         std::to_string(c.drive + 1));
+            fs::path where = root / "disks";
+            if (fs::exists(where / c.workingPath.filename(), ec)) where /= "drive" + std::to_string(c.drive + 1);
+            fs::create_directories(where, ec);
+            if (ec) throw std::runtime_error("cannot create " + PathUtf8(where) + ": " + ec.message());
+            const fs::path dest = where / c.workingPath.filename();
+            fs::copy_file(c.copy, dest, fs::copy_options::none, ec);
+            if (ec) throw std::runtime_error("cannot restore disk image " + PathUtf8(dest) + ": " + ec.message());
+            newPaths.push_back(dest);
+            oldToNew[c.statePath] = ImagePathForAppleWin(dest);
+        }
+        RewriteSaveStateImages(entry.StateFile(), rewritten, oldToNew);
+        emulator_.CheckSnapshot(rewritten, newPaths);
+    } catch (const std::exception& e) {
+        discard();
+        throw RpcError{kCheckpointFailed, e.what()};
+    }
+
+    try {
+        for (const fs::path& p : newPaths) emulator_.NoteImagePath(p);   // list_disks keeps the long path (D10)
+        emulator_.EjectAll();
+    } catch (const std::exception& e) {
+        RpcError err = AbandonRestore(e.what(), true);
+        discard();
+        throw err;
+    }
+    try {
+        emulator_.LoadSnapshot(rewritten, entry.meta);
+    } catch (const SnapshotPreLoadError& e) {   // the machine is untouched: put the old disks and drives back
+        RpcError err = AbandonRestore(e.what(), true);
+        discard();
+        throw err;
+    } catch (const std::exception& e) {   // in or after the load: the session is unusable
+        unusable_ = true;
+        state_ = State::Paused;
+        SendInputApplied();   // the discarded inputs
+        throw RpcError{kCheckpointFailed, e.what()};
+    }
+    for (size_t i = 0; i < newPaths.size(); ++i) originals_.emplace_back(newPaths[i], entry.disks[i].originalPath);
+}
+
 json Session::ListCheckpoints(const json&)
 {
     if (state_ == State::NoSession) throw RpcError{kNoSession, "no session"};
@@ -1256,7 +1368,8 @@ json Session::ListCheckpoints(const json&)
         list.push_back(json{{"checkpoint_id", e.id},
                             {"name", e.name.empty() ? json(nullptr) : json(e.name)},
                             {"created_at", e.createdAt},
-                            {"emulated_cycles", e.meta.emulatedCycles}});
+                            {"emulated_cycles", e.meta.emulatedCycles},
+                            {"compatible", e.build == BuildId()}});
     return list;
 }
 

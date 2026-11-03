@@ -457,6 +457,56 @@ TEST_CASE("ckpt: two restored runs replay the script exactly, whatever ran befor
     CHECK_MESSAGE(second.audio == first.audio, "audio over the script's range differs between the runs");
 }
 
+TEST_CASE("ckpt: RewriteSaveStateImages replaces only the named absolute paths")
+{
+    auto& e = StartedEmulator();
+    DosBoot boot(e, "rewrite");
+    const fs::path state = boot.dir.path / "state.yaml";
+    const fs::path rewritten = boot.dir.path / "rewritten.yaml";
+    e.SaveSnapshot(state);
+    const std::string oldPath = ImagePathForAppleWin(boot.copy.Path());
+
+    const auto before = SaveStateImages(state);
+    REQUIRE(before.size() >= 1);
+    size_t drive1 = before.size();
+    for (size_t i = 0; i < before.size(); ++i)
+        if (before[i].second == oldPath) drive1 = i;
+    REQUIRE(drive1 < before.size());
+
+    const std::string newPath = "C:\\a b\\c#d\\e.dsk";
+    RewriteSaveStateImages(state, rewritten, {{oldPath, newPath}});
+    const auto after = SaveStateImages(rewritten);
+    REQUIRE(after.size() == before.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+        CHECK(after[i].first == before[i].first);   // Filename unchanged
+        CHECK(after[i].second == (i == drive1 ? newPath : before[i].second));
+    }
+
+    // Every other line is byte-identical.
+    auto lines = [](const fs::path& p) {
+        const std::vector<uint8_t> bytes = ReadAll(p);
+        std::vector<std::string> out(1);
+        for (uint8_t b : bytes) {
+            out.back() += char(b);
+            if (b == '\n') out.emplace_back();
+        }
+        return out;
+    };
+    const auto a = lines(state), b = lines(rewritten);
+    REQUIRE(a.size() == b.size());
+    size_t differing = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] == b[i]) continue;
+        ++differing;
+        CHECK(a[i].find("Absolute Path:") != std::string::npos);
+        CHECK(b[i].find("Absolute Path:") != std::string::npos);
+    }
+    CHECK(differing == 1);
+
+    CHECK_THROWS_AS(RewriteSaveStateImages(state, boot.dir.path / "x.yaml", {{"Z:\\not\\there.dsk", newPath}}),
+                    std::runtime_error);
+}
+
 // ---- Pass condition 5 in-process ----
 
 TEST_CASE("ckpt: SSI263 speech replays identically across two restores; the muted program is silent")

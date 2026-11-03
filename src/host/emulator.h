@@ -6,10 +6,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -326,8 +328,25 @@ public:
     // them). Insert errors throw std::runtime_error as InsertDisk does.
     void EjectAll();
     void ReinsertAll();
+    // Records that the image at `image` is what AppleWin will hold under ImagePathForAppleWin(image) after a save state
+    // load names it, so Disks() reports the long path (D10) for a disk a restore brought in. Call before LoadSnapshot.
+    void NoteImagePath(const std::filesystem::path& image);
 private:
     Emulator() = default;
 };
+
+// The string AppleWin is given when `image` is inserted, and so the one its save state holds for it (D10): the path as
+// ANSI when that survives the save state, else its ASCII 8.3 short path (the file must exist). std::runtime_error when
+// neither exists.
+std::string ImagePathForAppleWin(const std::filesystem::path& image);
+// The disks a save state names, as {Filename, Absolute Path}, decoded the way AppleWin's load decodes them (an empty
+// drive has an empty Filename). std::runtime_error if the file cannot be read or holds a path the harness cannot decode.
+std::vector<std::pair<std::string, std::string>> SaveStateImages(const std::filesystem::path& stateFile);
+// Copies a save state to `to`, replacing each "Absolute Path" value that is a key of absoluteOldToNew (compared as
+// SaveStateImages returns it) by its value, written the way YamlSaveHelper::SaveString writes a string. Every other byte
+// is unchanged. std::runtime_error if a key is not found, a value cannot be written so that it reads back the same, or a
+// file cannot be read or written; `to` is not left behind on failure.
+void RewriteSaveStateImages(const std::filesystem::path& from, const std::filesystem::path& to,
+                            const std::map<std::string, std::string>& absoluteOldToNew);
 
 }  // namespace harness
